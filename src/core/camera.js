@@ -56,7 +56,9 @@ export function createDirector( ctx ) {
 		groundHeight: null,   // ( x, z ) => 地面高度
 		bounds: null,         // { minX, maxX, minZ, maxZ }
 		obstacles: [],        // [ { x, z, radius } ]，走不进去的圆（岩石、树干）
+		canWalk: null,        // ( x, z ) => 能不能站，可选（海边不能走进水里）
 		groundErrorReported: false,
+		canWalkErrorReported: false,
 	};
 	const walkTarget = new THREE.Vector3();
 	const walkForward = new THREE.Vector3();
@@ -140,7 +142,7 @@ export function createDirector( ctx ) {
 
 	}
 
-	// 步行漫游：options = { position:[x,y,z], lookAt:[x,y,z], groundHeight:( x, z ) => y, bounds? }
+	// 步行漫游：options = { position:[x,y,z], lookAt:[x,y,z], groundHeight:( x, z ) => y, bounds?, obstacles?, canWalk? }
 	function setWalk( options ) {
 
 		if ( ! options || ! Array.isArray( options.position ) || ! Array.isArray( options.lookAt ) || typeof options.groundHeight !== 'function' ) {
@@ -154,7 +156,9 @@ export function createDirector( ctx ) {
 		walkState.groundHeight = options.groundHeight;
 		walkState.bounds = options.bounds || null;
 		walkState.obstacles = Array.isArray( options.obstacles ) ? options.obstacles : [];
+		walkState.canWalk = typeof options.canWalk === 'function' ? options.canWalk : null;
 		walkState.groundErrorReported = false;
+		walkState.canWalkErrorReported = false;
 		keyframes = [];
 		setPose( options.position, options.lookAt );
 
@@ -183,6 +187,28 @@ export function createDirector( ctx ) {
 
 	}
 
+	// canWalk 出错就当能走（不把人卡死），报一次错
+	function safeCanWalk( x, z ) {
+
+		try {
+
+			return walkState.canWalk( x, z ) !== false;
+
+		} catch ( error ) {
+
+			if ( ! walkState.canWalkErrorReported ) {
+
+				walkState.canWalkErrorReported = true;
+				console.error( '镜头：canWalk 出错，暂时不限制：', error );
+
+			}
+
+			return true;
+
+		}
+
+	}
+
 	function updateWalk( dt ) {
 
 		const speed = cameraConfig.walkSpeed * ( pressedKeys.has( 'shift' ) ? cameraConfig.runMultiplier : 1 );
@@ -200,6 +226,8 @@ export function createDirector( ctx ) {
 		// 速度缓动，起步停步不生硬
 		const blend = 1 - Math.exp( - cameraConfig.walkSmoothing * dt );
 		walkState.velocity.lerp( walkTarget, blend );
+		const previousX = walkState.position.x;
+		const previousZ = walkState.position.z;
 		walkState.position.addScaledVector( walkState.velocity, dt );
 
 		const bounds = walkState.bounds;
@@ -222,6 +250,28 @@ export function createDirector( ctx ) {
 				walkState.position.z = obstacle.z + offsetZ / distance * obstacle.radius;
 
 			}
+
+		}
+
+		// 走到不能站的地方（水里）：先试只沿 x 或只沿 z 走（贴着岸边滑），都不行就停在原地
+		if ( walkState.canWalk && ! safeCanWalk( walkState.position.x, walkState.position.z ) ) {
+
+			if ( safeCanWalk( walkState.position.x, previousZ ) ) {
+
+				walkState.position.z = previousZ;
+
+			} else if ( safeCanWalk( previousX, walkState.position.z ) ) {
+
+				walkState.position.x = previousX;
+
+			} else {
+
+				walkState.position.x = previousX;
+				walkState.position.z = previousZ;
+
+			}
+
+			walkState.velocity.multiplyScalar( 0.5 );
 
 		}
 
@@ -521,6 +571,7 @@ export function createDirector( ctx ) {
 			walkState.enabled = false;
 			walkState.groundHeight = null;
 			walkState.obstacles = [];
+			walkState.canWalk = null;
 
 		},
 		update,

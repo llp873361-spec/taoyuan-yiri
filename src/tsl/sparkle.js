@@ -1,16 +1,18 @@
 // 闪光层（雪、海面共用）。算法照 Bowles & Wang《Sparkly but not too sparkly!》（SIGGRAPH 2015）
 // 和《A Robust and Flexible Real-Time Sparkle Effect》（EGSR 2016）的思路自己实现：
 // 世界空间抖动网格放闪点，网格大小跟着像素足迹走（相当于闪光的 mipmap），闪点半径始终约 1 个像素，
-// 所以远近都不会糊成噪点，闪烁只来自镜头移动。输出 HDR 颜色，交给 bloom 出星芒。
+// 所以远近都不会糊成噪点。雪地不传 time，闪点静止，闪烁只来自镜头移动；
+// 海面传 time，每个格子按自己的节奏生灭（水面的小晶面一直在换），输出 HDR 颜色，交给 bloom 出星芒。
 
 import { float, vec2, vec3, floor, fract, length, dFdx, dFdy, log2, exp2, max, min, mix, smoothstep, dot, normalize, cross, cos, sin, sqrt, pow, cameraPosition } from 'three/tsl';
 import { hash33 } from './noise.js';
 
 // 一层闪光在某一级网格上的结果
 // pixelDx / pixelDy：相邻像素之间世界坐标的差（dFdx / dFdy），用来把世界里的距离换算成屏幕像素
-function evaluateLevel( settings, level, footprintMax, pixelDx, pixelDy ) {
+// marginFootprint：选网格用的那个像素足迹（'max' 模式是长边，'mean' 模式是几何平均），闪点离格子边留这么多
+function evaluateLevel( settings, level, marginFootprint, pixelDx, pixelDy ) {
 
-	const { position, normal, viewDirection, lightDirection, cellSize, existProbability, density, coneRadians, sharpness, radiusPixels, seed } = settings;
+	const { position, normal, viewDirection, lightDirection, cellSize, existProbability, density, coneRadians, sharpness, radiusPixels, seed, time, twinkleRate } = settings;
 
 	const levelCellSize = exp2( level ).mul( cellSize );
 	// 网格放在世界 XZ 平面上（雪地、海面都近似水平）
@@ -18,11 +20,23 @@ function evaluateLevel( settings, level, footprintMax, pixelDx, pixelDy ) {
 	const cell = floor( gridPoint );
 	const local = fract( gridPoint );
 
-	const randomA = hash33( vec3( cell, level.add( seed * 31 ) ) );
-	const randomB = hash33( vec3( cell, level.add( seed * 31 + 517 ) ) );
+	// 闪烁：每个格子一个随机相位，每过一个周期换一套随机数（换位置、换微法线），周期内 sin 包络淡入淡出不跳变
+	let epoch = float( 0 );
+	let twinkle = float( 1 );
+	if ( time ) {
 
-	// 闪点离格子边至少留一个"最长方向"的像素半径，单格就能查全
-	const marginCell = min( footprintMax.mul( radiusPixels ).div( levelCellSize ), 0.4 );
+		const phase = hash33( vec3( cell, level.add( seed * 31 + 1031 ) ) ).x;
+		const cycle = time.mul( twinkleRate ).add( phase );
+		epoch = floor( cycle ).mul( 4096 );
+		twinkle = sin( fract( cycle ).mul( Math.PI ) );
+
+	}
+
+	const randomA = hash33( vec3( cell, level.add( seed * 31 ).add( epoch ) ) );
+	const randomB = hash33( vec3( cell, level.add( seed * 31 + 517 ).add( epoch ) ) );
+
+	// 闪点离格子边至少留一个像素半径，单格就能查全（'mean' 模式下掠射角的纵深方向会超出一点，那个方向本来只占零点几个像素，看不出）
+	const marginCell = min( marginFootprint.mul( radiusPixels ).div( levelCellSize ), 0.4 );
 	const sparklePoint = vec2( marginCell ).add( randomA.xy.mul( float( 1 ).sub( marginCell.mul( 2 ) ) ) );
 	const offsetWorld = sparklePoint.sub( local ).mul( levelCellSize );
 
@@ -54,7 +68,7 @@ function evaluateLevel( settings, level, footprintMax, pixelDx, pixelDy ) {
 	const glint = pow( max( dot( microNormal, halfVector ), 0 ), sharpness ).mul( max( dot( microNormal, lightDirection ), 0 ) ).mul( facing );
 	const brightness = mix( 0.4, 1.6, randomB.z );
 
-	return shape.mul( exists ).mul( glint ).mul( brightness );
+	return shape.mul( exists ).mul( glint ).mul( brightness ).mul( twinkle );
 
 }
 
@@ -62,29 +76,34 @@ function evaluateLevel( settings, level, footprintMax, pixelDx, pixelDy ) {
 //   position / normal：世界空间；viewDirection：表面指向相机；lightDirection：表面指向光源（都要单位向量）
 //   lightColor：vec3，光源颜色 × 强度；density：0~1 的密度调制（斑驳、脚印里为 0）
 //   cellSize：最细一级网格的边长（米）；existProbability：格子里有闪点的概率（0.1~0.3）
-//   coneDegrees：微法线锥角（15~25°）；sharpness：高光指数（200~800）；intensity：HDR 亮度倍数
+//   coneDegrees：微法线锥角（15~25°，也可以传节点：海面按每个像素剩下的斜率方差给）；sharpness：高光指数（200~800）；intensity：HDR 亮度倍数
 //   cellPixels：希望一个格子大约占多少像素；radiusPixels：闪点半径（像素）；levels：1 或 2（核显只用 1 级）
 //   seed：每层不同的种子；fadeStart / fadeEnd：距离淡出范围（米）
+//   time / twinkleRate：可选，传了就让闪点随时间生灭（每秒换几轮），海面用
+//   footprintMode：'max'（默认，按像素足迹的长边选网格，雪地用，最稳）或 'mean'（长短边的几何平均）。
+//     掠射角下像素在纵深方向拉得很长，按长边选格子会大到横向几十个像素才一个闪点；海面几乎全是掠射角，用 'mean'
 export function sparkleLayer( settings ) {
 
 	const {
 		position, normal, viewDirection, lightDirection, lightColor,
 		density = float( 1 ), cellSize = 0.05, existProbability = 0.2, coneDegrees = 20, sharpness = 400,
 		intensity = 10, cellPixels = 6, radiusPixels = 0.8, levels = 2, seed = 1, fadeStart = 60, fadeEnd = 250,
+		time = null, twinkleRate = 2, footprintMode = 'max',
 	} = settings;
 
 	const prepared = {
-		position, normal, viewDirection, lightDirection, density, existProbability, sharpness, radiusPixels, seed,
+		position, normal, viewDirection, lightDirection, density, existProbability, sharpness, radiusPixels, seed, time, twinkleRate,
 		cellSize: float( cellSize ),
-		coneRadians: coneDegrees * Math.PI / 180,
+		coneRadians: typeof coneDegrees === 'number' ? coneDegrees * Math.PI / 180 : coneDegrees.mul( Math.PI / 180 ),
 	};
 
-	// 像素足迹：这个像素在世界里覆盖多大（选网格级别用，取长边防走样）
+	// 像素足迹：这个像素在世界里覆盖多大。'max' 取长边（最稳，不走样）；'mean' 取长短边的几何平均（掠射角下格子不会大到横向几十个像素）
 	const pixelDx = dFdx( position );
 	const pixelDy = dFdy( position );
 	const footprint = max( max( length( pixelDx ), length( pixelDy ) ), 1e-5 );
+	const levelFootprint = footprintMode === 'mean' ? max( sqrt( length( pixelDx ).mul( length( pixelDy ) ) ), 1e-5 ) : footprint;
 	// 希望格子 ≈ cellPixels 个像素；近处不小于最细一级
-	const levelFloat = max( log2( footprint.mul( cellPixels ).div( cellSize ) ), 0 );
+	const levelFloat = max( log2( levelFootprint.mul( cellPixels ).div( cellSize ) ), 0 );
 
 	let sparkle;
 	if ( levels >= 2 ) {
@@ -92,11 +111,11 @@ export function sparkleLayer( settings ) {
 		// 两级网格按小数部分混合，过渡时不会整片跳变
 		const levelLow = floor( levelFloat );
 		const blend = fract( levelFloat );
-		sparkle = mix( evaluateLevel( prepared, levelLow, footprint, pixelDx, pixelDy ), evaluateLevel( prepared, levelLow.add( 1 ), footprint, pixelDx, pixelDy ), blend );
+		sparkle = mix( evaluateLevel( prepared, levelLow, levelFootprint, pixelDx, pixelDy ), evaluateLevel( prepared, levelLow.add( 1 ), levelFootprint, pixelDx, pixelDy ), blend );
 
 	} else {
 
-		sparkle = evaluateLevel( prepared, floor( levelFloat.add( 0.5 ) ), footprint, pixelDx, pixelDy );
+		sparkle = evaluateLevel( prepared, floor( levelFloat.add( 0.5 ) ), levelFootprint, pixelDx, pixelDy );
 
 	}
 

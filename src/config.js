@@ -33,7 +33,7 @@ const config = {
 			duration: 70,
 			mainColor: '#ff9a4d',
 			transitionStyle: 'flash',
-			grading: { exposure: 1.0, contrast: 1.08, saturation: 1.1, tint: '#ff9a4d', tintAmount: 0.06, toneMapping: 'agx' },
+			grading: { exposure: 1.0, contrast: 1.08, saturation: 1.1, tint: '#ff9a4d', tintAmount: 0.06, toneMapping: 'agx', grain: 0.006 },
 			shots: [ 5, 35, 60 ],
 		},
 		{
@@ -144,6 +144,60 @@ const config = {
 
 	// ===== 场景细节开关 =====
 	footprintsReveal: true,   // 雪原脚印随人往前走一个一个出现在前方
+
+	// ===== 场景 2：落日与海 =====
+	sunset: {
+		sunAzimuth: 0,               // 太阳方位角（度）：0 = 出生点正前方（-z）
+		sunElevationStart: 2.6,      // 开场时太阳仰角（度），规格 1~3°
+		sunElevationEnd: 1.0,        // 场景结束时的仰角：整场缓慢下沉一点点（圆盘下缘已经碰到海平线）
+		sunAngularRadius: 1.2,       // 太阳圆盘角半径（度）：真实约 0.27°，放大到 1~2° 好看，光路也按它算
+		sunColor: '#fff1c9',
+		sunDiscIntensity: 28,        // 太阳圆盘 HDR 亮度（20~50）
+		sunLightColor: '#ffb27a',    // 照在礁石上的阳光：贴着地平线穿过厚大气，偏橙
+		sunLightIntensity: 2.6,
+		skyTurbidity: 4.5,           // SkyMesh（Preetham 天空）的浑浊度
+		skyRayleigh: 2.6,            // 瑞利散射系数，调高（2~3）天空更红更紫
+		skyMieCoefficient: 0.005,
+		skyMieDirectionalG: 0.8,
+		skyExposure: 0.11,           // SkyMesh 输出的量级很大，先乘这个再进后期
+		skyPaletteAmount: 0.6,       // 天空往配色表（下面三色）拉的程度，0 = 原样 Preetham
+		horizonGlow: 0.35,           // 贴着海平线的橙金色光带亮度
+		twilightStrength: 1,         // 背着太阳那半边天的暮光（地球影子 + 维纳斯带 + 蓝紫天顶）整体亮度
+		earthShadowColor: '#4c5276', // 背着太阳的地平线：地球影子那条灰紫蓝
+		beltColor: '#c47a92',        // 维纳斯带：地球影子上面那条粉色
+		zenithColor: '#3b3a73',      // 头顶的蓝紫
+		cloudAwayColor: '#9c6f8c',   // 背着太阳的晚霞是淡粉紫
+		coastShadowColor: '#252238', // 远岸山脚（在影子里）
+		coastGlowColor: '#c98577',   // 远岸山脊上的余晖
+		skyHorizon: '#ff9a4d',
+		skyMid: '#f27b8a',
+		skyHigh: '#8f6fbf',
+		cloudCoverage: 0.42,         // 晚霞覆盖率（0~1，越大云越多）
+		cloudBrightness: 0.55,       // 晚霞亮度
+		cloudShadowColor: '#4a3352', // 云厚处的暗紫色
+		endDarken: 0.45,             // 最后 20 秒天空和光变暗的程度，给入夜铺垫
+		windSpeed: 6.5,              // 风速（米/秒，规格 5~8）：Cox–Munk 斜率方差按它算；风小于约 5.8 时浪和波纹会自动跟着变小
+		windDirection: 100,          // 浪的主方向（度）：90 = 朝 +z，也就是朝岸边推过来
+		waveScale: 1,                // 大浪整体振幅倍数（再大会被 Cox–Munk 的 σ² 压回来，想要更大的浪请同时调大风速）
+		waveChoppiness: 0.85,        // Gerstner 的 Q（尖峰程度），陡度总和会自动压到 1 以下
+		waterColor: '#1d2b4a',       // 海水暗部
+		shallowColor: '#2e5d5a',     // 礁石边浅水
+		sssColor: '#3fbfa0',         // 浪尖逆光透出的绿
+		sssStrength: 0.5,
+		foamColor: '#fff4ea',
+		pathIntensity: 3,            // 金色光路（Cox–Munk 高光瓣，平均亮度）的倍数；近处的碎光主要靠闪点
+		sparkleIntensity: 2.5,       // 光路闪点的亮度倍数（峰值约 F·L_太阳 × 它，进 HDR 让 bloom 出星芒）
+		sparkleTwinkleRate: 2.5,     // 闪点每秒换几轮
+		fogDensity: 0.002,           // 海面上的薄雾（每米）
+		fogFalloff: 25,              // 雾的衰减高度（米）
+		fogColor: '#7a4a52',         // 雾的底色（背着太阳看到的颜色），暗玫瑰色
+		fogScatter: 0.1,             // 朝太阳看时雾里的前向散射强度
+		seagullCount: 2,
+		oceanSegments: { hi: 512, mid: 384, lo: 256 },    // 海面环形网格的角向分段
+		terrainSegments: { hi: 320, mid: 240, lo: 170 },  // 礁石岸地形网格分段
+		environmentInterval: 0.15,   // 太阳每沉多少度重新生成一次环境光贴图
+		environmentIntensity: 2.0,   // 天空光（环境光贴图）照在沙滩、礁石上的强度，背光面和影子靠它提亮
+	},
 
 	// ===== 场景 5：极光雪原 =====
 	aurora: {

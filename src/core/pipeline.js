@@ -206,6 +206,8 @@ export function createPipeline( ctx ) {
 		if ( gradingConfig.saturation !== undefined ) grading.saturation.value = gradingConfig.saturation;
 		if ( gradingConfig.tint !== undefined ) grading.tintColor.value.set( gradingConfig.tint );
 		if ( gradingConfig.tintAmount !== undefined ) grading.tintAmount.value = gradingConfig.tintAmount;
+		// 颗粒是线性空间的加性噪声，暗而平的大片渐变（黄昏天空）上会很显，场景可以自己压低；没写就用全局值
+		grainAmount.value = gradingConfig.grain !== undefined ? gradingConfig.grain : config.post.grain;
 
 		const nextName = gradingConfig.toneMapping || 'agx';
 		if ( nextName !== currentToneMappingName ) {
