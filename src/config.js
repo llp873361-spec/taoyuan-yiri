@@ -91,6 +91,12 @@ const config = {
 		dragReturnDamping: 2.5,  // 松手回正的阻尼（越大回得越快）
 		idleCursorHide: 3,       // 鼠标几秒不动就隐藏光标
 		freeMoveSpeed: 8,        // 自由相机 WASD 速度（米/秒），按住 Shift 乘 4
+		// 步行漫游（场景里 WASD 走、拖动转头）
+		eyeHeight: 1.65,         // 眼睛离地高度（米）
+		walkSpeed: 1.4,          // 步行速度（米/秒）
+		runMultiplier: 3,        // 按住 Shift 的倍数
+		walkSmoothing: 6,        // 起步停步的缓动（越大越跟手）
+		walkPitchMax: 80,        // 步行时抬头低头的最大角度（度）
 	},
 
 	// ===== 画质分档 =====
@@ -137,7 +143,45 @@ const config = {
 	},
 
 	// ===== 场景细节开关 =====
-	footprintsReveal: true,   // 雪原脚印随镜头前进一个一个出现
+	footprintsReveal: true,   // 雪原脚印随人往前走一个一个出现在前方
+
+	// ===== 场景 5：极光雪原 =====
+	aurora: {
+		terrainSize: 700,            // 地形边长（米）
+		terrainCenterZ: - 200,       // 地形中心的 z（路径从 z=0 往 -z 走 400 米）
+		pathLength: 400,             // 脚印路径长度（米）
+		moonAzimuth: - 38,           // 月亮方位角（度）：0 = 正前方（-z），负数偏左
+		moonElevation: 15,           // 月亮仰角（度），偏低才有长影子和逆光轮廓
+		moonColor: '#cfdcff',
+		moonIntensity: 2.2,          // 月光强度（雪的受光面亮度主要靠它）
+		skyHorizon: '#0d1730',
+		skyZenith: '#03060f',
+		shadowSkyColor: '#22336a',   // 阴影里的天空半球色（深蓝）
+		groundBounceColor: '#3a4d7e',// 雪面反弹到背光面的颜色
+		ambientIntensity: 0.75,
+		snowAlbedo: [ 0.85, 0.88, 0.92 ], // 雪的反照率（线性，0.85~0.92），不能是 1，带一点蓝
+		wrapAmount: 0.4,             // 包裹光照的 w
+		sheenColor: '#e4ecff',
+		sheenRoughness: 0.65,
+		scatterColor: '#9fc2ff',     // 前向散射 / 棱线透光的颜色
+		forwardScatter: 0.3,
+		ridgeGlow: 1.4,
+		sparkleIntensity: 14,        // 闪点 HDR 亮度倍数
+		auroraBrightness: 1.6,       // 极光整体亮度
+		auroraDrift: 0.035,          // 极光竖向光线的横向漂移（单位/秒）
+		auroraBreathPeriod: 11,      // 极光呼吸周期（秒）
+		auroraLightStrength: 0.15,   // 极光照亮雪地的强度（0.05~0.2）
+		fogDensity: 0.012,           // 贴地雾在海拔 0 处的密度（每米）
+		fogFalloff: 5,               // 雾的衰减高度（米）
+		fogColor: '#121f40',     // 贴近地平线天色，远山和远处雪面才能溶进天空
+		fogScatterColor: '#3d5590',
+		windDirection: 30,           // 风向（度）：风纹和地吹雪都沿这个方向
+		windSpeed: 4,                // 地吹雪流速（米/秒）
+		snowCount: { hi: 20000, mid: 12000, lo: 5000 }, // 飘雪粒子数
+		footprintRevealLead: 30,     // 脚印提前出现在人前方多远（米）
+		pomSteps: { hi: 16, mid: 12, lo: 8 },             // 脚印视差步数
+		terrainSegments: { hi: 511, mid: 383, lo: 255 },  // 地形网格分段
+	},
 
 };
 

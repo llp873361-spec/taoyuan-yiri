@@ -1,4 +1,4 @@
-// 导演镜头 + 拖动转头 + 自由相机。契约见 reference/notes/design-stage0.md 第 6 节，交互规则见 CLAUDE.md 5.5。
+// 导演镜头 + 拖动转头 + 自由相机 + 步行漫游（setWalk，WASD 贴地走、拖动随意转头）。契约见 reference/notes/design-stage0.md 第 6 节，交互规则见 CLAUDE.md 5.5。
 // 路线是关键帧数组 [{ time, position:[x,y,z], lookAt:[x,y,z], fov? }]，位置用 Catmull-Rom、朝向用四元数球面插值。
 
 import * as THREE from 'three/webgpu';
@@ -45,6 +45,23 @@ export function createDirector( ctx ) {
 		pitch: 0,   // 弧度
 	};
 	const pressedKeys = new Set();
+
+	// 步行漫游状态：场景调 setWalk 后启用，setRoute 会关掉它
+	const walkState = {
+		enabled: false,
+		position: new THREE.Vector3(),
+		velocity: new THREE.Vector3(),
+		yaw: 0,
+		pitch: 0,
+		groundHeight: null,   // ( x, z ) => 地面高度
+		bounds: null,         // { minX, maxX, minZ, maxZ }
+		obstacles: [],        // [ { x, z, radius } ]，走不进去的圆（岩石、树干）
+		groundErrorReported: false,
+	};
+	const walkTarget = new THREE.Vector3();
+	const walkForward = new THREE.Vector3();
+	const walkRight = new THREE.Vector3();
+	const walkEuler = new THREE.Euler( 0, 0, 0, 'YXZ' );
 	const trackedKeys = new Set( [ 'w', 'a', 's', 'd', 'q', 'e', 'shift' ] );
 
 	// 复用的临时对象，避免每帧 new
@@ -109,6 +126,125 @@ export function createDirector( ctx ) {
 		}
 
 		keyframes = prepared;
+		walkState.enabled = false;
+
+	}
+
+	// 由位置和看向点算出偏航/俯仰（弧度）
+	function anglesFromLookAt( fromPosition, lookAtTarget ) {
+
+		tempMatrix.lookAt( fromPosition, lookAtTarget, worldUp );
+		baseQuaternion.setFromRotationMatrix( tempMatrix );
+		walkEuler.setFromQuaternion( baseQuaternion, 'YXZ' );
+		return { yaw: walkEuler.y, pitch: walkEuler.x };
+
+	}
+
+	// 步行漫游：options = { position:[x,y,z], lookAt:[x,y,z], groundHeight:( x, z ) => y, bounds? }
+	function setWalk( options ) {
+
+		if ( ! options || ! Array.isArray( options.position ) || ! Array.isArray( options.lookAt ) || typeof options.groundHeight !== 'function' ) {
+
+			console.error( '镜头：setWalk 需要 { position, lookAt, groundHeight }，忽略' );
+			return;
+
+		}
+
+		walkState.enabled = true;
+		walkState.groundHeight = options.groundHeight;
+		walkState.bounds = options.bounds || null;
+		walkState.obstacles = Array.isArray( options.obstacles ) ? options.obstacles : [];
+		walkState.groundErrorReported = false;
+		keyframes = [];
+		setPose( options.position, options.lookAt );
+
+	}
+
+	// 直接把人放到某处看向某处（出生点、截图机位）；只在步行模式下有意义
+	function setPose( position, lookAt ) {
+
+		walkState.position.fromArray( position );
+		const angles = anglesFromLookAt( walkState.position, tempTarget.fromArray( lookAt ) );
+		walkState.yaw = angles.yaw;
+		walkState.pitch = angles.pitch;
+		walkState.velocity.set( 0, 0, 0 );
+		yawOffset = 0;
+		pitchOffset = 0;
+		writeWalkCamera();
+
+	}
+
+	function writeWalkCamera() {
+
+		walkEuler.set( walkState.pitch, walkState.yaw, 0, 'YXZ' );
+		camera.quaternion.setFromEuler( walkEuler );
+		camera.position.copy( walkState.position );
+		applyFov( cameraConfig.fov );
+
+	}
+
+	function updateWalk( dt ) {
+
+		const speed = cameraConfig.walkSpeed * ( pressedKeys.has( 'shift' ) ? cameraConfig.runMultiplier : 1 );
+
+		walkForward.set( - Math.sin( walkState.yaw ), 0, - Math.cos( walkState.yaw ) );
+		walkRight.set( Math.cos( walkState.yaw ), 0, - Math.sin( walkState.yaw ) );
+
+		walkTarget.set( 0, 0, 0 );
+		if ( pressedKeys.has( 'w' ) ) walkTarget.add( walkForward );
+		if ( pressedKeys.has( 's' ) ) walkTarget.sub( walkForward );
+		if ( pressedKeys.has( 'd' ) ) walkTarget.add( walkRight );
+		if ( pressedKeys.has( 'a' ) ) walkTarget.sub( walkRight );
+		if ( walkTarget.lengthSq() > 0 ) walkTarget.normalize().multiplyScalar( speed );
+
+		// 速度缓动，起步停步不生硬
+		const blend = 1 - Math.exp( - cameraConfig.walkSmoothing * dt );
+		walkState.velocity.lerp( walkTarget, blend );
+		walkState.position.addScaledVector( walkState.velocity, dt );
+
+		const bounds = walkState.bounds;
+		if ( bounds ) {
+
+			walkState.position.x = Math.min( bounds.maxX, Math.max( bounds.minX, walkState.position.x ) );
+			walkState.position.z = Math.min( bounds.maxZ, Math.max( bounds.minZ, walkState.position.z ) );
+
+		}
+
+		// 碰到岩石、树干就沿圆周推出去（只在水平面上算）
+		for ( const obstacle of walkState.obstacles ) {
+
+			const offsetX = walkState.position.x - obstacle.x;
+			const offsetZ = walkState.position.z - obstacle.z;
+			const distance = Math.hypot( offsetX, offsetZ );
+			if ( distance < obstacle.radius && distance > 1e-6 ) {
+
+				walkState.position.x = obstacle.x + offsetX / distance * obstacle.radius;
+				walkState.position.z = obstacle.z + offsetZ / distance * obstacle.radius;
+
+			}
+
+		}
+
+		// 眼睛贴着地面走；地面函数出错或没有数据（场景已释放）就保持原高度，报一次错
+		let ground = NaN;
+		try {
+
+			ground = walkState.groundHeight( walkState.position.x, walkState.position.z );
+
+		} catch ( error ) {
+
+			if ( ! walkState.groundErrorReported ) {
+
+				walkState.groundErrorReported = true;
+				console.error( '镜头：地面高度函数出错，暂时保持当前高度：', error );
+
+			}
+
+		}
+
+		if ( Number.isFinite( ground ) ) walkState.position.y = ground + cameraConfig.eyeHeight;
+
+		writeWalkCamera();
 
 	}
 
@@ -225,6 +361,13 @@ export function createDirector( ctx ) {
 
 		}
 
+		if ( walkState.enabled ) {
+
+			updateWalk( dt );
+			return;
+
+		}
+
 		// 松手后指数阻尼回正
 		if ( ! dragging ) {
 
@@ -286,6 +429,17 @@ export function createDirector( ctx ) {
 			freeState.yaw -= THREE.MathUtils.degToRad( deltaX * cameraConfig.dragSensitivity );
 			freeState.pitch -= THREE.MathUtils.degToRad( deltaY * cameraConfig.dragSensitivity );
 			freeState.pitch = Math.max( - Math.PI * 0.49, Math.min( Math.PI * 0.49, freeState.pitch ) );
+			return;
+
+		}
+
+		if ( walkState.enabled ) {
+
+			// 步行时随意转头，不回正
+			walkState.yaw -= THREE.MathUtils.degToRad( deltaX * cameraConfig.dragSensitivity );
+			walkState.pitch -= THREE.MathUtils.degToRad( deltaY * cameraConfig.dragSensitivity );
+			const pitchLimit = THREE.MathUtils.degToRad( cameraConfig.walkPitchMax );
+			walkState.pitch = Math.max( - pitchLimit, Math.min( pitchLimit, walkState.pitch ) );
 			return;
 
 		}
@@ -358,6 +512,17 @@ export function createDirector( ctx ) {
 	const director = {
 		setRoute,
 		setTime,
+		setWalk,
+		setPose,
+		isWalking: () => walkState.enabled,
+		// 场景退出时调：不再步行，也不再引用那个场景的地面函数
+		clearWalk: () => {
+
+			walkState.enabled = false;
+			walkState.groundHeight = null;
+			walkState.obstacles = [];
+
+		},
 		update,
 		getBaseState,
 		dispose,
@@ -386,7 +551,7 @@ export function createDirector( ctx ) {
 
 				yawOffset = 0;
 				pitchOffset = 0;
-				console.log( '镜头：回到导演路线' );
+				console.log( walkState.enabled ? '镜头：回到步行' : '镜头：回到导演路线' );
 
 			}
 

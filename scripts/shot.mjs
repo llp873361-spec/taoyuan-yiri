@@ -17,6 +17,8 @@ const stepTimeoutMs = 60000;
 const suspiciousJpegBytes = 15 * 1024;
 // 泄漏检查里要对比的 renderer.info 字段
 const leakFields = [ 'geometries', 'textures', 'renderTargets', 'programs' ];
+// 每张图前推进的帧数（极光贴图做时间累积，需要十几帧才收敛）
+const settleFrames = 14;
 
 function printHelp() {
 	console.log( [
@@ -26,6 +28,8 @@ function printHelp() {
 		'  --scene=key                   只截一个场景（key 见 src/config.js 的 scenes），泄漏检查仍跑全部场景',
 		'  --out=目录                    截图输出目录，默认 shots',
 		'  --software                    加 --use-angle=swiftshader 模拟没显卡的机器（WebGPU 会自动退回 WebGL2）',
+		'  --layers                      额外截逐层对比图：每个机位全开一张，再每次只关一层（输出到 <out>/<backend>/layers/）',
+		'  --query=a=1&b=2               追加到页面地址后的查询参数，比如 --query=q=lo 强制低档',
 		'  --help                        打印这段',
 		'',
 		'输出：<out>/<backend>/<场景key>_<秒>s.png 和 <out>/report.json；',
@@ -34,10 +38,12 @@ function printHelp() {
 }
 
 function parseArgs( argv ) {
-	const options = { backend: 'both', scene: '', out: 'shots', software: false, help: false };
+	const options = { backend: 'both', scene: '', out: 'shots', software: false, layers: false, query: '', help: false };
 	for ( const arg of argv ) {
 		if ( arg === '--help' || arg === '-h' ) options.help = true;
 		else if ( arg === '--software' ) options.software = true;
+		else if ( arg === '--layers' ) options.layers = true;
+		else if ( arg.startsWith( '--query=' ) ) options.query = arg.slice( '--query='.length );
 		else if ( arg.startsWith( '--backend=' ) ) options.backend = arg.slice( '--backend='.length );
 		else if ( arg.startsWith( '--scene=' ) ) options.scene = arg.slice( '--scene='.length );
 		else if ( arg.startsWith( '--out=' ) ) options.out = arg.slice( '--out='.length );
@@ -78,7 +84,7 @@ async function shootBackend( requested, options ) {
 		backend: '',
 		gpuName: '',
 		tier: '',
-		query: requested === 'webgl' ? '?shot=1&webgl=1' : '?shot=1',
+		query: ( requested === 'webgl' ? '?shot=1&webgl=1' : '?shot=1' ) + ( options.query ? '&' + options.query : '' ),
 		shots: [],
 		warnings: [],
 		errors: [],
@@ -153,23 +159,62 @@ async function shootBackend( requested, options ) {
 			if ( targets.length === 0 ) throw new Error( '没有 key 为 ' + options.scene + ' 的场景，可选：' + scenes.map( ( scene ) => scene.key ).join( ', ' ) );
 		}
 
-		// 逐场景逐时间点截图
+		// 截一张：推进几帧让极光的时间累积、粒子到位，再截图并粗检纯色
+		async function capture( fileName, frames = settleFrames, meta = {} ) {
+
+			const startedAt = Date.now();
+			for ( let frame = 0; frame < frames; frame ++ ) await callGift( page, 'step', [ 1 / 60 ], '__gift.step' );
+			const filePath = path.join( outDir, fileName );
+			await page.screenshot( { path: filePath, type: 'png' } );
+			const jpegBuffer = await page.screenshot( { type: 'jpeg', quality: 50 } );
+			const suspicious = jpegBuffer.length < suspiciousJpegBytes;
+			const entry = { ...meta, file: fileName, path: filePath, ms: Date.now() - startedAt, jpegBytes: jpegBuffer.length, suspicious };
+			result.shots.push( entry );
+			if ( suspicious ) result.suspiciousShots.push( filePath );
+			console.log( '[' + requested + '] ' + fileName + '  ' + entry.ms + ' ms' + ( suspicious ? '  （可疑：画面几乎纯色，jpeg 只有 ' + jpegBuffer.length + ' 字节）' : '' ) );
+
+		}
+
+		// 逐场景逐时间点截图；自由漫游的场景每个时间点再按机位各截一张
 		for ( const target of targets ) {
 			for ( const seconds of target.shots ) {
-				const startedAt = Date.now();
 				await callGift( page, 'jumpTo', [ target.index, seconds ], '__gift.jumpTo(' + target.index + ', ' + seconds + ')' );
-				await callGift( page, 'step', [ 1 / 60 ], '__gift.step' );
-				await callGift( page, 'step', [ 1 / 60 ], '__gift.step' );
-				const fileName = target.key + '_' + formatTime( seconds ) + 's.png';
-				const filePath = path.join( outDir, fileName );
-				await page.screenshot( { path: filePath, type: 'png' } );
-				// 粗检纯色：低质量 jpeg 太小说明画面几乎没有内容
-				const jpegBuffer = await page.screenshot( { type: 'jpeg', quality: 50 } );
-				const suspicious = jpegBuffer.length < suspiciousJpegBytes;
-				const entry = { scene: target.key, time: seconds, path: filePath, ms: Date.now() - startedAt, jpegBytes: jpegBuffer.length, suspicious };
-				result.shots.push( entry );
-				if ( suspicious ) result.suspiciousShots.push( filePath );
-				console.log( '[' + requested + '] ' + fileName + '  ' + entry.ms + ' ms' + ( suspicious ? '  （可疑：画面几乎纯色，jpeg 只有 ' + jpegBuffer.length + ' 字节）' : '' ) );
+				const views = await withTimeout( page.evaluate( () => window.__gift.getViews() ), '__gift.getViews()' );
+				if ( views.length === 0 ) {
+					await capture( target.key + '_' + formatTime( seconds ) + 's.png', settleFrames, { scene: target.key, time: seconds } );
+					continue;
+				}
+				for ( const view of views ) {
+					await callGift( page, 'setView', [ view ], '__gift.setView(' + view + ')' );
+					await capture( target.key + '_' + formatTime( seconds ) + 's_' + view + '.png', settleFrames, { scene: target.key, time: seconds, view } );
+				}
+			}
+		}
+
+		// 逐层对比图：每个机位先截全开，再每次只关一层
+		if ( options.layers ) {
+			for ( const target of targets ) {
+				const seconds = target.shots[ Math.min( 1, target.shots.length - 1 ) ] || 0;
+				await callGift( page, 'jumpTo', [ target.index, seconds ], '逐层 jumpTo' );
+				const layers = await withTimeout( page.evaluate( () => window.__gift.getLayers() ), '__gift.getLayers()' );
+				const views = await withTimeout( page.evaluate( () => window.__gift.getViews() ), '__gift.getViews()' );
+				if ( layers.length === 0 ) continue;
+				const layerDir = path.join( 'layers', target.key );
+				fs.mkdirSync( path.join( outDir, layerDir ), { recursive: true } );
+				for ( const view of ( views.length ? views : [ '' ] ) ) {
+					if ( view ) await callGift( page, 'setView', [ view ], '逐层 setView' );
+					const prefix = path.join( layerDir, ( view || '默认' ) + '_' );
+					// 先让时间走几帧收敛，再冻结时间：对比图之间只差那一层，不混进动画
+					for ( let frame = 0; frame < settleFrames; frame ++ ) await callGift( page, 'step', [ 1 / 60 ], '__gift.step' );
+					await callGift( page, 'pause', [], '__gift.pause' );
+					await capture( prefix + '00全开.png', 2 );
+					for ( let i = 0; i < layers.length; i ++ ) {
+						await callGift( page, 'setLayer', [ layers[ i ], false ], '关 ' + layers[ i ] );
+						await capture( prefix + String( i + 1 ).padStart( 2, '0' ) + '关' + layers[ i ] + '.png', 2 );
+						await callGift( page, 'setLayer', [ layers[ i ], true ], '开 ' + layers[ i ] );
+					}
+					await callGift( page, 'resume', [], '__gift.resume' );
+				}
 			}
 		}
 

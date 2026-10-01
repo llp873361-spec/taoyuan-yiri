@@ -543,11 +543,35 @@ export function createTimeline( ctx, sceneModules ) {
 
 		if ( switching ) return false;
 
-		if ( state.index >= 0 && entries[ state.index ].inited ) {
+		// 当前场景继续画着，先把其它场景（除了场景 1）都释放掉，再在后台准备场景 1；
+		// 准备好之后才退出、释放当前场景并切过去，中间不会有一段黑屏或空场景
+		const currentIndex = state.index;
+		generation ++;
+		await waitIdle();
+		for ( let i = 0; i < entries.length; i ++ ) {
+
+			entries[ i ].failed = false;
+			if ( i !== currentIndex && i !== 0 ) disposeEntry( i );
+
+		}
+
+		// 准备期间当前场景还是旧的，要把场景 1 标成"要留着"，否则加载完会被当成多余的释放掉
+		jumpTarget = 0;
+		try {
+
+			if ( currentIndex !== 0 ) await prepareFirst();
+
+		} finally {
+
+			jumpTarget = - 1;
+
+		}
+
+		if ( currentIndex >= 0 && entries[ currentIndex ].inited ) {
 
 			try {
 
-				entries[ state.index ].module.exit();
+				entries[ currentIndex ].module.exit();
 
 			} catch ( error ) {
 
@@ -555,25 +579,19 @@ export function createTimeline( ctx, sceneModules ) {
 
 			}
 
-		}
-
-		for ( let i = 0; i < entries.length; i ++ ) {
-
-			disposeEntry( i );
-			entries[ i ].failed = false;
+			disposeEntry( currentIndex );
 
 		}
+
+		if ( currentIndex === 0 ) await prepareFirst();
 
 		ctx.pipeline.setFlash( 0 );
 		ctx.pipeline.setCanvasReveal( 0 );
 		state.index = - 1;
 		state.phase = 'idle';
 		endFired = false;
-		generation ++;
-		await waitIdle();
-		logMemory( '重播前已释放全部场景' );
+		logMemory( '重播：已释放上一轮的场景' );
 
-		await prepareFirst();
 		start();
 		return true;
 
@@ -618,6 +636,7 @@ export function createTimeline( ctx, sceneModules ) {
 		isPaused: () => state.paused,
 		getSceneIndex: () => state.index,
 		getSceneKey: () => ( getCurrentEntry() ? getCurrentEntry().config.key : '' ),
+		getCurrentModule: () => ( getCurrentEntry() && getCurrentEntry().inited ? getCurrentEntry().module : null ),
 		// 每个场景的加载状态：已加载 / 加载中 / 失败 / 空，调试和截图脚本看
 		getLoadStates: () => entries.map( ( entry ) => entry.inited ? '已加载' : ( entry.initPromise ? '加载中' : ( entry.failed ? '失败' : '空' ) ) ),
 		getSceneList: () => config.scenes.map( ( scene ) => scene.name ),

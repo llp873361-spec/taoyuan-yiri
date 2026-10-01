@@ -85,6 +85,13 @@ const gift = {
 	jumpTo: null,
 	step: null,
 	settle: null,
+	pause: null,
+	resume: null,
+	getViews: null,
+	setView: null,
+	setPose: null,
+	getLayers: null,
+	setLayer: null,
 	info: null,
 };
 window.__gift = gift;
@@ -572,8 +579,66 @@ async function boot() {
 		return true;
 
 	};
+	// 截图对比用：冻结 / 恢复时间（冻结后照样渲染）
+	gift.pause = () => {
+
+		timeline.pause();
+		return true;
+
+	};
+	gift.resume = () => {
+
+		timeline.resume();
+		return true;
+
+	};
 	// 等后台预加载都结束，取内存快照才稳定
 	gift.settle = () => timeline.waitIdle();
+	// 当前场景的截图机位（自由漫游的场景才有）
+	gift.getViews = () => {
+
+		const module = timeline.getCurrentModule();
+		if ( ! module || typeof module.getShotViews !== 'function' ) return [];
+		return module.getShotViews().map( ( view ) => view.name );
+
+	};
+	gift.setView = ( name ) => {
+
+		const module = timeline.getCurrentModule();
+		const views = module && typeof module.getShotViews === 'function' ? module.getShotViews() : [];
+		const view = views.find( ( item ) => item.name === name );
+		if ( ! view ) throw new Error( `当前场景没有叫「${ name }」的机位` );
+		if ( ! ctx.director.isWalking() ) throw new Error( '当前场景不是步行漫游，机位不生效' );
+		ctx.director.setPose( view.position, view.lookAt );
+		return true;
+
+	};
+	// 调试用：把步行的人放到任意位置（检查边界、找机位）
+	gift.setPose = ( position, lookAt ) => {
+
+		if ( ! ctx.director.isWalking() ) throw new Error( '当前场景不是步行漫游' );
+		ctx.director.setPose( position, lookAt );
+		return true;
+
+	};
+	// 当前场景的效果层：列出名字、单独开关
+	gift.getLayers = () => {
+
+		const module = timeline.getCurrentModule();
+		return module && typeof module.getLayers === 'function' ? Object.keys( module.getLayers() ) : [];
+
+	};
+	gift.setLayer = ( label, enabled ) => {
+
+		const module = timeline.getCurrentModule();
+		const layers = module && typeof module.getLayers === 'function' ? module.getLayers() : {};
+		const target = layers[ label ];
+		if ( target === undefined ) throw new Error( `当前场景没有叫「${ label }」的效果层` );
+		if ( typeof target === 'function' ) target( Boolean( enabled ) );
+		else target.value = enabled ? 1 : 0;
+		return true;
+
+	};
 	gift.info = () => {
 
 		const info = renderer.info;
@@ -589,6 +654,7 @@ async function boot() {
 			paused: timeline.state.paused,
 			transitionTime: timeline.state.transitionTime,
 			loadStates: timeline.getLoadStates(),
+			cameraPosition: camera.position.toArray().map( ( value ) => Math.round( value * 100 ) / 100 ),
 			geometries: info.memory.geometries,
 			textures: info.memory.textures,
 			renderTargets: info.memory.renderTargets,
