@@ -1,0 +1,353 @@
+/* 界面样式：开场卡、结尾、致谢、兜底错误页。字体只用系统字体栈，不联网。 */
+
+:root {
+	--paper: #fbf6ef;
+	--paperEdge: #f1e6d8;
+	--pink: #e8b4b8;
+	--pinkDeep: #c98b92;
+	--ink: #4a3f3a;
+	--inkSoft: #8a7b74;
+	--wax: #b8474f;
+	--fontStack: "Songti SC", "STSong", "SimSun", serif;
+}
+
+html, body {
+	margin: 0;
+	padding: 0;
+	width: 100%;
+	height: 100%;
+	overflow: hidden;
+	background: #070a14;
+	font-family: var(--fontStack);
+	color: var(--ink);
+}
+
+body.cursorHidden {
+	cursor: none;
+}
+
+#canvasHost {
+	position: fixed;
+	inset: 0;
+	z-index: 0;
+}
+
+#canvasHost canvas {
+	display: block;
+	width: 100vw;
+	height: 100vh;
+}
+
+#hud {
+	position: fixed;
+	inset: 0;
+	z-index: 10;
+	pointer-events: none;
+}
+
+#hud.hidden {
+	display: none;
+}
+
+/* ===== 开场卡 ===== */
+
+#cardBackdrop {
+	position: absolute;
+	inset: 0;
+	background: radial-gradient(ellipse at 50% 40%, #2a2338 0%, #140f1c 55%, #0a0810 100%);
+	opacity: 1;
+	transition: opacity 1.2s ease;
+	pointer-events: auto;
+}
+
+#cardBackdrop.fadeOut {
+	opacity: 0;
+	pointer-events: none;
+}
+
+#card {
+	position: absolute;
+	left: 50%;
+	top: 50%;
+	width: min(560px, 86vw);
+	padding: 52px 48px 40px;
+	transform: translate(-50%, -50%) rotate(-0.6deg);
+	background: var(--paper);
+	border: 1px solid var(--paperEdge);
+	border-radius: 6px;
+	box-shadow: 0 30px 60px rgba(0, 0, 0, 0.45), 0 2px 0 var(--paperEdge) inset;
+	text-align: center;
+	pointer-events: auto;
+	transition: opacity 1.2s ease, transform 1.2s ease;
+}
+
+#card.fadeOut {
+	opacity: 0;
+	transform: translate(-50%, -54%) rotate(-0.6deg);
+	pointer-events: none;
+}
+
+/* 手绘感的虚线内框 */
+#card::before {
+	content: "";
+	position: absolute;
+	inset: 14px;
+	border: 1.5px dashed var(--pink);
+	border-radius: 4px;
+	opacity: 0.8;
+	pointer-events: none;
+}
+
+/* 一枚小火漆印 */
+#cardSeal {
+	position: absolute;
+	right: 30px;
+	top: -22px;
+	width: 46px;
+	height: 46px;
+	border-radius: 50%;
+	background: radial-gradient(circle at 35% 30%, #d9666d, var(--wax) 60%, #8f2f36 100%);
+	box-shadow: 0 4px 10px rgba(0, 0, 0, 0.25);
+	transform: rotate(12deg);
+}
+
+#cardSeal::after {
+	content: "";
+	position: absolute;
+	inset: 9px;
+	border-radius: 50%;
+	border: 1.5px solid rgba(255, 230, 220, 0.55);
+}
+
+#cardTitle {
+	margin: 0;
+	font-size: clamp(28px, 4.2vw, 44px);
+	font-weight: normal;
+	letter-spacing: 0.18em;
+	color: var(--ink);
+}
+
+#cardSubtitle {
+	margin: 14px 0 0;
+	font-size: 15px;
+	letter-spacing: 0.12em;
+	color: var(--inkSoft);
+	min-height: 1em;
+}
+
+#cardStart {
+	display: inline-block;
+	margin-top: 34px;
+	padding: 10px 34px;
+	font-family: var(--fontStack);
+	font-size: 17px;
+	letter-spacing: 0.3em;
+	color: var(--ink);
+	background: transparent;
+	border: 1px solid var(--pinkDeep);
+	border-radius: 999px;
+	cursor: pointer;
+	transition: background 0.3s ease, color 0.3s ease, transform 0.3s ease;
+}
+
+#cardStart:hover {
+	background: var(--pink);
+	color: #fff;
+	transform: translateY(-1px);
+}
+
+#cardStart:disabled {
+	opacity: 0.45;
+	cursor: default;
+	transform: none;
+	background: transparent;
+	color: var(--ink);
+}
+
+#cardHints {
+	margin: 26px 0 0;
+	padding: 0;
+	list-style: none;
+	font-size: 12px;
+	line-height: 1.9;
+	letter-spacing: 0.1em;
+	color: var(--inkSoft);
+}
+
+#cardProgress {
+	display: block;
+	width: 100%;
+	height: 44px;
+	margin-top: 18px;
+	opacity: 0;
+	transition: opacity 0.6s ease;
+}
+
+#cardProgress.visible {
+	opacity: 1;
+}
+
+#cardStatus {
+	margin: 4px 0 0;
+	font-size: 12px;
+	letter-spacing: 0.1em;
+	color: var(--inkSoft);
+	min-height: 1.2em;
+}
+
+/* ===== 结尾 ===== */
+
+#ending {
+	position: absolute;
+	left: 0;
+	right: 0;
+	bottom: 14vh;
+	text-align: center;
+	font-size: clamp(18px, 2.2vw, 26px);
+	letter-spacing: 0.22em;
+	line-height: 1.8;
+	color: rgba(240, 236, 228, 0.92);
+	text-shadow: 0 2px 18px rgba(0, 0, 0, 0.6);
+	opacity: 0;
+	transition: opacity 2.5s ease;
+	white-space: pre-line;
+}
+
+#ending.visible {
+	opacity: 1;
+}
+
+#creditsButton,
+#replayButton {
+	position: absolute;
+	bottom: 22px;
+	padding: 6px 14px;
+	font-family: var(--fontStack);
+	font-size: 12px;
+	letter-spacing: 0.2em;
+	color: rgba(240, 236, 228, 0.7);
+	background: rgba(0, 0, 0, 0.25);
+	border: 1px solid rgba(240, 236, 228, 0.25);
+	border-radius: 999px;
+	cursor: pointer;
+	opacity: 0;
+	transition: opacity 2.5s ease, background 0.3s ease;
+	pointer-events: none;
+}
+
+#creditsButton {
+	right: 22px;
+}
+
+#replayButton {
+	left: 22px;
+	opacity: 0;
+	font-size: 11px;
+	color: rgba(240, 236, 228, 0.35);
+	border-color: rgba(240, 236, 228, 0.12);
+	background: transparent;
+}
+
+#creditsButton.visible,
+#replayButton.visible {
+	opacity: 1;
+	pointer-events: auto;
+}
+
+#replayButton.visible {
+	opacity: 0.55;
+}
+
+#creditsButton:hover,
+#replayButton:hover {
+	background: rgba(0, 0, 0, 0.5);
+}
+
+#creditsPanel {
+	position: absolute;
+	right: 22px;
+	bottom: 64px;
+	width: min(420px, 80vw);
+	max-height: 60vh;
+	overflow: auto;
+	padding: 18px 22px;
+	background: rgba(12, 10, 18, 0.88);
+	border: 1px solid rgba(240, 236, 228, 0.18);
+	border-radius: 10px;
+	color: rgba(240, 236, 228, 0.88);
+	font-size: 13px;
+	line-height: 1.7;
+	letter-spacing: 0.04em;
+	pointer-events: auto;
+	display: none;
+}
+
+#creditsPanel.visible {
+	display: block;
+}
+
+#creditsPanel h3 {
+	margin: 0 0 10px;
+	font-weight: normal;
+	font-size: 15px;
+	letter-spacing: 0.2em;
+}
+
+#creditsPanel ul {
+	margin: 0;
+	padding: 0;
+	list-style: none;
+}
+
+#creditsPanel li {
+	padding: 6px 0;
+	border-top: 1px solid rgba(240, 236, 228, 0.1);
+	word-break: break-all;
+}
+
+#creditsPanel li span {
+	color: rgba(240, 236, 228, 0.55);
+	font-size: 12px;
+}
+
+/* ===== 兜底错误页 ===== */
+
+#fatal {
+	position: fixed;
+	inset: 0;
+	z-index: 100;
+	display: none;
+	align-items: center;
+	justify-content: center;
+	background: #1a1420;
+	color: #f0ece4;
+	text-align: center;
+	padding: 24px;
+}
+
+#fatal.visible {
+	display: flex;
+}
+
+#fatal .box {
+	max-width: 560px;
+	padding: 36px 40px;
+	background: rgba(255, 255, 255, 0.04);
+	border: 1px solid rgba(255, 255, 255, 0.12);
+	border-radius: 10px;
+	line-height: 1.9;
+	letter-spacing: 0.06em;
+}
+
+#fatal h2 {
+	margin: 0 0 12px;
+	font-weight: normal;
+	font-size: 22px;
+	letter-spacing: 0.2em;
+}
+
+#fatal p {
+	margin: 0;
+	font-size: 14px;
+	color: rgba(240, 236, 228, 0.8);
+}

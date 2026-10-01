@@ -1,0 +1,38 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+	<meta charset="UTF-8">
+	<meta name="viewport" content="width=device-width, initial-scale=1.0">
+	<title>一天五景</title>
+</head>
+<body>
+	<div id="canvasHost"></div>
+
+	<div id="hud">
+		<div id="cardBackdrop"></div>
+		<div id="card">
+			<div id="cardSeal"></div>
+			<h1 id="cardTitle"></h1>
+			<p id="cardSubtitle"></p>
+			<button id="cardStart" type="button"></button>
+			<ul id="cardHints"></ul>
+			<canvas id="cardProgress" width="600" height="60"></canvas>
+			<p id="cardStatus"></p>
+		</div>
+
+		<div id="ending"></div>
+		<button id="creditsButton" type="button"></button>
+		<div id="creditsPanel"></div>
+		<button id="replayButton" type="button"></button>
+	</div>
+
+	<div id="fatal">
+		<div class="box">
+			<h2>打不开这份礼物</h2>
+			<p id="fatalMessage"></p>
+		</div>
+	</div>
+
+	<script type="module" src="/src/main.js"></script>
+</body>
+</html>

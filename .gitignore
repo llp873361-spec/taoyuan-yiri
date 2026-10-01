@@ -1,0 +1,8 @@
+node_modules/
+dist/
+shots/
+assets/raw/
+.vite/
+*.log
+reference/
+.claude/

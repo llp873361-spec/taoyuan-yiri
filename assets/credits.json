@@ -1,0 +1,4 @@
+{
+	"说明": "每个外部素材一条。author、license、url 由我手填；scripts/opt.mjs 只校验字段齐全。license 只能是 CC0 / CC BY 4.0 / CC BY 3.0 / MIT 之类的免费许可。",
+	"items": []
+}
