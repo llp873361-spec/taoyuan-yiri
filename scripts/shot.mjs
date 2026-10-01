@@ -30,6 +30,8 @@ function printHelp() {
 		'  --software                    加 --use-angle=swiftshader 模拟没显卡的机器（WebGPU 会自动退回 WebGL2）',
 		'  --layers                      额外截逐层对比图：每个机位全开一张，再每次只关一层（输出到 <out>/<backend>/layers/）',
 		'  --query=a=1&b=2               追加到页面地址后的查询参数，比如 --query=q=lo 强制低档',
+		'  --world                       秘境俯瞰模式（?world=1）：3 公里高空俯瞰（清晨、正午、黄昏、午夜）、正上方地图、',
+		'                                每个地点在自己的时刻 8 方向环视；加 --layers 再截黄昏俯瞰的逐层对比',
 		'  --help                        打印这段',
 		'',
 		'输出：<out>/<backend>/<场景key>_<秒>s.png 和 <out>/report.json；',
@@ -38,11 +40,12 @@ function printHelp() {
 }
 
 function parseArgs( argv ) {
-	const options = { backend: 'both', scene: '', out: 'shots', software: false, layers: false, query: '', help: false };
+	const options = { backend: 'both', scene: '', out: 'shots', software: false, layers: false, query: '', help: false, world: false };
 	for ( const arg of argv ) {
 		if ( arg === '--help' || arg === '-h' ) options.help = true;
 		else if ( arg === '--software' ) options.software = true;
 		else if ( arg === '--layers' ) options.layers = true;
+		else if ( arg === '--world' ) options.world = true;
 		else if ( arg.startsWith( '--query=' ) ) options.query = arg.slice( '--query='.length );
 		else if ( arg.startsWith( '--backend=' ) ) options.backend = arg.slice( '--backend='.length );
 		else if ( arg.startsWith( '--scene=' ) ) options.scene = arg.slice( '--scene='.length );
@@ -84,7 +87,7 @@ async function shootBackend( requested, options ) {
 		backend: '',
 		gpuName: '',
 		tier: '',
-		query: ( requested === 'webgl' ? '?shot=1&webgl=1' : '?shot=1' ) + ( options.query ? '&' + options.query : '' ),
+		query: ( requested === 'webgl' ? '?shot=1&webgl=1' : '?shot=1' ) + ( options.world ? '&world=1' : '' ) + ( options.query ? '&' + options.query : '' ),
 		shots: [],
 		warnings: [],
 		errors: [],
@@ -147,18 +150,6 @@ async function shootBackend( requested, options ) {
 			result.errors.push( '?webgl=1 下实际后端应是 webgl2，拿到的是 ' + ready.backend );
 		}
 
-		await callGift( page, 'start', [], '__gift.start()' );
-
-		const config = await withTimeout( page.evaluate( () => window.__gift.getConfig() ), '__gift.getConfig()' );
-		const scenes = config.scenes;
-		if ( ! Array.isArray( scenes ) || scenes.length === 0 ) throw new Error( 'config.scenes 为空，没东西可截' );
-
-		let targets = scenes.map( ( scene, index ) => ( { index, key: scene.key, shots: scene.shots || [] } ) );
-		if ( options.scene ) {
-			targets = targets.filter( ( target ) => target.key === options.scene );
-			if ( targets.length === 0 ) throw new Error( '没有 key 为 ' + options.scene + ' 的场景，可选：' + scenes.map( ( scene ) => scene.key ).join( ', ' ) );
-		}
-
 		// 截一张：推进几帧让极光的时间累积、粒子到位，再截图并粗检纯色
 		async function capture( fileName, frames = settleFrames, meta = {} ) {
 
@@ -173,6 +164,27 @@ async function shootBackend( requested, options ) {
 			if ( suspicious ) result.suspiciousShots.push( filePath );
 			console.log( '[' + requested + '] ' + fileName + '  ' + entry.ms + ' ms' + ( suspicious ? '  （可疑：画面几乎纯色，jpeg 只有 ' + jpegBuffer.length + ' 字节）' : '' ) );
 
+		}
+
+		if ( options.world ) {
+
+			await shootWorld( page, capture, options, outDir );
+			result.pageLogs = await withTimeout( page.evaluate( () => Array.isArray( window.__gift.logs ) ? window.__gift.logs.map( ( item ) => String( item ) ) : [] ), '__gift.logs' );
+			await context.close();
+			return result;
+
+		}
+
+		await callGift( page, 'start', [], '__gift.start()' );
+
+		const config = await withTimeout( page.evaluate( () => window.__gift.getConfig() ), '__gift.getConfig()' );
+		const scenes = config.scenes;
+		if ( ! Array.isArray( scenes ) || scenes.length === 0 ) throw new Error( 'config.scenes 为空，没东西可截' );
+
+		let targets = scenes.map( ( scene, index ) => ( { index, key: scene.key, shots: scene.shots || [] } ) );
+		if ( options.scene ) {
+			targets = targets.filter( ( target ) => target.key === options.scene );
+			if ( targets.length === 0 ) throw new Error( '没有 key 为 ' + options.scene + ' 的场景，可选：' + scenes.map( ( scene ) => scene.key ).join( ', ' ) );
 		}
 
 		// 逐场景逐时间点截图；自由漫游的场景每个时间点再按机位各截一张
@@ -257,6 +269,54 @@ async function shootBackend( requested, options ) {
 		await browser.close();
 	}
 	return result;
+}
+
+// 秘境俯瞰模式的截图（规格书 13 阶段 4a 的验收）：
+//   3 公里高空俯瞰，06:12 / 12:00 / 19:00 / 00:00 四个时刻；正午正上方地图；
+//   每个地点在自己的时刻（config.world.overview.locationTimes）从眼睛的位置朝 8 个方向各一张（0° = 地点的 yaw，顺时针）
+async function shootWorld( page, capture, options, outDir ) {
+
+	const config = await withTimeout( page.evaluate( () => window.__gift.getConfig() ), '__gift.getConfig()' );
+	const overview = config.world.overview;
+	const locations = await withTimeout( page.evaluate( () => window.__gift.getWorldLocations() ), '__gift.getWorldLocations()' );
+	const setTime = ( hours ) => callGift( page, 'setDayTime', [ hours ], '__gift.setDayTime(' + hours + ')' );
+	const setView = ( position, lookAt ) => callGift( page, 'setWorldView', [ position, lookAt ], '__gift.setWorldView' );
+
+	for ( const hours of [ 6.2, 12, 19, 0 ] ) {
+		await setTime( hours );
+		await setView( overview.aerial.position, overview.aerial.lookAt );
+		await capture( 'world_aerial_' + formatTime( hours ) + 'h.png', 3, { world: 'aerial', time: hours } );
+	}
+
+	await setTime( 12 );
+	await setView( overview.map.position, overview.map.lookAt );
+	await capture( 'world_map_12h.png', 3, { world: 'map', time: 12 } );
+
+	for ( const location of locations ) {
+		await setTime( location.time );
+		const [ x, y, z ] = location.position;
+		for ( let k = 0; k < 8; k ++ ) {
+			const azimuth = ( location.yaw + k * 45 ) % 360;
+			const radians = azimuth * Math.PI / 180;
+			await setView( location.position, [ x + Math.sin( radians ) * 100, y + 3.5, z - Math.cos( radians ) * 100 ] );
+			await capture( 'world_ring_' + location.key + '_' + String( k * 45 ).padStart( 3, '0' ) + '.png', 3, { world: location.key, time: location.time, azimuth } );
+		}
+	}
+
+	if ( options.layers ) {
+		// 黄昏俯瞰：全开一张，再每次只关一层
+		await setTime( 19 );
+		await setView( overview.aerial.position, overview.aerial.lookAt );
+		const layers = await withTimeout( page.evaluate( () => window.__gift.getLayers() ), '__gift.getLayers()' );
+		fs.mkdirSync( path.join( outDir, 'world_layers' ), { recursive: true } );
+		await capture( path.join( 'world_layers', '00全开.png' ), 3 );
+		for ( let i = 0; i < layers.length; i ++ ) {
+			await callGift( page, 'setLayer', [ layers[ i ], false ], '关 ' + layers[ i ] );
+			await capture( path.join( 'world_layers', String( i + 1 ).padStart( 2, '0' ) + '关' + layers[ i ] + '.png' ), 2 );
+			await callGift( page, 'setLayer', [ layers[ i ], true ], '开 ' + layers[ i ] );
+		}
+	}
+
 }
 
 function summarize( backendResult ) {

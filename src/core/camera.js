@@ -1,4 +1,4 @@
-// 导演镜头 + 拖动转头 + 自由相机 + 步行漫游（setWalk，WASD 贴地走、拖动随意转头）。契约见 reference/notes/design-stage0.md 第 6 节，交互规则见 CLAUDE.md 5.5。
+// 导演镜头 + 拖动转头 + 自由相机 + 步行漫游（setWalk，WASD 贴地走、拖动随意转头）+ 呼吸感和行走感（CLAUDE.md 5.5）。契约见 reference/notes/design-stage0.md 第 6 节，交互规则见 CLAUDE.md 5.5。
 // 路线是关键帧数组 [{ time, position:[x,y,z], lookAt:[x,y,z], fov? }]，位置用 Catmull-Rom、朝向用四元数球面插值。
 
 import * as THREE from 'three/webgpu';
@@ -45,6 +45,17 @@ export function createDirector( ctx ) {
 		pitch: 0,   // 弧度
 	};
 	const pressedKeys = new Set();
+	let freeSpeed = null;   // 自由相机速度（米/秒），null 用 config 里的 freeMoveSpeed
+
+	// 呼吸感和行走感：只改最终写进相机的位置和朝向，不动 walkState（贴地、碰撞都按没晃的位置算）
+	const swayState = {
+		enabled: true,     // 全景烘焙时关掉
+		stepPhase: 0,      // 按走过的距离推进，一步 = π
+		walkBlend: 0,      // 0 站着，1 正常走，>1 跑
+	};
+	const swayRight = new THREE.Vector3();
+	const swayEuler = new THREE.Euler( 0, 0, 0, 'YXZ' );
+	const swayQuaternion = new THREE.Quaternion();
 
 	// 步行漫游状态：场景调 setWalk 后启用，setRoute 会关掉它
 	const walkState = {
@@ -373,7 +384,7 @@ export function createDirector( ctx ) {
 
 	function updateFree( dt ) {
 
-		const speedBase = cameraConfig.freeMoveSpeed * ( pressedKeys.has( 'shift' ) ? 4 : 1 );
+		const speedBase = ( freeSpeed !== null ? freeSpeed : cameraConfig.freeMoveSpeed ) * ( pressedKeys.has( 'shift' ) ? 4 : 1 );
 		const step = speedBase * dt;
 
 		// 先算朝向，再沿相机轴移动
@@ -402,6 +413,64 @@ export function createDirector( ctx ) {
 
 	}
 
+	// 呼吸感和行走感。时间用场景时间（暂停时不晃，截图可复现），步伐相位按走过的距离推进（停下就不颠）
+	//   walk：站着时约 4 秒一次的呼吸起伏；走路时每一步上下颠一次（脚落地最低）、两步左右晃一个来回，起停平滑
+	//   float：坐船、飞行、导演路线时很慢的漂浮
+	function applySway( dt, horizontalSpeed, mode ) {
+
+		const sway = cameraConfig.sway;
+		if ( ! sway || ! sway.enabled || ! swayState.enabled ) return;
+
+		const time = sceneTime;
+		const degree = Math.PI / 180;
+		let up = 0;
+		let side = 0;
+		let pitch = 0;
+		let roll = 0;
+
+		if ( mode === 'walk' ) {
+
+			const targetBlend = Math.min( 1 + sway.runExtra, horizontalSpeed / cameraConfig.walkSpeed );
+			swayState.walkBlend += ( targetBlend - swayState.walkBlend ) * ( 1 - Math.exp( - sway.blendSpeed * dt ) );
+			swayState.stepPhase += horizontalSpeed * dt / sway.stepLength * Math.PI;
+			const walking = Math.min( 1, swayState.walkBlend );
+			const running = Math.max( 0, swayState.walkBlend - 1 );
+
+			// 呼吸：走起来以后呼吸被步伐盖住，只留三成
+			const breathAngle = time * Math.PI * 2 / sway.breathPeriod;
+			const breathWeight = 1 - walking * 0.7;
+			up += Math.sin( breathAngle ) * sway.breathHeight * breathWeight;
+			pitch += Math.sin( breathAngle - 0.6 ) * sway.breathPitch * degree * breathWeight;
+			roll += Math.sin( breathAngle * 0.53 ) * sway.breathRoll * degree * breathWeight;
+
+			// 步伐：|sin| 每步一个起伏，减去平均值 2/π 让眼睛高度平均不变；sin 两步一个来回，左右晃和横滚
+			const stepAmount = walking * ( 1 + running * 0.8 );
+			const bounce = Math.abs( Math.sin( swayState.stepPhase ) ) - 2 / Math.PI;
+			const swing = Math.sin( swayState.stepPhase );
+			up += bounce * sway.bobHeight * stepAmount;
+			side += swing * sway.bobSide * stepAmount;
+			roll += swing * sway.bobRoll * degree * stepAmount;
+			pitch += bounce * sway.bobPitch * degree * stepAmount;
+
+		} else {
+
+			const floatAngle = time * Math.PI * 2 / sway.floatPeriod;
+			up += Math.sin( floatAngle ) * sway.floatHeight;
+			side += Math.sin( floatAngle * 0.73 + 1.3 ) * sway.floatHeight * 0.6;
+			roll += Math.sin( floatAngle * 0.59 + 0.4 ) * sway.floatRoll * degree;
+			pitch += Math.sin( floatAngle * 0.81 + 2.1 ) * sway.floatRoll * 0.5 * degree;
+
+		}
+
+		swayRight.set( 1, 0, 0 ).applyQuaternion( camera.quaternion );
+		camera.position.y += up;
+		camera.position.addScaledVector( swayRight, side );
+		swayEuler.set( pitch, 0, roll, 'YXZ' );
+		swayQuaternion.setFromEuler( swayEuler );
+		camera.quaternion.multiply( swayQuaternion );
+
+	}
+
 	function update( dt ) {
 
 		if ( director.freeMode ) {
@@ -413,7 +482,12 @@ export function createDirector( ctx ) {
 
 		if ( walkState.enabled ) {
 
+			// 步伐按真实走过的距离推进：顶着岩石、边界走不动时速度还在，但人没动，不能还在颠
+			const previousX = walkState.position.x;
+			const previousZ = walkState.position.z;
 			updateWalk( dt );
+			const travelled = Math.hypot( walkState.position.x - previousX, walkState.position.z - previousZ );
+			applySway( dt, dt > 0 ? travelled / dt : 0, 'walk' );
 			return;
 
 		}
@@ -439,6 +513,7 @@ export function createDirector( ctx ) {
 		camera.position.copy( tempPosition );
 		camera.quaternion.copy( finalQuaternion );
 		applyFov( currentFov );
+		applySway( dt, 0, 'float' );
 
 	}
 
@@ -565,6 +640,26 @@ export function createDirector( ctx ) {
 		setWalk,
 		setPose,
 		isWalking: () => walkState.enabled,
+		// 自由相机：直接摆到某处看向某处（秘境俯瞰、截图机位用）；要先打开 freeMode
+		setFreePose: ( position, lookAt ) => {
+
+			freeState.position.fromArray( position );
+			const angles = anglesFromLookAt( freeState.position, tempTarget.fromArray( lookAt ) );
+			freeState.yaw = angles.yaw;
+			freeState.pitch = angles.pitch;
+
+		},
+		setFreeSpeed: ( metersPerSecond ) => {
+
+			freeSpeed = Number.isFinite( metersPerSecond ) && metersPerSecond > 0 ? metersPerSecond : null;
+
+		},
+		// 全景烘焙时关掉呼吸和步伐晃动
+		setSwayEnabled: ( enabled ) => {
+
+			swayState.enabled = Boolean( enabled );
+
+		},
 		// 场景退出时调：不再步行，也不再引用那个场景的地面函数
 		clearWalk: () => {
 

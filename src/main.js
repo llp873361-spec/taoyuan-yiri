@@ -11,6 +11,8 @@ import { createDirector } from './core/camera.js';
 import { createTimeline } from './core/timeline.js';
 import { createAudio } from './core/audio.js';
 import { createDebug } from './core/debug.js';
+import { createWorld, directionFromAngles } from './core/world.js';
+import * as backdrop from './scenes/backdrop.js';
 import * as garden from './scenes/garden.js';
 import * as sunset from './scenes/sunset.js';
 import * as gothic from './scenes/gothic.js';
@@ -39,6 +41,7 @@ const forceWebGL = params.get( 'webgl' ) === '1';
 const forcedTier = params.get( 'q' ) || '';
 const debugEnabled = params.has( 'debug' );
 const isShotMode = params.get( 'shot' ) === '1';
+const worldMode = params.get( 'world' ) === '1';   // 秘境俯瞰：只看常驻远景（规格书 6.3）
 
 // ===== DOM =====
 const elements = {
@@ -93,6 +96,12 @@ const gift = {
 	getLayers: null,
 	setLayer: null,
 	info: null,
+	setDayTime: null,
+	setWorldView: null,
+	getWorldLocations: null,
+	setCameraRange: null,
+	setCompression: null,
+	measureGpu: null,
 };
 window.__gift = gift;
 // 没人接这个 Promise 的拒绝时别再多报一条错
@@ -184,7 +193,7 @@ async function boot() {
 	let rendererBundle;
 	try {
 
-		rendererBundle = await createRenderer( { forceWebGL } );
+		rendererBundle = await createRenderer( { forceWebGL, trackTimestamp: ! isShotMode } );
 
 	} catch ( error ) {
 
@@ -198,7 +207,7 @@ async function boot() {
 
 	}
 
-	const { renderer, backend, gpuName, timer } = rendererBundle;
+	const { renderer, backend, gpuName, timer, gpuTiming } = rendererBundle;
 	elements.canvasHost.appendChild( renderer.domElement );
 
 	const camera = new THREE.PerspectiveCamera( config.camera.fov, Math.max( 1, window.innerWidth ) / Math.max( 1, window.innerHeight ), config.camera.near, config.camera.far );
@@ -208,6 +217,7 @@ async function boot() {
 		backend,
 		gpuName,
 		timer,
+		gpuTiming,
 		camera,
 		config,
 		quality: null,
@@ -215,19 +225,22 @@ async function boot() {
 		director: null,
 		audio: null,
 		debug: null,
+		world: null,
 		isShotMode,
 	};
 
+	ctx.world = createWorld( config );
 	ctx.quality = createQuality( ctx, forcedTier );
 	ctx.pipeline = createPipeline( ctx );
 	ctx.director = createDirector( ctx );
 	ctx.audio = createAudio( ctx );
-	ctx.debug = createDebug( ctx, debugEnabled );
+	// 俯瞰模式默认带调试面板（时刻滑条、跳地点）；截图模式下不要，免得挡住画面
+	ctx.debug = createDebug( ctx, debugEnabled || ( worldMode && ! isShotMode ) );
 	ctx.pipeline.registerDebug();
 	ctx.pipeline.resize();
 
 	const timeline = createTimeline( ctx, sceneModules );
-	ctx.debug.setTimelineHooks( {
+	if ( ! worldMode ) ctx.debug.setTimelineHooks( {
 		getTime: timeline.getTime,
 		getDuration: timeline.getDuration,
 		seek: timeline.seek,
@@ -273,7 +286,10 @@ async function boot() {
 		}
 
 		ctx.director.update( dt );
+		if ( overview ) overview.update( dt );
 		ctx.pipeline.render();
+		// 每帧都结算显卡时间戳（开场卡阶段也要，不然查询一直攒着）
+		if ( ! isShotMode ) ctx.quality.afterRender();
 		if ( started && ! isShotMode ) ctx.quality.onFrame( frameMs );
 		ctx.debug.onFrame();
 
@@ -562,6 +578,95 @@ async function boot() {
 
 	} );
 
+	// ===== 秘境俯瞰（?world=1）：只看常驻远景，自由飞行，拖时刻滑条，跳到各地点 =====
+	const overviewConfig = config.world.overview;
+	let overview = null;
+
+	// 地点的眼睛位置：原点高度和"地面 + 1.7 米"取高的（哥特、星月夜的原点本身就是机位高度），朝 yaw 方向略微抬头。
+	// 地面按远景网格画出来的高度算（远景还没建好时用解析高度）：网格 12.5 米一格，按解析高度算有时会钻到网格下面
+	function locationView( key ) {
+
+		const location = ctx.world.locations[ key ];
+		const [ x, y, z ] = location.origin;
+		const meshGround = backdrop.getTerrainHeight( x, z );
+		const ground = Number.isFinite( meshGround ) ? meshGround : ctx.world.worldHeight( x, z );
+		const eyeY = Math.max( y, ground + 1.7 );
+		const direction = directionFromAngles( location.yaw, 2, new THREE.Vector3() );
+		return {
+			key,
+			name: location.name,
+			origin: location.origin,
+			yaw: location.yaw,
+			landmark: location.landmark || null,
+			time: overviewConfig.locationTimes[ key ],
+			position: [ x, eyeY, z ],
+			lookAt: [ x + direction.x * 100, eyeY + direction.y * 100, z + direction.z * 100 ],
+		};
+
+	}
+
+	async function startOverview() {
+
+		elements.card.classList.add( 'fadeOut' );
+		elements.cardBackdrop.classList.add( 'fadeOut' );
+		camera.near = overviewConfig.near;
+		camera.far = overviewConfig.far;
+		camera.updateProjectionMatrix();
+
+		ctx.world.setDayTime( overviewConfig.startTime );
+		const overviewBuildStart = performance.now();
+		const result = await backdrop.init( ctx );
+		await renderer.compileAsync( result.scene, camera );
+		backdrop.enter();
+		ctx.pipeline.setScene( result.scene );
+		ctx.pipeline.setGrading( overviewConfig.grading );
+
+		ctx.director.setFreeSpeed( overviewConfig.moveSpeed );
+		ctx.director.freeMode = true;
+		ctx.director.setFreePose( overviewConfig.aerial.position, overviewConfig.aerial.lookAt );
+
+		overview = {
+			time: 0,
+			daySpeed: 0,   // 时刻流速（小时/秒），0 = 停住
+			update( dt ) {
+
+				this.time += dt;
+				if ( this.daySpeed !== 0 ) ctx.world.setDayTime( ctx.world.getDayTime() + this.daySpeed * dt );
+				backdrop.update( dt, this.time );
+				// 俯瞰时的自动曝光：夜里天光弱，按天空亮度把曝光抬起来（4b 起飞行途中用两个地点的调色插值）
+				const intensity = ctx.world.uniforms.skyIntensity.value;
+				ctx.pipeline.grading.exposure.value = overviewConfig.grading.exposure / ( 0.4 + 0.6 * Math.pow( intensity, 0.7 ) );
+
+			},
+		};
+
+		for ( const [ label, target ] of Object.entries( backdrop.getLayers() ) ) ctx.debug.addLayerToggle( '远景', label, target );
+
+		ctx.debug.addWorldControls( {
+			getDayTime: () => ctx.world.getDayTime(),
+			setDayTime: ( hours ) => ctx.world.setDayTime( hours ),
+			setDaySpeed: ( speed ) => {
+
+				overview.daySpeed = speed;
+
+			},
+			getLocations: () => Object.keys( ctx.world.locations ).map( locationView ),
+			jumpToLocation: ( key ) => {
+
+				const view = locationView( key );
+				ctx.world.setDayTime( view.time );
+				ctx.director.setFreePose( view.position, view.lookAt );
+
+			},
+			showAerial: () => ctx.director.setFreePose( overviewConfig.aerial.position, overviewConfig.aerial.lookAt ),
+			showMap: () => ctx.director.setFreePose( overviewConfig.map.position, overviewConfig.map.lookAt ),
+		} );
+
+		if ( ! isShotMode ) renderer.setAnimationLoop( () => frame() );
+		console.log( `秘境俯瞰：远景准备好了，用时 ${ ( performance.now() - overviewBuildStart ).toFixed( 0 ) } ms。WASD 飞、QE 升降、Shift 加速、按住左键转头` );
+
+	}
+
 	// ===== 截图脚本接口 =====
 	gift.start = () => startExperience();
 	gift.jumpTo = async ( index, time = 0 ) => {
@@ -621,22 +726,68 @@ async function boot() {
 		return true;
 
 	};
-	// 当前场景的效果层：列出名字、单独开关
+	// 当前场景的效果层：列出名字、单独开关（俯瞰模式下是远景的层）
+	const layerModule = () => ( overview ? backdrop : timeline.getCurrentModule() );
 	gift.getLayers = () => {
 
-		const module = timeline.getCurrentModule();
+		const module = layerModule();
 		return module && typeof module.getLayers === 'function' ? Object.keys( module.getLayers() ) : [];
 
 	};
 	gift.setLayer = ( label, enabled ) => {
 
-		const module = timeline.getCurrentModule();
+		const module = layerModule();
 		const layers = module && typeof module.getLayers === 'function' ? module.getLayers() : {};
 		const target = layers[ label ];
 		if ( target === undefined ) throw new Error( `当前场景没有叫「${ label }」的效果层` );
 		if ( typeof target === 'function' ) target( Boolean( enabled ) );
 		else target.value = enabled ? 1 : 0;
 		return true;
+
+	};
+	// 秘境：设时刻、摆机位、列出地点、改相机远近裁剪面、远景深度压缩（只在俯瞰模式下有意义）
+	gift.setDayTime = ( hours ) => {
+
+		ctx.world.setDayTime( hours );
+		if ( overview ) backdrop.update( 0, overview.time );
+		return ctx.world.getDayTime();
+
+	};
+	gift.setWorldView = ( position, lookAt ) => {
+
+		if ( ! overview ) throw new Error( '不在秘境俯瞰模式（?world=1）' );
+		ctx.director.setFreePose( position, lookAt );
+		return true;
+
+	};
+	gift.getWorldLocations = () => Object.keys( ctx.world.locations ).map( locationView );
+	gift.setCameraRange = ( near, far ) => {
+
+		if ( ! Number.isFinite( near ) || ! Number.isFinite( far ) || near <= 0 || far <= near ) throw new Error( `setCameraRange 参数不对（near ${ near }、far ${ far }），要 0 < near < far` );
+		camera.near = near;
+		camera.far = far;
+		camera.updateProjectionMatrix();
+		return true;
+
+	};
+	gift.setCompression = ( start, end ) => backdrop.setCompression( start, end );
+	// 性能探针用：连续 frameCount 帧，每帧等这一帧的显卡时间戳结算完再画下一帧（帧和帧不重叠，量的是一帧本身的显卡时间），
+	// 返回中位数和最大值（毫秒）。显卡计时只在 WebGPU 上开（WebGL2 上关了，见 renderer.js）；没有时间戳返回 null
+	gift.measureGpu = async ( frameCount = 60 ) => {
+
+		if ( ! ctx.gpuTiming || isShotMode ) return null;
+		const samples = [];
+		for ( let i = 0; i < frameCount; i ++ ) {
+
+			await new Promise( ( resolve ) => requestAnimationFrame( resolve ) );
+			const duration = await renderer.resolveTimestampsAsync( 'render' ).catch( () => null );
+			if ( typeof duration === 'number' && Number.isFinite( duration ) && duration > 0 ) samples.push( duration );
+
+		}
+
+		if ( samples.length === 0 ) return null;
+		samples.sort( ( first, second ) => first - second );
+		return { median: samples[ Math.floor( samples.length / 2 ) ], max: samples[ samples.length - 1 ], count: samples.length };
 
 	};
 	gift.info = () => {
@@ -647,6 +798,8 @@ async function boot() {
 			gpuName,
 			tier: ctx.quality.tier,
 			renderScale: ctx.quality.renderScale,
+			gpuMs: ctx.quality.gpuMs,
+			dayTime: ctx.world.getDayTime(),
 			sceneKey: timeline.getSceneKey(),
 			sceneIndex: timeline.getSceneIndex(),
 			sceneTime: timeline.getTime(),
@@ -663,6 +816,8 @@ async function boot() {
 		};
 
 	};
+
+	if ( worldMode ) await startOverview();
 
 	resolveReady( { backend, gpuName, tier: ctx.quality.tier } );
 

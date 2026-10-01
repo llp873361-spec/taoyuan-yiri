@@ -47,7 +47,8 @@ function readGpuName( renderer, backend ) {
 }
 
 // 建渲染器。canvas 不挂到 DOM，由 main.js 挂。
-export async function createRenderer( { forceWebGL = false } = {} ) {
+// trackTimestamp：用显卡时间戳量每帧显卡干活的时间（画质判断用，不受垂直同步和浏览器限帧影响）；截图模式不开
+export async function createRenderer( { forceWebGL = false, trackTimestamp = false } = {} ) {
 
 	if ( typeof document === 'undefined' ) {
 
@@ -62,6 +63,7 @@ export async function createRenderer( { forceWebGL = false } = {} ) {
 		canvas,
 		antialias: true,
 		forceWebGL: forceWebGL === true,
+		trackTimestamp: trackTimestamp === true,
 	} );
 
 	// r186 必须先 init 再 render；WebGPU 失败时 init 内部自动退回 WebGL2，两个都失败才会抛
@@ -120,7 +122,13 @@ export async function createRenderer( { forceWebGL = false } = {} ) {
 
 	console.log( `渲染器就绪：后端 ${ backend === 'webgpu' ? 'WebGPU' : 'WebGL2' }，显卡 ${ gpuName }` );
 
-	return { renderer, backend, gpuName, timer };
+	// 显卡计时只在 WebGPU 上用（要有 timestamp-query 特性，没有时后端自己会把 trackTimestamp 关掉）。
+	// WebGL2 上关掉：r186 的 WebGLTimestampQueryPool 在查询池满了重置时，不管还有没有正在进行的 GL 查询就把 activeQuery 清空，
+	// 下一个 beginQuery 就报"a query is already active"（帧率一高、结算跟不上就会满）。WebGL2 改用帧间隔判断（quality.js）
+	if ( backend === 'webgl2' ) renderer.backend.trackTimestamp = false;
+	const gpuTiming = trackTimestamp === true && backend === 'webgpu' && renderer.backend.trackTimestamp === true;
+
+	return { renderer, backend, gpuName, timer, gpuTiming };
 
 }
 

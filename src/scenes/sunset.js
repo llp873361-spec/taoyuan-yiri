@@ -139,16 +139,17 @@ function smoothstepJs( edge0, edge1, value ) {
 
 }
 
+// 海蚀柱（本地坐标 x、z、半径、高，米）：避开正前方的光路，左右各一组，远处一根小的。远景的替身也按这张表摆
+export const seaStacks = [
+	[ - 30, - 44, 4.5, 12 ], [ - 22, - 68, 3.0, 6.5 ], [ - 44, - 28, 2.4, 4.5 ],
+	[ 52, - 82, 6.0, 15 ], [ 62, - 104, 3.4, 6 ], [ 14, - 96, 2.0, 3 ],
+];
+
 // 礁石摆放：海里几根海蚀柱 + 沿岸线半泡在水里的礁石 + 岸上几块大石头
 function placeRocks() {
 
 	const spots = [];
-	// 海蚀柱：避开正前方的光路，左右各一组，远处一根小的
-	const stacks = [
-		[ - 30, - 44, 4.5, 12 ], [ - 22, - 68, 3.0, 6.5 ], [ - 44, - 28, 2.4, 4.5 ],
-		[ 52, - 82, 6.0, 15 ], [ 62, - 104, 3.4, 6 ], [ 14, - 96, 2.0, 3 ],
-	];
-	stacks.forEach( ( item, i ) => spots.push( { x: item[ 0 ], z: item[ 1 ], radius: item[ 2 ], height: item[ 3 ], seed: 3.1 + i * 1.7, kind: 'stack' } ) );
+	seaStacks.forEach( ( item, i ) => spots.push( { x: item[ 0 ], z: item[ 1 ], radius: item[ 2 ], height: item[ 3 ], seed: 3.1 + i * 1.7, kind: 'stack' } ) );
 
 	// 岸边礁石：两块一簇，每 8 米一簇沿岸线排，离岸 -5~+1 米，出生点左右留空
 	for ( let i = 0; i < 34; i ++ ) {
@@ -567,7 +568,7 @@ function horizonHazeColor( direction ) {
 
 	const uniforms = state.uniforms;
 	const towardSun = dot( normalize( vec2( direction.x, direction.z ) ), normalize( vec2( uniforms.sunDirection.x, uniforms.sunDirection.z ) ) ).mul( 0.5 ).add( 0.5 );
-	return mix( uniforms.earthShadowColor, uniforms.skyHorizon.mul( 0.5 ), pow( towardSun, 2 ) ).mul( uniforms.twilightStrength ).mul( uniforms.skyDarken );
+	return mix( uniforms.earthShadowColor, uniforms.skyHorizon.mul( 0.5 ), towardSun.pow2() ).mul( uniforms.twilightStrength ).mul( uniforms.skyDarken );
 
 }
 
@@ -610,7 +611,7 @@ function createSky() {
 		// 背着太阳最明显，朝太阳那边被 Preetham 本身的亮光盖住
 		const awayFromSun = float( 1 ).sub( dot( normalize( vec2( direction.x, direction.z ) ), normalize( vec2( uniforms.sunDirection.x, uniforms.sunDirection.z ) ) ).mul( 0.5 ).add( 0.5 ) );
 		const earthShadowBand = float( 1 ).sub( smoothstep( 0.0, 0.08, elevation ) );
-		const beltOfVenus = exp( elevation.sub( 0.13 ).div( 0.075 ).pow( 2 ).negate() ).mul( awayFromSun.mul( 0.75 ).add( 0.25 ) );
+		const beltOfVenus = exp( elevation.sub( 0.13 ).div( 0.075 ).pow2().negate() ).mul( awayFromSun.mul( 0.75 ).add( 0.25 ) );
 		const zenithFloor = smoothstep( 0.04, 0.7, elevation ).mul( awayFromSun.mul( 0.75 ).add( 0.25 ) );
 		const twilight = horizonHazeColor( direction ).mul( earthShadowBand )
 			.add( uniforms.beltColor.mul( beltOfVenus ).mul( earthShadowBand.mul( - 0.7 ).add( 1 ) ).mul( uniforms.twilightStrength ).mul( uniforms.skyDarken ) )
@@ -779,7 +780,7 @@ function createOceanMaterial( tierName, useReflector ) {
 
 		const normalDotLight = dot( normal, sunDirection );
 		const shadowing = smith( normalDotView ).mul( smith( normalDotLight ) );
-		const fresnelHalf = float( 0.02 ).add( float( 0.98 ).mul( pow( float( 1 ).sub( max( dot( viewDirection, halfVector ), 0 ) ), 5 ) ) );
+		const fresnelHalf = float( 0.02 ).add( float( 0.98 ).mul( pow( max( float( 1 ).sub( max( dot( viewDirection, halfVector ), 0 ) ), 0 ), 5 ) ) );
 		// 太阳当成有角半径的圆盘：辐照度 = 圆盘亮度 × 立体角 π r²。L = E·F·p·G / (4·cosθv)
 		const sunIrradiance = uniforms.sunRadiance.mul( uniforms.sunSolidAngle );
 		const glint = sunIrradiance.mul( fresnelHalf.mul( slopeDensity ).mul( shadowing ).div( normalDotView.mul( 4 ) ) )
@@ -826,7 +827,7 @@ function createOceanMaterial( tierName, useReflector ) {
 
 		}
 
-		const fresnel = float( 0.02 ).add( float( 0.98 ).mul( pow( float( 1 ).sub( normalDotView ), 5 ) ) );
+		const fresnel = float( 0.02 ).add( float( 0.98 ).mul( pow( max( float( 1 ).sub( normalDotView ), 0 ), 5 ) ) );
 
 		// ⑥ 水体：暗部海水色 × 天空环境光；礁石边水浅，透出一点青色
 		const terrain = texture( state.heightTexture, terrainUV( worldPosition.xz ) );
@@ -941,7 +942,7 @@ function createRockMaterial( withSand ) {
 
 		// 沙：平缓（法线朝上）、离出生点那块岬角远的地方；陡坡露出岩石。
 		// 不在平地上撒岩石斑块——从高处往回看，平地上一块块深色石斑像污渍
-		const headland = exp( worldPosition.x.div( 13 ).pow( 2 ).negate() ).mul( float( 1 ).sub( smoothstep( 4, 14, worldPosition.z ) ) );
+		const headland = exp( worldPosition.x.div( 13 ).pow2().negate() ).mul( float( 1 ).sub( smoothstep( 4, 14, worldPosition.z ) ) );
 		const flat = smoothstep( 0.8, 0.92, normalWorld.y );
 		const sand = flat.mul( float( 1 ).sub( headland ) ).toVar();
 		// 风吹出来的沙纹：沿一个方向的细条纹，被噪声扭弯，只改法线

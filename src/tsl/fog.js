@@ -12,11 +12,12 @@ export const heightFogFactor = Fn( ( [ density, falloff, worldPosition, eyePosit
 	const deltaY = delta.y;
 	const eyeDensity = density.mul( exp( eyePosition.y.negate().div( falloff ) ) );
 
-	// ∫0^L d0·exp(-(y0 + t·dy/L)/H) dt = d0·exp(-y0/H)·L·(1 - exp(-dy/H)) / (dy/H)；dy 接近 0 时退化成 d0·exp(-y0/H)·L
+	// ∫0^L d0·exp(-(y0 + t·dy/L)/H) dt = d0·L·H·(exp(-y0/H) - exp(-y1/H)) / dy；dy 接近 0 时退化成 d0·exp(-y0/H)·L。
+	// 写成两个 exp 相减，不写成 exp(-y0/H)·(1 - exp(-dy/H))/(dy/H)：相机很高（几公里）、衰减高度很小时 exp(dy/H) 会溢出成无穷，乘 0 得 NaN
 	const ratio = deltaY.div( falloff );
-	const slanted = float( 1 ).sub( exp( ratio.negate() ) ).div( ratio );
-	const integralFactor = abs( ratio ).greaterThan( 1e-4 ).select( slanted, float( 1 ) );
-	const opticalDepth = eyeDensity.mul( distance ).mul( integralFactor );
+	const pointDensity = density.mul( exp( worldPosition.y.negate().div( falloff ) ) );
+	const slanted = distance.mul( eyeDensity.sub( pointDensity ) ).div( ratio );
+	const opticalDepth = abs( ratio ).greaterThan( 1e-4 ).select( slanted, eyeDensity.mul( distance ) );
 
 	return float( 1 ).sub( exp( opticalDepth.negate() ) );
 

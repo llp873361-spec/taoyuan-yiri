@@ -697,11 +697,11 @@ function createSnowMaterial( tierName ) {
 	const backLight = max( dot( viewDirectionWorld, moonDirection.negate() ), 0 );
 	const scatterColor = color( auroraConfig.scatterColor ).mul( uniforms.moonColor );
 	// 逆光瓣：pow(V·(-L), 6) · pow(1 - N·V, 2)，镜头朝月亮看时雪丘轮廓发亮
-	const forwardScatter = pow( backLight, 6 ).mul( pow( float( 1 ).sub( dotNV ), 2 ) ).mul( auroraConfig.forwardScatter ).mul( uniforms.forwardToggle );
+	const forwardScatter = pow( backLight, 6 ).mul( float( 1 ).sub( dotNV ).pow2() ).mul( auroraConfig.forwardScatter ).mul( uniforms.forwardToggle );
 	// 棱线透光：高度场拉普拉斯为负（凸）的地方是雪丘棱线，薄处透光
 	const curvature = texture( state.heightTexture, terrainUV( worldXZ ) ).g;
 	const ridge = smoothstep( 0.0, 0.06, curvature.negate() );
-	const ridgeGlow = ridge.mul( pow( backLight, 2 ) ).mul( float( 0.35 ).add( pow( float( 1 ).sub( dotNV ), 3 ) ) ).mul( auroraConfig.ridgeGlow ).mul( uniforms.ridgeToggle );
+	const ridgeGlow = ridge.mul( backLight.pow2() ).mul( float( 0.35 ).add( pow( max( float( 1 ).sub( dotNV ), 0 ), 3 ) ) ).mul( auroraConfig.ridgeGlow ).mul( uniforms.ridgeToggle );
 
 	// ---------- ⑧ 闪光：月光算一次，极光（朝上偏北）也算一次 ----------
 	const sparkleInputs = {

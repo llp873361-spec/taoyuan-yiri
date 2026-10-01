@@ -316,3 +316,87 @@ export function jsFbm2D( x, y, octaves = 4, lacunarity = 2.0, gain = 0.5 ) {
 	return sum / amplitudeSum;
 
 }
+
+// ===================== 噪声贴图 =====================
+// 大面积的远景（地形、云）每个像素要好几层噪声，用上面的哈希 value noise 一层就是 8 轮整数哈希，很贵。
+// 这里先在 CPU 上把可平铺的 value noise 烘成一张 RGBA8 贴图，着色器里一次硬件双线性取样顶一层噪声：
+//   R、G：两张独立的噪声（0~1，五次插值，和上面的 valueNoise2D 同一种曲线）；
+//   B、A：R 的梯度 ∂R/∂u、∂R/∂v（每个格子为单位，按 /4 + 0.5 编到 0~1），做水面微波的法线用，不用再多取样做差分。
+// 一张贴图 size × size 像素、cells × cells 个格子（每格 size / cells 像素），四边无缝平铺；开 mipmap，远处自动取平均，不闪。
+// JS 版 sampleNoiseTexture 用同一份数据双线性取样，CPU 上摆东西（比如树）和 GPU 画出来的地表对得上（近处一致，远处 GPU 多了 mipmap 的平均）。
+
+function jsQuinticDerivative( fraction ) {
+
+	return 30 * fraction * fraction * ( fraction - 1 ) * ( fraction - 1 );
+
+}
+
+export function createNoiseTextureData( size = 256, cells = 32, seed = 0 ) {
+
+	const data = new Uint8Array( size * size * 4 );
+	const cellPixels = size / cells;
+	// 格点哈希，格子坐标对 cells 取模：贴图左右、上下接得上
+	const corner = ( cellX, cellY, channel ) => jsHash21( ( ( cellX % cells ) + cells ) % cells + channel * 4099 + seed * 131, ( ( cellY % cells ) + cells ) % cells + channel * 7919 - seed * 59 );
+
+	for ( let y = 0; y < size; y ++ ) {
+
+		for ( let x = 0; x < size; x ++ ) {
+
+			// 像素中心在格子坐标里的位置
+			const cellCoordX = ( x + 0.5 ) / cellPixels;
+			const cellCoordY = ( y + 0.5 ) / cellPixels;
+			const cellX = Math.floor( cellCoordX );
+			const cellY = Math.floor( cellCoordY );
+			const fractionX = cellCoordX - cellX;
+			const fractionY = cellCoordY - cellY;
+			const weightX = jsQuintic( fractionX );
+			const weightY = jsQuintic( fractionY );
+			const offset = ( y * size + x ) * 4;
+
+			for ( let channel = 0; channel < 2; channel ++ ) {
+
+				const corner00 = corner( cellX, cellY, channel );
+				const corner10 = corner( cellX + 1, cellY, channel );
+				const corner01 = corner( cellX, cellY + 1, channel );
+				const corner11 = corner( cellX + 1, cellY + 1, channel );
+				const bottom = corner00 + ( corner10 - corner00 ) * weightX;
+				const top = corner01 + ( corner11 - corner01 ) * weightX;
+				data[ offset + channel ] = Math.round( ( bottom + ( top - bottom ) * weightY ) * 255 );
+
+				if ( channel === 0 ) {
+
+					// 解析梯度（每格为单位）：d/dx = ((c10 − c00) + (c00 − c10 − c01 + c11)·wy)·w'x
+					const gradientX = ( corner10 - corner00 + ( corner00 - corner10 - corner01 + corner11 ) * weightY ) * jsQuinticDerivative( fractionX );
+					const gradientY = ( corner01 - corner00 + ( corner00 - corner10 - corner01 + corner11 ) * weightX ) * jsQuinticDerivative( fractionY );
+					data[ offset + 2 ] = Math.round( Math.min( 1, Math.max( 0, gradientX / 4 + 0.5 ) ) * 255 );
+					data[ offset + 3 ] = Math.round( Math.min( 1, Math.max( 0, gradientY / 4 + 0.5 ) ) * 255 );
+
+				}
+
+			}
+
+		}
+
+	}
+
+	return { data, size, cells };
+
+}
+
+// JS 双线性取样（重复平铺），u、v 以"一张贴图"为单位；返回 0~1
+export function sampleNoiseTexture( noise, u, v, channel ) {
+
+	const size = noise.size;
+	const pixelX = u * size - 0.5;
+	const pixelY = v * size - 0.5;
+	const x0 = Math.floor( pixelX );
+	const y0 = Math.floor( pixelY );
+	const fractionX = pixelX - x0;
+	const fractionY = pixelY - y0;
+	const wrap = ( value ) => ( ( value % size ) + size ) % size;
+	const read = ( x, y ) => noise.data[ ( wrap( y ) * size + wrap( x ) ) * 4 + channel ] / 255;
+	const bottom = read( x0, y0 ) + ( read( x0 + 1, y0 ) - read( x0, y0 ) ) * fractionX;
+	const top = read( x0, y0 + 1 ) + ( read( x0 + 1, y0 + 1 ) - read( x0, y0 + 1 ) ) * fractionX;
+	return bottom + ( top - bottom ) * fractionY;
+
+}

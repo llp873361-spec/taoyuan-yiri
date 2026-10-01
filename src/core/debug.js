@@ -14,6 +14,7 @@ export function createDebug( ctx, enabled ) {
 			removeSceneToggles: noop,
 			onFrame: noop,
 			setTimelineHooks: noop,
+			addWorldControls: noop,
 			setVisible: noop,
 			dispose: noop,
 		};
@@ -38,6 +39,7 @@ export function createDebug( ctx, enabled ) {
 		渲染目标: 0,
 		绘制调用: 0,
 		程序: 0,
+		显卡ms: 0,
 	};
 
 	const statsFolder = gui.addFolder( '状态' );
@@ -86,6 +88,41 @@ export function createDebug( ctx, enabled ) {
 
 	}
 
+	// ===== 秘境俯瞰（?world=1）=====
+	let worldRefresh = null;
+
+	function addWorldControls( worldHooks ) {
+
+		const folder = gui.addFolder( '秘境俯瞰' );
+		const locations = worldHooks.getLocations();
+		const worldState = { 时刻: worldHooks.getDayTime(), 流速: 0 };
+		folder.add( worldState, '时刻', 0, 24, 0.05 ).name( '时刻（小时）' ).listen().onChange( ( value ) => worldHooks.setDayTime( value ) );
+		folder.add( worldState, '流速', 0, 2, 0.05 ).name( '流速（小时/秒）' ).onChange( ( value ) => worldHooks.setDaySpeed( value ) );
+		// 每个地点一个按钮（下拉框选同一项不会触发，跳走以后想回来就不灵）
+		for ( const location of locations ) {
+
+			const action = { [ '跳到' + location.name ]: () => worldHooks.jumpToLocation( location.key ) };
+			folder.add( action, '跳到' + location.name );
+
+		}
+		const actions = {
+			高空俯瞰: () => worldHooks.showAerial(),
+			正上方地图: () => worldHooks.showMap(),
+		};
+		folder.add( actions, '高空俯瞰' );
+		folder.add( actions, '正上方地图' );
+		worldRefresh = () => {
+
+			worldState.时刻 = Math.round( worldHooks.getDayTime() * 100 ) / 100;
+
+		};
+
+		// 俯瞰模式全程是自由相机，没有导演路线可以回去，关掉会掉到地底下：把开关锁住
+		cameraState.自由相机 = true;
+		freeCameraController.disable();
+
+	}
+
 	// ===== 画质 =====
 	const qualityState = { 档位: ctx.quality.tier };
 	const qualityFolder = gui.addFolder( '画质' );
@@ -98,7 +135,7 @@ export function createDebug( ctx, enabled ) {
 	// ===== 相机 =====
 	const cameraState = { 自由相机: false };
 	const cameraFolder = gui.addFolder( '相机' );
-	cameraFolder.add( cameraState, '自由相机' ).onChange( ( value ) => {
+	const freeCameraController = cameraFolder.add( cameraState, '自由相机' ).onChange( ( value ) => {
 
 		ctx.director.freeMode = value;
 
@@ -199,6 +236,8 @@ export function createDebug( ctx, enabled ) {
 		}
 
 		cameraState.自由相机 = ctx.director.freeMode;
+		if ( worldRefresh ) worldRefresh();
+		stats.显卡ms = Math.round( ( ctx.quality.gpuMs || 0 ) * 100 ) / 100;
 
 	}
 
@@ -224,6 +263,7 @@ export function createDebug( ctx, enabled ) {
 		removeSceneToggles,
 		onFrame,
 		setTimelineHooks,
+		addWorldControls,
 		setVisible,
 		dispose,
 	};

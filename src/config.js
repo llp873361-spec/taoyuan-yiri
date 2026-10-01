@@ -96,6 +96,24 @@ const config = {
 		walkSpeed: 1.4,          // 步行速度（米/秒）
 		runMultiplier: 3,        // 按住 Shift 的倍数
 		walkSmoothing: 6,        // 起步停步的缓动（越大越跟手）
+		// 呼吸感和行走感（幅度都很小，不能晕；enabled 改 false 整个关掉）
+		sway: {
+			enabled: true,
+			breathPeriod: 4,       // 呼吸一次多少秒
+			breathHeight: 0.012,   // 呼吸的上下起伏（米）
+			breathPitch: 0.15,     // 呼吸带的俯仰（度）
+			breathRoll: 0.08,      // 呼吸带的横滚（度）
+			stepLength: 0.78,      // 一步多长（米）：步行 1.4 米/秒时约每秒 1.8 步
+			bobHeight: 0.028,      // 每一步的上下颠（米）
+			bobSide: 0.015,        // 两步一个来回的左右晃（米）
+			bobRoll: 0.25,         // 左右晃带的横滚（度）
+			bobPitch: 0.08,        // 每一步带的点头（度）
+			runExtra: 0.6,         // 跑起来晃动最多再加多少（相对步行）
+			blendSpeed: 5,         // 起步停步时晃动的过渡快慢
+			floatPeriod: 7,        // 坐船、飞行时漂浮一次多少秒
+			floatHeight: 0.035,    // 漂浮的上下幅度（米）
+			floatRoll: 0.2,        // 漂浮的横滚（度）
+		},
 		walkPitchMax: 80,        // 步行时抬头低头的最大角度（度）
 	},
 
@@ -107,11 +125,14 @@ const config = {
 		benchmarkSeconds: 2,          // 开场页基准测试时长
 		benchmarkDowngradeMs: 16.7,   // 基准测试平均帧时间超过这个就降一档
 		dynamic: {
-			slowFrameMs: 20,       // 连续 slowFrames 帧超过这个毫秒数 → 降 0.1
-			slowFrames: 30,
-			fastFrameMs: 12,       // 连续 fastFrames 帧低于这个毫秒数 → 升 0.1
-			fastFrames: 120,
-			minScale: 0.5,         // 降到底了还卡就降一档
+			// 有显卡时间戳（WebGPU 大多有）：每帧显卡干活的时间超过这一档的预算才降，有余量就升回去
+			gpuBudgetMs: { hi: 14, mid: 22, lo: 28 },
+			// 没有显卡计时：帧间隔比"刷新间隔"长 45% 以上、且超过 slowFrameMs 才算掉帧（被垂直同步或浏览器限帧卡住不算）
+			slowFrameMs: 20,
+			slowFrames: 30,        // 连续这么多帧超预算 → 渲染比例降 0.1
+			fastFrames: 120,       // 连续这么多帧有余量 → 升 0.1（没有显卡计时时要两倍这么多帧，且离上次降至少 raiseCooldown 秒）
+			raiseCooldown: 20,     // 没有显卡计时时，降比例以后至少等这么多秒才试着升回去
+			minScale: 0.5,         // 降到底了还超预算就降一档
 			step: 0.1,
 		},
 		tiers: {
@@ -144,6 +165,74 @@ const config = {
 
 	// ===== 场景细节开关 =====
 	footprintsReveal: true,   // 雪原脚印随人往前走一个一个出现在前方
+
+	// ===== 秘境：世界地图和一天的天空（CLAUDE.md 5.0）=====
+	// 坐标：+x 东、−z 北、y 海拔（米）；方位角从北顺时针量（度）。时刻用小时（5.75 = 05:45），24 小时循环
+	world: {
+		// 每个地点：原点（本地 0,0,0 在世界里的位置）、yaw（本地 −z 在世界里的方位角）、内容半径（米，这个范围里是地点自己的细节）
+		locations: {
+			overture: { name: '溪口桃花林', origin: [ - 480, 10, 2150 ], yaw: 355, contentRadius: 450 },
+			garden: { name: '白银花园', origin: [ - 430, 24, 1380 ], yaw: 75, contentRadius: 350, landmark: [ - 110, 24, 1295 ] },
+			sunset: { name: '落日海湾', origin: [ - 1250, 0, 150 ], yaw: 280, contentRadius: 2000 },
+			gothic: { name: '哥特城堡', origin: [ - 50, 57, - 40 ], yaw: 72, contentRadius: 700, landmark: [ 520, 95, - 225 ] },
+			starry: { name: '星月夜', origin: [ 150, 210, - 1250 ], yaw: 160, contentRadius: 500, landmark: [ 235, 175, - 1015 ] },
+			aurora: { name: '极光雪原', origin: [ 100, 560, - 1900 ], yaw: 0, contentRadius: 1100 },
+		},
+		cave: { outer: [ - 520, 26, 1640 ], inner: [ - 520, 30, 1570 ] },
+		lake: { center: [ 230, - 130 ], radiusX: 270, radiusZ: 200, level: 55 },
+		// 河：湖南端 → 花园 → 西边入海；小镇溪：冰瀑脚 → 湖北端；桃花溪：洞外口 → 往南出山（渔人从这里来）
+		// key 是程序里认的名字（不要改）；name 只是给人看的。控制点之间按曲线重采样、加一点蜿蜒（地点附近不蜿蜒）
+		rivers: [
+			{ key: 'river', name: '河', width: 26, points: [ [ 200, 54.5, 60 ], [ 140, 46, 380 ], [ - 40, 36, 780 ], [ - 210, 28, 1120 ], [ - 300, 24, 1300 ], [ - 620, 14, 1260 ], [ - 930, 6, 930 ], [ - 1300, 0, 640 ], [ - 1560, 0, 560 ] ] },
+			{ key: 'townStream', name: '小镇溪', width: 9, points: [ [ 150, 210, - 1690 ], [ 230, 190, - 1420 ], [ 260, 165, - 1030 ], [ 270, 110, - 650 ], [ 250, 56, - 320 ] ] },
+			{ key: 'peachStream', name: '桃花溪', width: 10, points: [ [ - 520, 25, 1660 ], [ - 500, 18, 1880 ], [ - 480, 10, 2150 ], [ - 450, 6, 2500 ], [ - 380, 3, 2900 ] ] },
+		],
+		// 一天的天空关键帧（按时刻插值）。sun / moon 是 [方位角, 仰角]（度）；颜色是 sRGB；intensity 是天空整体亮度（HDR 倍数）
+		//   zenith 天顶；horizon 地平线（侧面）；sunHorizon 太阳那边的地平线；earthShadow 背着太阳的地平线；
+		//   belt 维纳斯带颜色和强度；glow 太阳周围的光晕颜色和强度；mist 贴地薄雾（0~1）；stars / moonLight 星星、月光的强度
+		skyKeys: [
+			{ time: 0.5, sun: [ 0, - 40 ], moon: [ 185, 35 ], intensity: 0.07, zenith: '#03060f', horizon: '#101a38', sunHorizon: '#101a38', earthShadow: '#0b1530', belt: '#1a2448', beltAmount: 0, glow: '#000000', glowAmount: 0, mist: 0.3, stars: 1, moonLight: 1 },
+			{ time: 4.0, sun: [ 45, - 15 ], moon: [ 322, 15 ], intensity: 0.06, zenith: '#03060f', horizon: '#0d1730', sunHorizon: '#1a2550', earthShadow: '#0a1228', belt: '#1a2448', beltAmount: 0, glow: '#000000', glowAmount: 0, mist: 0.35, stars: 1, moonLight: 1 },
+			{ time: 5.0, sun: [ 75, - 8 ], moon: [ 328, 10 ], intensity: 0.22, zenith: '#14204a', horizon: '#3b4a7e', sunHorizon: '#9a7a9a', earthShadow: '#26305a', belt: '#5a4a78', beltAmount: 0.3, glow: '#c08080', glowAmount: 0.2, mist: 0.7, stars: 0.35, moonLight: 0.6 },
+			{ time: 5.75, sun: [ 77, - 0.5 ], moon: [ 335, 4 ], intensity: 0.75, zenith: '#8fa6d6', horizon: '#e6c9c4', sunHorizon: '#ffcfae', earthShadow: '#9aa2c8', belt: '#e8b6c0', beltAmount: 0.4, glow: '#ffd9c2', glowAmount: 0.9, mist: 0.7, stars: 0, moonLight: 0.2 },
+			{ time: 6.6, sun: [ 82, 7 ], moon: [ 340, - 5 ], intensity: 1.0, zenith: '#bcd3ee', horizon: '#f3e3df', sunHorizon: '#ffe6cc', earthShadow: '#c8d2ea', belt: '#f0d0d4', beltAmount: 0.1, glow: '#fff0dc', glowAmount: 1.0, mist: 0.5, stars: 0, moonLight: 0 },
+			{ time: 9.0, sun: [ 110, 32 ], moon: [ 0, - 40 ], intensity: 1.15, zenith: '#5d8fd8', horizon: '#d6e6f4', sunHorizon: '#eef4fa', earthShadow: '#cfdff0', belt: '#ffffff', beltAmount: 0, glow: '#fff6e8', glowAmount: 0.6, mist: 0.15, stars: 0, moonLight: 0 },
+			{ time: 12.5, sun: [ 180, 52 ], moon: [ 60, - 50 ], intensity: 1.2, zenith: '#4a82d4', horizon: '#d2e4f4', sunHorizon: '#e8f0fa', earthShadow: '#cfe0f2', belt: '#ffffff', beltAmount: 0, glow: '#fff8ec', glowAmount: 0.5, mist: 0, stars: 0, moonLight: 0 },
+			{ time: 16.5, sun: [ 255, 22 ], moon: [ 90, - 30 ], intensity: 1.1, zenith: '#5a86cc', horizon: '#e4dccc', sunHorizon: '#f6e0bc', earthShadow: '#cad6e8', belt: '#ffffff', beltAmount: 0, glow: '#ffe8c8', glowAmount: 0.7, mist: 0, stars: 0, moonLight: 0 },
+			{ time: 18.85, sun: [ 280, 2.6 ], moon: [ 70, - 12 ], intensity: 0.9, zenith: '#8f6fbf', horizon: '#f27b8a', sunHorizon: '#ff9a4d', earthShadow: '#4c5276', belt: '#c47a92', beltAmount: 1, glow: '#ffb27a', glowAmount: 1.2, mist: 0.12, stars: 0, moonLight: 0 },
+			{ time: 19.0, sun: [ 281, 1.0 ], moon: [ 68, - 8 ], intensity: 0.7, zenith: '#5a4a90', horizon: '#c86a80', sunHorizon: '#ff8a4a', earthShadow: '#3c4268', belt: '#a86a88', beltAmount: 1, glow: '#ff9a5a', glowAmount: 1.0, mist: 0.18, stars: 0, moonLight: 0 },
+			{ time: 20.0, sun: [ 290, - 8 ], moon: [ 60, 3 ], intensity: 0.22, zenith: '#18204a', horizon: '#3a3a6c', sunHorizon: '#a05a6a', earthShadow: '#20284c', belt: '#4a3a62', beltAmount: 0.3, glow: '#a05a5a', glowAmount: 0.25, mist: 0.35, stars: 0.4, moonLight: 0.6 },
+			{ time: 21.0, sun: [ 300, - 13 ], moon: [ 72, 12 ], intensity: 0.12, zenith: '#0b1636', horizon: '#1d2c5c', sunHorizon: '#2a2e5c', earthShadow: '#141f44', belt: '#1d2c5c', beltAmount: 0, glow: '#000000', glowAmount: 0, mist: 0.45, stars: 0.8, moonLight: 1 },
+			{ time: 23.9, sun: [ 340, - 35 ], moon: [ 172, 33 ], intensity: 0.1, zenith: '#0b1a4a', horizon: '#1b3a8c', sunHorizon: '#1b3a8c', earthShadow: '#14286a', belt: '#1b3a8c', beltAmount: 0, glow: '#000000', glowAmount: 0, mist: 0.35, stars: 1, moonLight: 1 },
+		],
+		sunDiscRadius: 1.2,        // 太阳圆盘角半径（度），和落日一致
+		sunDiscIntensity: 28,      // 太阳圆盘 HDR 亮度
+		moonDiscRadius: 0.9,       // 月亮圆盘角半径（度）
+		hazeDistance: 9000,        // 远景的大气透视：海拔 0 处这么远混一半地平线雾霭（越高空气越干净，见 hazeFalloff）
+		// 远景地形：核心区（盆地和四周的山）网格细，外圈粗；核心区网格间距按档位（lo 给软件渲染和老核显）
+		terrain: { coreSize: [ 4200, 4800 ], coreCenter: [ 100, 200 ], coreSpacing: { hi: 12.5, mid: 12.5, lo: 25 }, outerSize: 20000, outerSpacing: 75 },   // 外圈间距要能整除核心区的长宽，两块网格的边才对得齐
+		biomeSpacing: 4,           // 地表图（河、桃林、花海、天光遮蔽）的像素间距（米）
+		horizonSpacing: 25,        // 地形阴影用的地平线图间距（米），16 个方向
+		hazeFalloff: 1500,         // 大气透视的高度衰减（米）：越高空气越干净
+		mistDensity: 0.0005,       // 贴地薄雾在海拔 0 处的密度（每米，再乘 mist）；薄雾最多盖一半，远处地点的剪影还认得出
+		mistFalloff: 55,           // 薄雾的衰减高度（米）：只贴着盆地底和湖面
+		clouds: { height: 4500, coverage: 0.4, scale: 2400, speed: 7, direction: 70, octaves: { hi: 5, mid: 4, lo: 3 } },   // 薄云：高度（米）、覆盖率、尺度（米）、风速（米/秒）、风往哪个方位吹（度）
+		windowLights: { gothic: 260, starry: 120 },   // 远景里的窗灯数量
+		windowIntensity: 6,        // 窗灯 HDR 亮度（3~8）
+		windowColor: '#ffb35c',
+		// 秘境俯瞰（?world=1）：只看远景，自由飞行，调时刻
+		overview: {
+			near: 1,
+			far: 30000,
+			moveSpeed: 150,         // 米/秒，按住 Shift 乘 4
+			startTime: 6.2,
+			grading: { exposure: 1.0, contrast: 1.04, saturation: 1.05, tint: '#ffffff', tintAmount: 0, toneMapping: 'agx', grain: 0.004 },
+			aerial: { position: [ 100, 3000, 3600 ], lookAt: [ 100, 0, - 300 ] },   // 3 公里高空，从南往北斜着看整个盆地
+			map: { position: [ 100, 6200, 201 ], lookAt: [ 100, 0, 200 ] },        // 正上方往下看，核对地图
+			// 环视时每个地点用的时刻（规格书 5.0 的时刻表取中间）
+			locationTimes: { overture: 5.3, garden: 6.2, sunset: 18.9, gothic: 21.1, starry: 0.0, aurora: 4.2 },
+		},
+	},
 
 	// ===== 场景 2：落日与海 =====
 	sunset: {

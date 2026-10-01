@@ -27,6 +27,7 @@ npm run build
 | `?debug` | 打开调试面板：帧率、内存、时间轴、画质、自由相机、每层效果开关 |
 | `?q=hi` / `?q=mid` / `?q=lo` | 强制画质档位 |
 | `?webgl=1` | 强制走 WebGL2（测兜底路径） |
+| `?world=1` | 秘境俯瞰：只看常驻远景，WASD 飞、QE 升降、Shift 加速；面板里拖时刻滑条、跳到各地点 |
 
 参数可以组合，比如 `index.html?debug&q=lo`。
 
@@ -49,6 +50,7 @@ node scripts/shot.mjs --backend=webgpu --scene=aurora --layers
 - `--layers`：额外截逐层对比图（每个机位全开一张，再每次只关一层）
 - `--query=q=lo`：给页面加参数
 - `--software`：用软件渲染模拟没显卡的电脑
+- `--world`：秘境俯瞰模式的截图（3 公里高空俯瞰四个时刻、正上方地图、每个地点 8 方向环视），文件名以 `world_` 开头
 
 截图在 `shots/`，报告在 `shots/report.json`。有报错、外部请求或泄漏时退出码为 1。
 
@@ -64,4 +66,4 @@ npm run opt
 
 ## 可调参数
 
-所有文字和数字都在 `src/config.js`：开场和结尾文字、各场景时长、调色、转场、画质三档、后期、音频；落日的太阳 / 天空 / 晚霞 / 海浪 / 光路 / 闪点 / 泡沫（`sunset` 段）；雪原的月亮 / 雾 / 极光 / 闪光（`aurora` 段）。改完重新 `npm run build`。
+所有文字和数字都在 `src/config.js`：开场和结尾文字、各场景时长、调色、转场、画质三档、后期、音频；落日的太阳 / 天空 / 晚霞 / 海浪 / 光路 / 闪点 / 泡沫（`sunset` 段）；雪原的月亮 / 雾 / 极光 / 闪光（`aurora` 段）；秘境的地点坐标、一天各时刻的天色、远景的雾 / 薄雾 / 云 / 窗灯（`world` 段）；镜头的呼吸感和走路晃动（`camera.sway`，`enabled` 改 false 整个关掉）。改完重新 `npm run build`。
