@@ -6,13 +6,18 @@
 //   雪材质：MeshPhysicalNodeMaterial 的子类，逐层叠加 ①~⑧（见 createSnowMaterial），每层一个 uniform 开关
 //   脚印：启动时生成 32 种脚印的图集，着色器按"第几步、左右脚"挑一个；20 米内视差遮蔽，20 米外只改法线
 //   极光：分层采样画到一张"方向参数化"的半球贴图里（转头不拖影），指数滑动平均去条纹；再降采样成平均色照亮雪地
-//   天空：渐变 + 星星 + 月亮 + 极光贴图；远山剪影；贴地高度雾
+//   天空：渐变 + 星星 + 月亮 + 极光贴图；贴地高度雾
 //   粒子：飘雪（两层，全 GPU）、地吹雪卷流带 + 少量贴地亮粒
 //   岩石、枯树：程序化
+//
+// 接入秘境（4b）：原点在台地南缘崖边，先朝南看整个秘境的夜景（远景画），再转身往北沿脚印走。
+// 远山、外圈平雪删了，四周是世界真实的台地和山（远景，雪原的贴地雾也盖到它上面）；本地地形四边渐变到远景画出来的高度，
+// 崖外的部分裁掉，雪原范围里的远景压低让开；月亮按世界的时刻走（03:40~04:45 钉在 322°/15°，和阶段 1 一样）；
+// 天空是叠加在统一天空上的透明层，交接时渐变过去；内容按 locationVeil 化进同色薄雾
 
 import * as THREE from 'three/webgpu';
 import {
-	Fn, If, Loop, Break, uniform, float, int, vec2, vec3, vec4, color, texture, uv,
+	Fn, If, Loop, Break, uniform, float, int, vec2, vec3, vec4, color, texture, uv, varying, array, vertexIndex,
 	positionWorld, positionView, positionLocal, normalWorld, normalViewGeometry, normalWorldGeometry, cameraPosition, cameraViewMatrix,
 	instanceIndex, faceDirection, BRDF_Lambert, diffuseContribution, normalView,
 	mix, smoothstep, clamp, max, min, abs, pow, exp, sqrt, sin, cos, atan, asin, floor, fract, length, normalize, dot, cross,
@@ -94,19 +99,49 @@ const state = {
 	currentTier: '',
 	rockSpots: [],
 	treePosition: new THREE.Vector3(),
+	cliffZ: null,          // 每一列的崖（本地 z）
+	cutZ: null,            // 每一列地形裁到哪里
+	veil: null,
+	auroraScenes: null,    // 极光的两个全屏 pass 各套一个场景（异步预编译要场景）
+	fogColor: new THREE.Color(),
+	fogScatter: new THREE.Color(),
+	worldMoon: new THREE.Vector3(),
 };
 
 // ===================== 地形高度场（CPU）=====================
 
-function terrainHeightRaw( x, z, rocks ) {
+// 这个场景是在上一个地点停留时后台加载的：CPU 上的大循环切成小段，每段不超过约 10 毫秒就让出主线程一次
+// （用 setTimeout 而不是 requestAnimationFrame：截图模式下帧是手动推进的）
+const sliceBudget = 10;
+const yieldToBrowser = () => new Promise( ( resolve ) => setTimeout( resolve, 0 ) );
+
+async function yieldIfBusy( slice ) {
+
+	if ( performance.now() - slice.start > sliceBudget ) {
+
+		await yieldToBrowser();
+		slice.start = performance.now();
+
+	}
+
+}
+
+function smooth01( value ) {
+
+	const t = Math.min( 1, Math.max( 0, value ) );
+	return t * t * ( 3 - 2 * t );
+
+}
+
+// 雪原自己的地形（不含和世界的接缝）。windCos / windSin 是风向，循环外面先算好
+function terrainHeightRaw( x, z, rocks, windCos, windSin ) {
 
 	// 大尺度起伏：波长约 120 米，高差 8~12 米
 	const large = ( jsFbm2D( x / 120 + 3.1, z / 120 - 7.4, 3 ) - 0.5 ) * 2 * 14;
 
 	// 中尺度雪丘：沿风向略拉长，波长 15~30 米；先 smoothstep 再 1-(1-t)² 做成"枕头"——顶部鼓圆、谷底收窄，没有尖棱
-	const windAngle = state.ctx.config.aurora.windDirection * Math.PI / 180;
-	const along = x * Math.cos( windAngle ) + z * Math.sin( windAngle );
-	const across = - x * Math.sin( windAngle ) + z * Math.cos( windAngle );
+	const along = x * windCos + z * windSin;
+	const across = - x * windSin + z * windCos;
 	const duneNoise = jsFbm2D( along / 30, across / 18, 3 );
 	const duneT = Math.min( 1, Math.max( 0, ( duneNoise - 0.3 ) / 0.45 ) );
 	const duneSmooth = duneT * duneT * ( 3 - 2 * duneT );
@@ -122,15 +157,11 @@ function terrainHeightRaw( x, z, rocks ) {
 
 	let height = large + dunes;
 
-	// 地形最外 80 米平滑落到海拔 0，和外面那圈平的雪接上，走到哪都看不到断崖
-	const halfSize = state.terrainSize / 2;
-	const borderDistance = Math.min( halfSize - Math.abs( x ), halfSize - Math.abs( z - state.terrainCenterZ ) );
-	const borderT = Math.min( 1, Math.max( 0, borderDistance / 80 ) );
-	height *= borderT * borderT * ( 3 - 2 * borderT );
-
-	// 岩石脚下一圈堆雪（被雪半埋的感觉）
+	// 岩石脚下一圈堆雪（被雪半埋的感觉）；离得远的直接跳过
 	for ( const rock of rocks ) {
 
+		const reach = rock.size * 1.7 * 3;
+		if ( Math.abs( x - rock.x ) > reach || Math.abs( z - rock.z ) > reach ) continue;
 		const distance = Math.hypot( x - rock.x, z - rock.z );
 		const ratio = distance / ( rock.size * 1.7 );
 		height += rock.size * 0.35 * Math.exp( - ratio * ratio );
@@ -141,29 +172,102 @@ function terrainHeightRaw( x, z, rocks ) {
 
 }
 
-// 生成高度场 + 曲率（拉普拉斯），存成 RG 半精度纹理
-function buildHeightField( resolution, size, centerZ, rocks ) {
+// 远景网格在本地 (x, z) 画出来的高度（本地坐标）；远景还没建好就用世界的解析高度
+const tempWorldPoint = new THREE.Vector3();
+function backdropHeightAt( x, z ) {
+
+	const ctx = state.ctx;
+	const location = ctx.world.locations[ key ];
+	ctx.world.toWorld( tempWorldPoint.set( x, 0, z ), key, tempWorldPoint );
+	let height = ctx.backdrop.getTerrainHeight( tempWorldPoint.x, tempWorldPoint.z );
+	if ( ! Number.isFinite( height ) ) height = ctx.world.worldHeight( tempWorldPoint.x, tempWorldPoint.z );
+	return height - location.origin[ 1 ];
+
+}
+
+// 和世界接缝（4b）：雪原自己的地形只在"里面"，往四边（北、东、西 80 米，南边的看台 40 米）渐变到远景画出来的高度 + 0.3 米
+// （盖住远景、不共面闪）；原点往南的看台坡完全贴着远景，铺的还是雪原自己的雪（闪点、颗粒都在）。
+// 崖边：每一列从原点往南找崖（远景高度 2 米内降 1.2 米以上），崖前 1.5 米为止，再往外的顶点夹到这条线上（退化三角形，不画）
+const borderBlend = 80;
+const rimBlend = 40;
+
+async function buildHeightField( resolution, size, centerZ, rocks ) {
 
 	const heights = new Float32Array( resolution * resolution );
 	const cellSize = size / ( resolution - 1 );
+	const slice = { start: performance.now() };
+	const windAngle = state.ctx.config.aurora.windDirection * Math.PI / 180;
+	const windCos = Math.cos( windAngle );
+	const windSin = Math.sin( windAngle );
+	const minZ = centerZ - size / 2;
+	const maxZ = centerZ + size / 2;
 
-	for ( let j = 0; j < resolution; j ++ ) {
+	// 每一列的崖：从 z = 0 往南按 0.5 米一步找第一处陡降
+	const cliffZ = new Float32Array( resolution );
+	for ( let i = 0; i < resolution; i ++ ) {
 
-		const z = centerZ - size / 2 + j * cellSize;
-		for ( let i = 0; i < resolution; i ++ ) {
+		const x = - size / 2 + i * cellSize;
+		cliffZ[ i ] = maxZ;
+		let previous = backdropHeightAt( x, 0 );
+		for ( let z = 0.5; z <= maxZ; z += 0.5 ) {
 
-			const x = - size / 2 + i * cellSize;
-			heights[ j * resolution + i ] = terrainHeightRaw( x, z, rocks );
+			const current = backdropHeightAt( x, z );
+			const ahead = backdropHeightAt( x, z + 2 );
+			if ( current - ahead > 1.2 || previous - current > 0.6 ) {
+
+				cliffZ[ i ] = z;
+				break;
+
+			}
+
+			previous = current;
 
 		}
 
+		await yieldIfBusy( slice );
+
 	}
 
-	// 拉普拉斯（凸起处为负）。隔一格取样，量的是雪丘尺度的弯曲而不是单格噪声
-	const halfData = new Uint16Array( resolution * resolution * 2 );
-	const reach = 2;
+	// 裁切线 = 崖前 1.5 米，再沿 x 在 ±6 米里取最小（参差的崖边不会切出锯齿）
+	const reachCells = Math.ceil( 6 / cellSize );
+	const cutZ = new Float32Array( resolution );
+	for ( let i = 0; i < resolution; i ++ ) {
+
+		let lowest = Infinity;
+		for ( let k = Math.max( 0, i - reachCells ); k <= Math.min( resolution - 1, i + reachCells ); k ++ ) lowest = Math.min( lowest, cliffZ[ k ] );
+		cutZ[ i ] = Math.max( 0, lowest - 1.5 );
+
+	}
+
+	state.cliffZ = cliffZ;
+	state.cutZ = cutZ;
+
 	for ( let j = 0; j < resolution; j ++ ) {
 
+		const z = minZ + j * cellSize;
+		for ( let i = 0; i < resolution; i ++ ) {
+
+			const x = - size / 2 + i * cellSize;
+			// 崖外的点按裁切线上的高度算（贴图采样到那里不会顺着崖往下掉）
+			const sampleZ = Math.min( z, cutZ[ i ] );
+			const raw = terrainHeightRaw( x, sampleZ, rocks, windCos, windSin );
+			const drawn = backdropHeightAt( x, sampleZ );
+			const interior = smooth01( Math.min( size / 2 - Math.abs( x ), sampleZ - minZ ) / borderBlend ) * ( sampleZ < 0 ? smooth01( - sampleZ / rimBlend ) : 0 );
+			heights[ j * resolution + i ] = drawn + 0.3 + ( raw - drawn - 0.3 ) * interior;
+
+		}
+
+		await yieldIfBusy( slice );
+
+	}
+
+	// R 高度、G 拉普拉斯（凸起处为负，隔一格取样，量的是雪丘尺度的弯曲而不是单格噪声）、B 在崖内的程度（地吹雪、亮粒乘它）
+	const halfData = new Uint16Array( resolution * resolution * 4 );
+	const reach = 2;
+	const one = THREE.DataUtils.toHalfFloat( 1 );
+	for ( let j = 0; j < resolution; j ++ ) {
+
+		const z = minZ + j * cellSize;
 		for ( let i = 0; i < resolution; i ++ ) {
 
 			const index = j * resolution + i;
@@ -172,14 +276,19 @@ function buildHeightField( resolution, size, centerZ, rocks ) {
 			const down = heights[ Math.max( 0, j - reach ) * resolution + i ];
 			const up = heights[ Math.min( resolution - 1, j + reach ) * resolution + i ];
 			const laplacian = ( left + right + down + up - 4 * heights[ index ] ) / ( ( reach * cellSize ) * ( reach * cellSize ) );
-			halfData[ index * 2 ] = THREE.DataUtils.toHalfFloat( heights[ index ] );
-			halfData[ index * 2 + 1 ] = THREE.DataUtils.toHalfFloat( laplacian );
+			const inside = 1 - smooth01( ( z - ( cutZ[ i ] - 4 ) ) / 3.5 );
+			halfData[ index * 4 ] = THREE.DataUtils.toHalfFloat( heights[ index ] );
+			halfData[ index * 4 + 1 ] = THREE.DataUtils.toHalfFloat( laplacian );
+			halfData[ index * 4 + 2 ] = THREE.DataUtils.toHalfFloat( inside );
+			halfData[ index * 4 + 3 ] = one;
 
 		}
 
+		await yieldIfBusy( slice );
+
 	}
 
-	const heightTexture = new THREE.DataTexture( halfData, resolution, resolution, THREE.RGFormat, THREE.HalfFloatType );
+	const heightTexture = new THREE.DataTexture( halfData, resolution, resolution, THREE.RGBAFormat, THREE.HalfFloatType );
 	heightTexture.magFilter = THREE.LinearFilter;
 	heightTexture.minFilter = THREE.LinearFilter;
 	heightTexture.wrapS = THREE.ClampToEdgeWrapping;
@@ -188,6 +297,18 @@ function buildHeightField( resolution, size, centerZ, rocks ) {
 	heightTexture.needsUpdate = true;
 
 	return { heights, heightTexture };
+
+}
+
+// 这一列 x 的裁切线（本地 z）
+function cutZAt( x ) {
+
+	const cut = state.cutZ;
+	if ( ! cut ) return Infinity;
+	const resolution = state.heightResolution;
+	const gridX = ( x + state.terrainSize / 2 ) / state.terrainSize * ( resolution - 1 );
+	const i = Math.min( resolution - 1, Math.max( 0, Math.round( gridX ) ) );
+	return cut[ i ];
 
 }
 
@@ -214,19 +335,81 @@ function heightAt( x, z ) {
 
 }
 
-function buildTerrainGeometry( segments, size, centerZ ) {
+// 地形网格：和 PlaneGeometry + rotateX + translate + computeVertexNormals 一模一样的顶点、三角形和法线（逐三角形面积加权），
+// 只是分行做、中间让出主线程。崖外的顶点夹到裁切线上（退化三角形不画，也不影响法线）
+async function buildTerrainGeometry( segments, size, centerZ ) {
 
+	const slice = { start: performance.now() };
 	const geometry = new THREE.PlaneGeometry( size, size, segments, segments );
 	geometry.rotateX( - Math.PI / 2 );
 	geometry.translate( 0, 0, centerZ );
-	const positions = geometry.attributes.position;
-	for ( let i = 0; i < positions.count; i ++ ) {
+	const positionAttribute = geometry.attributes.position;
+	const positions = positionAttribute.array;
+	const columns = segments + 1;
+	for ( let row = 0; row < columns; row ++ ) {
 
-		positions.setY( i, heightAt( positions.getX( i ), positions.getZ( i ) ) );
+		for ( let column = 0; column < columns; column ++ ) {
+
+			const index = row * columns + column;
+			const x = positions[ index * 3 ];
+			const z = Math.min( positions[ index * 3 + 2 ], cutZAt( x ) );
+			positions[ index * 3 + 1 ] = heightAt( x, z );
+			positions[ index * 3 + 2 ] = z;
+
+		}
+
+		await yieldIfBusy( slice );
 
 	}
 
-	geometry.computeVertexNormals();
+	// 法线：同 BufferGeometry.computeVertexNormals 的做法（每个三角形的叉积加到三个顶点上，最后归一化）
+	const normals = geometry.attributes.normal.array;
+	normals.fill( 0 );
+	const indices = geometry.index.array;
+	const triangleCount = indices.length / 3;
+	const pointA = new THREE.Vector3();
+	const pointB = new THREE.Vector3();
+	const pointC = new THREE.Vector3();
+	const edgeCB = new THREE.Vector3();
+	const edgeAB = new THREE.Vector3();
+	for ( let triangle = 0; triangle < triangleCount; triangle ++ ) {
+
+		const a = indices[ triangle * 3 ];
+		const b = indices[ triangle * 3 + 1 ];
+		const c = indices[ triangle * 3 + 2 ];
+		pointA.fromArray( positions, a * 3 );
+		pointB.fromArray( positions, b * 3 );
+		pointC.fromArray( positions, c * 3 );
+		edgeCB.subVectors( pointC, pointB );
+		edgeAB.subVectors( pointA, pointB );
+		edgeCB.cross( edgeAB );
+		for ( const vertex of [ a, b, c ] ) {
+
+			normals[ vertex * 3 ] += edgeCB.x;
+			normals[ vertex * 3 + 1 ] += edgeCB.y;
+			normals[ vertex * 3 + 2 ] += edgeCB.z;
+
+		}
+
+		if ( ( triangle & 8191 ) === 0 ) await yieldIfBusy( slice );
+
+	}
+
+	for ( let vertex = 0; vertex < normals.length / 3; vertex ++ ) {
+
+		const nx = normals[ vertex * 3 ];
+		const ny = normals[ vertex * 3 + 1 ];
+		const nz = normals[ vertex * 3 + 2 ];
+		const length = Math.hypot( nx, ny, nz ) || 1;
+		normals[ vertex * 3 ] = nx / length;
+		normals[ vertex * 3 + 1 ] = ny / length;
+		normals[ vertex * 3 + 2 ] = nz / length;
+
+	}
+
+	positionAttribute.needsUpdate = true;
+	geometry.attributes.normal.needsUpdate = true;
+	geometry.computeBoundingSphere();
 	return geometry;
 
 }
@@ -251,13 +434,16 @@ function ellipseDistance( x, y, centerY, radiusX, radiusY ) {
 
 }
 
-function buildFootprintAtlas() {
+async function buildFootprintAtlas() {
 
 	const width = atlasColumns * atlasTileWidth;
 	const height = atlasRows * atlasTileHeight;
 	const data = new Uint8Array( width * height * 4 );
+	const slice = { start: performance.now() };
 
 	for ( let tile = 0; tile < atlasColumns * atlasRows; tile ++ ) {
+
+		await yieldIfBusy( slice );
 
 		const column = tile % atlasColumns;
 		const row = Math.floor( tile / atlasColumns );
@@ -366,6 +552,8 @@ function hemisphereUV( direction ) {
 	return vec2( mapU, mapV );
 
 }
+
+export { hemisphereUV };
 
 // 半球贴图 UV → 方向
 function hemisphereDirection( mapUV ) {
@@ -765,10 +953,11 @@ function createSnowMaterial( tierName ) {
 
 // ===================== 极光（半球贴图）=====================
 
-function createAuroraPass( renderer ) {
+// 极光半球贴图 pass。uniforms 要有 sceneTime、frameIndex、auroraSteps（int）、auroraResolution（vec2）、auroraBlend、auroraBrightness，
+// 可选 auroraRayScale（竖向光线的密度，默认 26；全景模式的低分辨率贴图用小一点，免得走样成竖条块）；
+// 雪原自己用，全景模式（panorama.js）也用它画实时极光（低分辨率、少步数）。返回的对象带 dispose()
+export function createAuroraPass( renderer, uniforms, auroraConfig ) {
 
-	const auroraConfig = state.ctx.config.aurora;
-	const uniforms = state.uniforms;
 
 	const makeTarget = ( width, height ) => {
 
@@ -833,7 +1022,7 @@ function createAuroraPass( renderer ) {
 				const sheet = exp( across.mul( across ).negate() );
 
 				// 竖向光线：只沿帘幕方向（x）变化的高频噪声，每一层用同一个 x，所以在天上拉成竖条；缓慢横向漂移
-				const rayCoordinate = planePoint.x.mul( 26 ).add( time.mul( auroraConfig.auroraDrift ) ).add( curtain.phase * 10 );
+				const rayCoordinate = planePoint.x.mul( uniforms.auroraRayScale || 26 ).add( time.mul( auroraConfig.auroraDrift ) ).add( curtain.phase * 10 );
 				const rays = valueNoise2D( vec2( rayCoordinate, curtain.phase ) ).mul( 0.6 ).add( valueNoise2D( vec2( rayCoordinate.mul( 2.7 ), curtain.phase + 5 ) ).mul( 0.4 ) );
 				// 光线之外再有一层很慢的明暗分段：有的段亮、有的段几乎断开
 				const segment = smoothstep( 0.25, 0.75, valueNoise2D( vec2( planePoint.x.mul( 1.1 ).add( time.mul( 0.012 ) ), curtain.phase + 13 ) ) );
@@ -873,10 +1062,16 @@ function createAuroraPass( renderer ) {
 
 	} );
 
+	// 全屏三角形：顶点固定写进材质（QuadMesh.render 是画的时候临时换 vertexNode，预编译编不到那一份）
+	const fullScreenVertex = vec4( array( [ - 1.0, - 1.0, 3.0 ] ).element( vertexIndex ), array( [ 3.0, - 1.0, - 1.0 ] ).element( vertexIndex ), 0.0, 1.0 );
 	const material = new THREE.NodeMaterial();
 	material.name = '极光半球贴图';
 	material.fragmentNode = auroraColor();
+	material.vertexNode = fullScreenVertex;
 	const quad = new THREE.QuadMesh( material );
+	quad.frustumCulled = false;
+	const quadScene = new THREE.Scene();
+	quadScene.add( quad );
 
 	// 降采样成一个平均色：8×8 个方向加权平均（越靠上权重越大），给雪地当"极光照明"
 	const averageTarget = new THREE.RenderTarget( 1, 1, { type: THREE.HalfFloatType, depthBuffer: false } );
@@ -903,10 +1098,14 @@ function createAuroraPass( renderer ) {
 		return vec4( sum.div( weightSum ), 1 );
 
 	} )();
+	averageMaterial.vertexNode = fullScreenVertex;
 	const averageQuad = new THREE.QuadMesh( averageMaterial );
+	averageQuad.frustumCulled = false;
+	const averageScene = new THREE.Scene();
+	averageScene.add( averageQuad );
 
 	// QuadMesh 的几何体是模块级共享的（QuadMesh.js），后期管线也在用，不归这个场景释放
-	state.disposables.push( targets[ 0 ], targets[ 1 ], averageTarget, material, averageMaterial );
+	const disposables = [ targets[ 0 ], targets[ 1 ], averageTarget, material, averageMaterial ];
 
 	let writeIndex = 1;
 	let freshTargets = true;
@@ -914,6 +1113,20 @@ function createAuroraPass( renderer ) {
 	return {
 		targets,
 		averageTarget,
+		dispose() {
+
+			for ( const item of disposables ) item.dispose();
+
+		},
+		// 异步预编译（在各自的渲染目标上编，和真画的上下文一样）
+		compile( pipeline ) {
+
+			return Promise.all( [
+				pipeline.compileScene( quadScene, quad.camera, null, targets[ 1 ] ),
+				pipeline.compileScene( averageScene, averageQuad.camera, null, averageTarget ),
+			] );
+
+		},
 		// 天空材质里采样的节点，每帧换成刚写好的那张
 		readNode: texture( targets[ 1 ].texture ),
 		setResolution( width, height ) {
@@ -934,11 +1147,11 @@ function createAuroraPass( renderer ) {
 			freshTargets = false;
 			const previousTarget = renderer.getRenderTarget();
 			renderer.setRenderTarget( targets[ writeIndex ] );
-			quad.render( renderer );
+			renderer.render( quadScene, quad.camera );
 			this.readNode.value = targets[ writeIndex ].texture;
 			currentNode.value = targets[ writeIndex ].texture;
 			renderer.setRenderTarget( averageTarget );
-			averageQuad.render( renderer );
+			renderer.render( averageScene, averageQuad.camera );
 			renderer.setRenderTarget( previousTarget );
 			writeIndex = readIndex;
 
@@ -991,6 +1204,9 @@ function createSkyDome() {
 	material.side = THREE.BackSide;
 	material.depthWrite = false;
 	material.fog = false;
+	// 交接：叠加在统一天空（远景天空球）上的透明层，不透明度 = 1 − worldSkyBlend；停留时是 1，和阶段 1 一样
+	material.transparent = true;
+	material.opacityNode = uniforms.skyOpacity;
 
 	material.colorNode = Fn( () => {
 
@@ -1027,94 +1243,13 @@ function createSkyDome() {
 
 	} )();
 
-	const dome = new THREE.Mesh( new THREE.SphereGeometry( 1500, 64, 32 ), material );
+	// 半径 1：每帧按相机远裁剪面缩放（0.87 × far，比远景最远的山远、比远景天空球 0.9 × far 近），不会盖住远处的盆地
+	const dome = new THREE.Mesh( new THREE.SphereGeometry( 1, 64, 32 ), material );
 	dome.name = '天空球';
 	dome.renderOrder = - 10;
 	dome.frustumCulled = false;
 	state.disposables.push( dome.geometry, material );
 	return dome;
-
-}
-
-// 地形外面一圈平的雪（海拔 0），一直铺到远山脚下；地形边缘已经落到 0。
-// 用和地形同一个雪材质，明暗、颜色、斑驳都连续，接缝看不出
-function createOuterSnow( snowMaterial ) {
-
-	const size = state.terrainSize;
-	const reach = 700;
-	const centerZ = state.terrainCenterZ;
-	const strips = [
-		// 北、南两条（整宽），东、西两条（只覆盖中间）
-		{ width: size + reach * 2, depth: reach, x: 0, z: centerZ - size / 2 - reach / 2 },
-		{ width: size + reach * 2, depth: reach, x: 0, z: centerZ + size / 2 + reach / 2 },
-		{ width: reach, depth: size, x: - size / 2 - reach / 2, z: centerZ },
-		{ width: reach, depth: size, x: size / 2 + reach / 2, z: centerZ },
-	];
-	const geometries = strips.map( ( strip ) => {
-
-		const geometry = new THREE.PlaneGeometry( strip.width, strip.depth, 1, 1 );
-		geometry.rotateX( - Math.PI / 2 );
-		geometry.translate( strip.x, 0, strip.z );
-		return geometry;
-
-	} );
-	const merged = mergeGeometries( geometries, false );
-	for ( const geometry of geometries ) geometry.dispose();
-	if ( ! merged ) throw new Error( '雪原场景：外圈平雪几何体合并失败' );
-
-	const mesh = new THREE.Mesh( merged, snowMaterial );
-	mesh.name = '外圈平雪';
-	mesh.receiveShadow = true;
-	// 材质归地形登记释放，这里只登记几何体
-	state.disposables.push( merged );
-	return mesh;
-
-}
-
-// 远山剪影：一圈低矮的山，用雾溶进天空
-function createDistantMountains() {
-
-	const segments = 360;
-	// 半径要大于地形角到中心的距离（约 495 米），走到地形角上远山也还在 150 米开外，不会变成一堵墙
-	const radius = 560;
-	const positions = [];
-	const indices = [];
-
-	for ( let i = 0; i <= segments; i ++ ) {
-
-		const angle = i / segments * Math.PI * 2;
-		const x = Math.sin( angle ) * radius;
-		const z = state.terrainCenterZ - Math.cos( angle ) * radius;
-		// 山高用两层噪声，绕一圈首尾相接（用圆上的坐标采样）
-		const sampleX = Math.sin( angle ) * 6;
-		const sampleY = Math.cos( angle ) * 6;
-		const height = 17 + jsFbm2D( sampleX + 11, sampleY + 3, 4 ) * 50 + Math.pow( jsValueNoise2D( sampleX * 2.5, sampleY * 2.5 ), 3 ) * 24;
-		positions.push( x, - 20, z, x, height, z );
-
-	}
-
-	for ( let i = 0; i < segments; i ++ ) {
-
-		const bottomLeft = i * 2;
-		indices.push( bottomLeft, bottomLeft + 2, bottomLeft + 1, bottomLeft + 1, bottomLeft + 2, bottomLeft + 3 );
-
-	}
-
-	const geometry = new THREE.BufferGeometry();
-	geometry.setAttribute( 'position', new THREE.Float32BufferAttribute( positions, 3 ) );
-	geometry.setIndex( indices );
-
-	const material = new THREE.MeshBasicNodeMaterial();
-	material.name = '远山';
-	material.side = THREE.DoubleSide;
-	// 山脚暗、山顶被月光擦亮一点
-	const top = positionWorld.y.div( 85 ).clamp( 0, 1 );
-	material.colorNode = mix( color( '#0a1124' ), color( '#1f2c4f' ), pow( top, 1.5 ) );
-
-	const mesh = new THREE.Mesh( geometry, material );
-	mesh.name = '远山';
-	state.disposables.push( geometry, material );
-	return mesh;
 
 }
 
@@ -1301,7 +1436,7 @@ function createFallingSnow( { count, boxSize, size, stretch, seedOffset, brightn
 	const distance = length( wrapped );
 	const fade = smoothstep( 0.4, 1.2, distance ).mul( float( 1 ).sub( smoothstep( boxSize * 0.38, boxSize * 0.5, distance ) ) );
 	material.colorNode = uniforms.moonColor.mul( 0.25 ).add( uniforms.auroraLightColor.mul( 0.6 ) ).add( vec3( 0.06, 0.08, 0.12 ) ).mul( brightness );
-	material.opacityNode = disc.mul( fade ).mul( 0.6 );
+	material.opacityNode = disc.mul( fade ).mul( 0.6 ).mul( float( 1 ).sub( state.ctx.world.uniforms.locationVeil ) );
 
 	const mesh = new THREE.Mesh( new THREE.PlaneGeometry( 1, 1 ), material );
 	mesh.name = '飘雪';
@@ -1329,8 +1464,10 @@ function createBlowingBand( layerHeight, layerIndex ) {
 
 	// 跟着人走（中心按 2 米网格吸附，噪声是世界坐标，不会跟着滑）；贴着地形起伏
 	const worldXZ = positionLocal.xz.add( uniforms.bandCenter );
-	const ground = texture( state.heightTexture, terrainUV( worldXZ ) ).level( 0 ).r;
-	material.positionNode = vec3( worldXZ.x, ground.add( layerHeight ), worldXZ.y );
+	const groundSample = texture( state.heightTexture, terrainUV( worldXZ ) ).level( 0 );
+	material.positionNode = vec3( worldXZ.x, groundSample.r.add( layerHeight ), worldXZ.y );
+	// 崖外（地形裁掉的地方）不画：那里的面片会横着悬在崖外的半空
+	const insideRim = varying( groundSample.b );
 
 	const windAngle = auroraConfig.windDirection * Math.PI / 180;
 	const fragmentXZ = positionWorld.xz;
@@ -1353,7 +1490,8 @@ function createBlowingBand( layerHeight, layerIndex ) {
 	// 朝月亮看时卷流被照亮（前向散射）
 	const backLight = pow( max( dot( viewDirection, uniforms.moonDirection.negate() ), 0 ), 4 );
 	material.colorNode = uniforms.moonColor.mul( float( 0.2 ).add( backLight.mul( 1.2 ) ) ).add( uniforms.auroraLightColor.mul( 0.5 ) ).add( vec3( 0.06, 0.08, 0.13 ) );
-	material.opacityNode = streak.mul( gust.mul( 0.7 ).add( 0.3 ) ).mul( heightFade ).mul( edgeFade ).mul( nearFade ).mul( 0.32 );
+	material.opacityNode = streak.mul( gust.mul( 0.7 ).add( 0.3 ) ).mul( heightFade ).mul( edgeFade ).mul( nearFade ).mul( 0.32 )
+		.mul( insideRim ).mul( float( 1 ).sub( state.ctx.world.uniforms.locationVeil ) );
 
 	const mesh = new THREE.Mesh( geometry, material );
 	mesh.name = '地吹雪';
@@ -1383,7 +1521,9 @@ function createDriftSparks( count ) {
 	const flat = seed.xz.mul( box ).add( vec2( Math.cos( windAngle ), Math.sin( windAngle ) ).mul( travel ) );
 	const relative = flat.sub( cameraPosition.xz ).add( box.mul( 0.5 ) );
 	const wrappedXZ = relative.sub( box.mul( floor( relative.div( box ) ) ) ).sub( box.mul( 0.5 ) ).add( cameraPosition.xz );
-	const ground = texture( state.heightTexture, terrainUV( wrappedXZ ) ).level( 0 ).r;
+	const groundSample = texture( state.heightTexture, terrainUV( wrappedXZ ) ).level( 0 );
+	const ground = groundSample.r;
+	const insideRim = varying( groundSample.b );
 	// 贴地跳动：高度 0~0.5 米，随时间小幅弹跳
 	const hop = abs( sin( uniforms.sceneTime.mul( mix( 2, 5, seedB.y ) ).add( seed.y.mul( 20 ) ) ) ).mul( 0.25 ).add( seed.y.mul( 0.25 ) );
 	material.positionNode = vec3( wrappedXZ.x, ground.add( hop ).add( 0.03 ), wrappedXZ.y );
@@ -1392,7 +1532,7 @@ function createDriftSparks( count ) {
 	const centered = uv().sub( 0.5 ).mul( 2 );
 	const twinkle = pow( abs( sin( uniforms.sceneTime.mul( mix( 3, 9, seedB.z ) ).add( seed.x.mul( 50 ) ) ) ), 6 );
 	material.colorNode = uniforms.moonColor.mul( twinkle.mul( 3 ).add( 0.2 ) );
-	material.opacityNode = float( 1 ).sub( smoothstep( 0, 1, length( centered ) ) ).mul( 0.9 );
+	material.opacityNode = float( 1 ).sub( smoothstep( 0, 1, length( centered ) ) ).mul( 0.9 ).mul( insideRim ).mul( float( 1 ).sub( state.ctx.world.uniforms.locationVeil ) );
 
 	const mesh = new THREE.Mesh( new THREE.PlaneGeometry( 1, 1 ), material );
 	mesh.name = '地吹雪亮粒';
@@ -1403,19 +1543,69 @@ function createDriftSparks( count ) {
 
 }
 
+// 阴影替身（4b 修卡顿）：three 画阴影时会把材质的整个 colorNode 拖进阴影着色器（只为了取一个 alpha），
+// 重材质第一次画阴影要同步编译 0.2~0.5 秒。投影的网格各挂一个子网格当替身：同一个几何体、材质什么颜色都不算，
+// 只放在 1 号层（灯的阴影相机只看 1 号层，主相机看不见），原网格不再投影。阴影只由几何体决定，画面不变
+function addShadowProxies( scene, light ) {
+
+	const materials = new Map();
+	const proxyMaterialFor = ( source ) => {
+
+		const cacheKey = source.side + ':' + source.shadowSide;
+		if ( ! materials.has( cacheKey ) ) {
+
+			const material = new THREE.MeshBasicNodeMaterial();
+			material.name = '阴影替身';
+			material.side = source.side;
+			material.shadowSide = source.shadowSide;
+			state.disposables.push( material );
+			materials.set( cacheKey, material );
+
+		}
+
+		return materials.get( cacheKey );
+
+	};
+
+	const casters = [];
+	scene.traverse( ( object ) => {
+
+		if ( object.isMesh && object.castShadow ) casters.push( object );
+
+	} );
+	for ( const mesh of casters ) {
+
+		const proxy = new THREE.Mesh( mesh.geometry, proxyMaterialFor( mesh.material ) );
+		proxy.name = mesh.name + '·阴影替身';
+		proxy.layers.set( 1 );
+		proxy.castShadow = true;
+		proxy.frustumCulled = mesh.frustumCulled;
+		mesh.add( proxy );
+		mesh.castShadow = false;
+
+	}
+
+	light.shadow.camera.layers.set( 1 );
+
+}
+
 // ===================== 生命周期 =====================
 
-function moonDirectionFromConfig( auroraConfig ) {
+// 月亮按世界的时刻走（本地方向）；后台加载时世界是别的时刻，按自己开始的时刻（03:40）先摆好
+function moonDirectionAt( world, hours ) {
 
-	const azimuth = THREE.MathUtils.degToRad( auroraConfig.moonAzimuth );
-	const elevation = THREE.MathUtils.degToRad( auroraConfig.moonElevation );
+	const moon = world.anglesAt( hours ).moon;
+	const location = world.locations[ key ];
+	const azimuth = THREE.MathUtils.degToRad( moon.azimuth - location.yaw );
+	const elevation = THREE.MathUtils.degToRad( moon.elevation );
 	return new THREE.Vector3( Math.sin( azimuth ) * Math.cos( elevation ), Math.sin( elevation ), - Math.cos( azimuth ) * Math.cos( elevation ) ).normalize();
 
 }
 
 function tierOf( ctx ) {
 
-	return ctx.quality && ctx.quality.tier ? ctx.quality.tier : 'mid';
+	// 内容参数档（hi / mid / lo）：mid 档用"低"那一列，见 quality.js
+	return ctx.quality && ctx.quality.content ? ctx.quality.content : 'mid';
 
 }
 
@@ -1460,7 +1650,9 @@ async function buildScene( ctx ) {
 	state.terrainCenterZ = auroraConfig.terrainCenterZ;
 
 	// ---------- uniforms ----------
-	const moonDirection = moonDirectionFromConfig( auroraConfig );
+	if ( ! ctx.world || ! ctx.backdrop ) throw new Error( '雪原场景：要先建好秘境（ctx.world、ctx.backdrop）' );
+	const moonDirection = moonDirectionAt( ctx.world, ctx.world.locationHours( key )[ 0 ] );
+	state.veil = { amount: ctx.world.uniforms.locationVeil, yawDegrees: ctx.world.locations[ key ].yaw, sky: ctx.world.uniforms };
 	const moonColor = new THREE.Color( auroraConfig.moonColor ).multiplyScalar( auroraConfig.moonIntensity );
 	state.uniforms = {
 		sceneTime: uniform( 0 ),
@@ -1480,6 +1672,7 @@ async function buildScene( ctx ) {
 		revealEnabled: uniform( ctx.config.footprintsReveal ? 1 : 0 ),
 		bandCenter: uniform( new THREE.Vector2() ),
 		fogAmount: uniform( 1 ),
+		skyOpacity: uniform( 1 ),
 		// 每层效果一个开关（1 开 0 关），调试面板逐个关闭看作用
 		wrapToggle: uniform( 1 ),
 		blueShadowToggle: uniform( 1 ),
@@ -1509,27 +1702,42 @@ async function buildScene( ctx ) {
 		{ x: pathX( - 260 ) - 18, z: - 262, size: 1.7, seed: 5.5 },
 	];
 
+	// 各步之间让出一次主线程（这个场景是在上一个地点停留时后台加载的），顺便记下每步耗时
+	const stepTimes = [];
+	let stepStart = performance.now();
+	const markStep = async ( label ) => {
+
+		stepTimes.push( `${ label } ${ ( performance.now() - stepStart ).toFixed( 0 ) }` );
+		await yieldToBrowser();
+		stepStart = performance.now();
+
+	};
+
 	// ---------- 高度场 ----------
 	const heightResolution = 512;
-	const { heights, heightTexture } = buildHeightField( heightResolution, state.terrainSize, state.terrainCenterZ, state.rockSpots );
-	state.heightData = heights;
 	state.heightResolution = heightResolution;
+	const { heights, heightTexture } = await buildHeightField( heightResolution, state.terrainSize, state.terrainCenterZ, state.rockSpots );
+	state.heightData = heights;
 	state.heightTexture = heightTexture;
 	state.disposables.push( heightTexture );
+	await markStep( '高度场' );
 
-	const atlas = buildFootprintAtlas();
+	const atlas = await buildFootprintAtlas();
 	state.disposables.push( atlas );
 	uniforms.atlasNode = texture( atlas );
+	await markStep( '脚印图集' );
 
 	// ---------- 场景 ----------
 	const scene = new THREE.Scene();
 	scene.background = new THREE.Color( auroraConfig.skyHorizon );
 
 	// 极光半球贴图要在天空材质之前建（天空要采样它）
-	state.auroraPass = createAuroraPass( ctx.renderer );
+	state.auroraPass = createAuroraPass( ctx.renderer, uniforms, auroraConfig );
 	applyQualityResolution( params );
+	await markStep( '极光' );
 
-	const terrainGeometry = buildTerrainGeometry( auroraConfig.terrainSegments[ tier ], state.terrainSize, state.terrainCenterZ );
+	const terrainGeometry = await buildTerrainGeometry( auroraConfig.terrainSegments[ tier ], state.terrainSize, state.terrainCenterZ );
+	await markStep( '地形网格' );
 	const snowMaterial = createSnowMaterial( tier );
 	const terrain = new THREE.Mesh( terrainGeometry, snowMaterial );
 	terrain.name = '雪地';
@@ -1539,17 +1747,17 @@ async function buildScene( ctx ) {
 	snowMaterial.shadowSide = THREE.BackSide;
 	scene.add( terrain );
 	state.disposables.push( terrainGeometry, snowMaterial );
-
-	scene.add( createOuterSnow( snowMaterial ) );
+	await markStep( '雪材质' );
 
 	state.skyDome = createSkyDome();
 	scene.add( state.skyDome );
-	scene.add( createDistantMountains() );
 	scene.add( createRocks() );
+	await markStep( '天空和岩石' );
 
 	const treeX = pathX( treeZ ) + 0.6;
 	state.treePosition.set( treeX, heightAt( treeX, treeZ ), treeZ );
 	scene.add( createDeadTree( state.treePosition ) );
+	await markStep( '枯树' );
 
 	// ---------- 灯光 ----------
 	const moonLight = new THREE.DirectionalLight( new THREE.Color( auroraConfig.moonColor ), auroraConfig.moonIntensity );
@@ -1578,6 +1786,7 @@ async function buildScene( ctx ) {
 	scene.add( moonLight );
 	scene.add( moonLight.target );
 	state.moonLight = moonLight;
+	if ( shadowSize > 0 ) addShadowProxies( scene, moonLight );
 
 	// 阴影区的环境光：天空半球色（深蓝 + 一点极光绿），不能是灰色
 	const hemisphereLight = new THREE.HemisphereLight( new THREE.Color( auroraConfig.shadowSkyColor ), new THREE.Color( auroraConfig.groundBounceColor ), auroraConfig.ambientIntensity );
@@ -1605,6 +1814,7 @@ async function buildScene( ctx ) {
 		lightDirection: uniforms.moonDirection,
 		anisotropy: float( 0.6 ),
 		amount: uniforms.fogAmount,
+		veil: state.veil,
 	} );
 
 	// ---------- 调试开关 ----------
@@ -1654,10 +1864,10 @@ async function buildScene( ctx ) {
 		grayGround: new THREE.Color( '#3a3a3e' ),
 	};
 
-	// 先画一帧极光贴图，顺便把这两个全屏着色器编译掉
-	state.auroraPass.render( 1 );
+	// 极光贴图的第一帧在 update 里画（frameIndex < 4 时整张重写）；着色器由 compile() 异步编好
 
-	console.log( `雪原场景：初始化完成，用时 ${ ( performance.now() - started ).toFixed( 0 ) } ms，档位 ${ tier }` );
+	await markStep( '其余' );
+	console.log( `雪原场景：初始化完成，用时 ${ ( performance.now() - started ).toFixed( 0 ) } ms（${ stepTimes.join( '，' ) }），档位 ${ tier }` );
 	return { scene };
 
 }
@@ -1671,16 +1881,44 @@ function applyQualityResolution( params ) {
 
 }
 
+// 出生点：脚印起点旁边，朝南看秘境的夜景（俯 10°，湖和哥特城堡落在画面下三分之一；规格书 5.0：先朝南看，再转身往北沿脚印走）
 function playerStart() {
 
 	const z = 2;
 	const x = pathX( z ) + 1.5;
 	const ground = heightAt( x, z );
 	const eyeHeight = state.ctx.config.camera.eyeHeight;
-	// 视线略微抬头：地平线落在画面下三分之一，极光占上半
+	return { position: [ x, ground + eyeHeight, z ], lookAt: [ x, ground + eyeHeight - 60 * Math.tan( 10 * Math.PI / 180 ), z + 60 ] };
+
+}
+
+// 阶段 1 的朝北机位（脚印伸向远处，地平线在画面下三分之一，极光占上半），对比截图用
+function northView() {
+
+	const start = playerStart();
 	const lookZ = - 60;
-	const lookX = pathX( lookZ );
-	return { position: [ x, ground + eyeHeight, z ], lookAt: [ lookX, ground + eyeHeight + 9, lookZ ] };
+	return { position: start.position, lookAt: [ pathX( lookZ ), start.position[ 1 ] + 9, lookZ ] };
+
+}
+
+// 本地 (x, z) 的地面高度（全景烘焙点按它放眼睛）
+export function groundHeightAt( x, z ) {
+
+	return heightAt( x, z );
+
+}
+
+export function getSpawn() {
+
+	return state.ready ? playerStart() : null;
+
+}
+
+// 预编译（时间线调）：极光的两个全屏 pass
+export function compile() {
+
+	if ( ! state.ready ) return Promise.resolve();
+	return state.auroraPass.compile( state.ctx.pipeline );
 
 }
 
@@ -1691,7 +1929,8 @@ export function enter() {
 	const ctx = state.ctx;
 	const start = playerStart();
 	const size = state.terrainSize;
-	// 地形外圈 80 米已经平滑落到 0，外面还有一圈平雪，留 60 米够用
+	const auroraConfig = ctx.config.aurora;
+	// 四边 80 米是和远景的接缝，留 60 米走不到；南边走到崖前 rimClearance 米为止
 	const margin = 60;
 	const obstacles = state.rockSpots.map( ( spot ) => ( { x: spot.x, z: spot.z, radius: spot.size * 1.15 + 0.3 } ) );
 	obstacles.push( { x: state.treePosition.x, z: state.treePosition.z, radius: 0.7 } );
@@ -1700,11 +1939,12 @@ export function enter() {
 		lookAt: start.lookAt,
 		groundHeight: heightAt,
 		obstacles,
+		canWalk: ( x, z ) => z <= cutZAt( x ) + 1.5 - auroraConfig.rimClearance,
 		bounds: {
 			minX: - size / 2 + margin,
 			maxX: size / 2 - margin,
 			minZ: state.terrainCenterZ - size / 2 + margin,
-			maxZ: state.terrainCenterZ + size / 2 - margin,
+			maxZ: state.terrainCenterZ + size / 2,
 		},
 	} );
 
@@ -1745,8 +1985,13 @@ export function update( dt, time ) {
 
 	}
 
+	// ---------- 月亮按世界的时刻；和远景的对接 ----------
+	ctx.world.directionToLocal( ctx.world.uniforms.moonDirection.value, key, uniforms.moonDirection.value ).normalize();
+	applyWorldSettings();
+
 	// ---------- 天空球、阴影相机跟着人 ----------
 	state.skyDome.position.copy( camera.position );
+	state.skyDome.scale.setScalar( camera.far * 0.87 );
 	const moonDirection = uniforms.moonDirection.value;
 	state.moonLight.target.position.set( camera.position.x, camera.position.y - 1.6, camera.position.z );
 	state.moonLight.position.copy( state.moonLight.target.position ).addScaledVector( moonDirection, 200 );
@@ -1773,6 +2018,38 @@ export function update( dt, time ) {
 	// ---------- 极光平均色 → 半球光 + 闪光颜色 ----------
 	if ( state.frameIndex % 6 === 0 ) requestAverageReadback( ctx.renderer );
 	applyAuroraLight();
+
+}
+
+// 和远景的对接，每帧设一遍（只改 uniform 和显隐）：
+//   天空：统一天空混进来的程度 worldSkyBlend；完全是自己的天空时不画远景天空球
+//   内容挖洞：雪原地形底下的远景压低 holeDepth 米（四边各让进一格远景网格，跨在洞边上的三角形斜下去的部分也在雪原地形底下）
+//   贴地雾盖到远景上；远景亮度增益（雪原的月光是世界月光的约 9 倍）；化进薄雾时这两项慢慢回到没有雪原时的样子
+function applyWorldSettings() {
+
+	const ctx = state.ctx;
+	const auroraConfig = ctx.config.aurora;
+	const uniforms = state.uniforms;
+	const worldUniforms = ctx.world.uniforms;
+	const blend = worldUniforms.worldSkyBlend.value;
+	const veil = worldUniforms.locationVeil.value;
+	uniforms.skyOpacity.value = 1 - blend;
+	ctx.backdrop.setSkyVisible( blend > 0.001 );
+	const halfSize = state.terrainSize / 2;
+	ctx.backdrop.setContentHole( { minX: - halfSize + 13, maxX: halfSize - 13, minZ: state.terrainCenterZ - halfSize + 80, maxZ: - 13, depth: auroraConfig.holeDepth } );
+	ctx.backdrop.setSurfaceGain( 1 + ( auroraConfig.backdropGain - 1 ) * ( 1 - veil ) );
+	state.fogColor.copy( uniforms.auroraLightColor.value ).multiplyScalar( 0.15 ).add( state.fogScatter.set( auroraConfig.fogColor ) );
+	state.fogScatter.set( auroraConfig.fogScatterColor );
+	ctx.backdrop.setLocationFog( {
+		density: auroraConfig.fogDensity,
+		falloff: auroraConfig.fogFalloff,
+		baseHeight: ctx.world.locations[ key ].origin[ 1 ],
+		color: state.fogColor,
+		scatterColor: state.fogScatter,
+		lightDirection: state.worldMoon.copy( worldUniforms.moonDirection.value ),
+		anisotropy: 0.6,
+		amount: uniforms.fogAmount.value * ( 1 - veil ),
+	} );
 
 }
 
@@ -1812,6 +2089,7 @@ function releaseResources() {
 	}
 
 	state.disposables = [];
+	if ( state.auroraPass ) state.auroraPass.dispose();
 	if ( state.moonLight && state.moonLight.shadow ) state.moonLight.shadow.dispose();
 
 }
@@ -1845,6 +2123,9 @@ export function dispose() {
 	state.driftSparks = null;
 	state.auroraPass = null;
 	state.auroraColors = null;
+	state.cliffZ = null;
+	state.cutZ = null;
+	state.veil = null;
 	state.ctx = null;
 	console.log( '雪原场景：已释放' );
 
@@ -1875,8 +2156,10 @@ export function getShotViews() {
 	const treeLookZ = treeZ + 16;
 	const treeLookX = pathX( treeLookZ ) - 2.5;
 
+	const north = northView();
 	return [
-		{ name: '远景', position: start.position, lookAt: start.lookAt },
+		{ name: '远景', position: north.position, lookAt: north.lookAt },
+		{ name: '南望', position: start.position, lookAt: start.lookAt },
 		{ name: '近景低头', position: [ nearX, ground( nearX, nearZ ) + eyeHeight, nearZ ], lookAt: [ footX, ground( footX, footZ ), footZ ] },
 		{ name: '逆光', position: [ backX, backGround + eyeHeight, backZ ], lookAt: [ backX + moonDirection.x * 50, backGround + 1.5, backZ + moonDirection.z * 50 ] },
 		{ name: '枯树抬头', position: [ treeLookX, ground( treeLookX, treeLookZ ) + eyeHeight, treeLookZ ], lookAt: [ state.treePosition.x, state.treePosition.y + 8, state.treePosition.z ] },

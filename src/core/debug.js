@@ -126,7 +126,7 @@ export function createDebug( ctx, enabled ) {
 	// ===== 画质 =====
 	const qualityState = { 档位: ctx.quality.tier };
 	const qualityFolder = gui.addFolder( '画质' );
-	qualityFolder.add( qualityState, '档位', [ 'hi', 'mid', 'lo' ] ).onChange( ( tier ) => {
+	qualityFolder.add( qualityState, '档位', [ 'hi', 'mid', 'pano' ] ).onChange( ( tier ) => {
 
 		ctx.quality.setTier( tier );
 

@@ -26,6 +26,8 @@ export function createDirector( ctx ) {
 	const camera = ctx.camera;
 	const cameraConfig = ctx.config.camera;
 	const domElement = ctx.renderer.domElement;
+	const flightConfig = ctx.config.world.flight;
+	const flightDrag = { yawMax: flightConfig.dragYawMax, pitchMax: flightConfig.dragPitchMax, returnDamping: flightConfig.dragReturnDamping };
 
 	// 路线关键帧（预处理成 Vector3 / Quaternion）
 	let keyframes = [];
@@ -35,6 +37,9 @@ export function createDirector( ctx ) {
 	let yawOffset = 0;
 	let pitchOffset = 0;
 	let dragging = false;
+	let lastDragTime = - Infinity;
+	// 路线 / 固定机位模式的拖动选项（全景模式用）：{ yawMax, pitchMax, returnDelay（秒）, returnDamping }；null 用 config.camera 的
+	let dragOptions = null;
 	let lastPointerX = 0;
 	let lastPointerY = 0;
 
@@ -52,7 +57,23 @@ export function createDirector( ctx ) {
 		enabled: true,     // 全景烘焙时关掉
 		stepPhase: 0,      // 按走过的距离推进，一步 = π
 		walkBlend: 0,      // 0 站着，1 正常走，>1 跑
+		floatWeight: 0,    // 0 步行的晃法，1 漂浮（飞行、固定机位）；切换时慢慢过渡，不跳
+		clock: null,       // 时间线给的连续时钟（换地点不归零）；没给就用场景时间
 	};
+
+	// 飞行时由时间线每帧给的位姿（当前渲染场景的坐标）：优先级在自由相机之后、步行和路线之前
+	const externalState = {
+		active: false,
+		position: new THREE.Vector3(),
+		quaternion: new THREE.Quaternion(),
+		fov: cameraConfig.fov,
+	};
+
+	// 她有没有在动：按着走路键、拖着转头、或者还在走（停步的缓动没走完）都算动
+	const activity = { idleSeconds: 0 };
+
+	// 最近一帧没加晃动的基础位姿（起飞时从这里接手）
+	const lastBase = { position: new THREE.Vector3(), quaternion: new THREE.Quaternion(), fov: cameraConfig.fov };
 	const swayRight = new THREE.Vector3();
 	const swayEuler = new THREE.Euler( 0, 0, 0, 'YXZ' );
 	const swayQuaternion = new THREE.Quaternion();
@@ -140,6 +161,13 @@ export function createDirector( ctx ) {
 
 		keyframes = prepared;
 		walkState.enabled = false;
+		// 飞行中（外部位姿）只登记路线，不接管相机；飞行结束 clearExternal 以后才生效
+		if ( ! externalState.active ) {
+
+			yawOffset = 0;
+			pitchOffset = 0;
+
+		}
 
 	}
 
@@ -175,7 +203,8 @@ export function createDirector( ctx ) {
 
 	}
 
-	// 直接把人放到某处看向某处（出生点、截图机位）；只在步行模式下有意义
+	// 直接把人放到某处看向某处（出生点、截图机位）；只在步行模式下有意义。
+	// 飞行中（外部位姿）只把人放好，不写相机，降落交还时才接上
 	function setPose( position, lookAt ) {
 
 		walkState.position.fromArray( position );
@@ -183,6 +212,7 @@ export function createDirector( ctx ) {
 		walkState.yaw = angles.yaw;
 		walkState.pitch = angles.pitch;
 		walkState.velocity.set( 0, 0, 0 );
+		if ( externalState.active ) return;
 		yawOffset = 0;
 		pitchOffset = 0;
 		writeWalkCamera();
@@ -416,51 +446,53 @@ export function createDirector( ctx ) {
 	// 呼吸感和行走感。时间用场景时间（暂停时不晃，截图可复现），步伐相位按走过的距离推进（停下就不颠）
 	//   walk：站着时约 4 秒一次的呼吸起伏；走路时每一步上下颠一次（脚落地最低）、两步左右晃一个来回，起停平滑
 	//   float：坐船、飞行、导演路线时很慢的漂浮
+	// 两种晃法都算出来，按 floatWeight 混合：从步行起飞、降落交还步行时晃动慢慢换过去，不会突然跳 2~3 厘米
 	function applySway( dt, horizontalSpeed, mode ) {
 
 		const sway = cameraConfig.sway;
 		if ( ! sway || ! sway.enabled || ! swayState.enabled ) return;
 
-		const time = sceneTime;
+		const time = swayState.clock !== null ? swayState.clock : sceneTime;
 		const degree = Math.PI / 180;
+		const targetFloat = mode === 'walk' ? 0 : 1;
+		swayState.floatWeight += ( targetFloat - swayState.floatWeight ) * ( 1 - Math.exp( - 2 * dt ) );
+		const floatWeight = swayState.floatWeight;
+		const walkWeight = 1 - floatWeight;
 		let up = 0;
 		let side = 0;
 		let pitch = 0;
 		let roll = 0;
 
-		if ( mode === 'walk' ) {
+		// 步行：站着呼吸，走起来按步伐颠和晃（不在步行时速度当 0，只剩呼吸）
+		const walkSpeed = mode === 'walk' ? horizontalSpeed : 0;
+		const targetBlend = Math.min( 1 + sway.runExtra, walkSpeed / cameraConfig.walkSpeed );
+		swayState.walkBlend += ( targetBlend - swayState.walkBlend ) * ( 1 - Math.exp( - sway.blendSpeed * dt ) );
+		swayState.stepPhase += walkSpeed * dt / sway.stepLength * Math.PI;
+		const walking = Math.min( 1, swayState.walkBlend );
+		const running = Math.max( 0, swayState.walkBlend - 1 );
 
-			const targetBlend = Math.min( 1 + sway.runExtra, horizontalSpeed / cameraConfig.walkSpeed );
-			swayState.walkBlend += ( targetBlend - swayState.walkBlend ) * ( 1 - Math.exp( - sway.blendSpeed * dt ) );
-			swayState.stepPhase += horizontalSpeed * dt / sway.stepLength * Math.PI;
-			const walking = Math.min( 1, swayState.walkBlend );
-			const running = Math.max( 0, swayState.walkBlend - 1 );
+		// 呼吸：走起来以后呼吸被步伐盖住，只留三成
+		const breathAngle = time * Math.PI * 2 / sway.breathPeriod;
+		const breathWeight = ( 1 - walking * 0.7 ) * walkWeight;
+		up += Math.sin( breathAngle ) * sway.breathHeight * breathWeight;
+		pitch += Math.sin( breathAngle - 0.6 ) * sway.breathPitch * degree * breathWeight;
+		roll += Math.sin( breathAngle * 0.53 ) * sway.breathRoll * degree * breathWeight;
 
-			// 呼吸：走起来以后呼吸被步伐盖住，只留三成
-			const breathAngle = time * Math.PI * 2 / sway.breathPeriod;
-			const breathWeight = 1 - walking * 0.7;
-			up += Math.sin( breathAngle ) * sway.breathHeight * breathWeight;
-			pitch += Math.sin( breathAngle - 0.6 ) * sway.breathPitch * degree * breathWeight;
-			roll += Math.sin( breathAngle * 0.53 ) * sway.breathRoll * degree * breathWeight;
+		// 步伐：|sin| 每步一个起伏，减去平均值 2/π 让眼睛高度平均不变；sin 两步一个来回，左右晃和横滚
+		const stepAmount = walking * ( 1 + running * 0.8 ) * walkWeight;
+		const bounce = Math.abs( Math.sin( swayState.stepPhase ) ) - 2 / Math.PI;
+		const swing = Math.sin( swayState.stepPhase );
+		up += bounce * sway.bobHeight * stepAmount;
+		side += swing * sway.bobSide * stepAmount;
+		roll += swing * sway.bobRoll * degree * stepAmount;
+		pitch += bounce * sway.bobPitch * degree * stepAmount;
 
-			// 步伐：|sin| 每步一个起伏，减去平均值 2/π 让眼睛高度平均不变；sin 两步一个来回，左右晃和横滚
-			const stepAmount = walking * ( 1 + running * 0.8 );
-			const bounce = Math.abs( Math.sin( swayState.stepPhase ) ) - 2 / Math.PI;
-			const swing = Math.sin( swayState.stepPhase );
-			up += bounce * sway.bobHeight * stepAmount;
-			side += swing * sway.bobSide * stepAmount;
-			roll += swing * sway.bobRoll * degree * stepAmount;
-			pitch += bounce * sway.bobPitch * degree * stepAmount;
-
-		} else {
-
-			const floatAngle = time * Math.PI * 2 / sway.floatPeriod;
-			up += Math.sin( floatAngle ) * sway.floatHeight;
-			side += Math.sin( floatAngle * 0.73 + 1.3 ) * sway.floatHeight * 0.6;
-			roll += Math.sin( floatAngle * 0.59 + 0.4 ) * sway.floatRoll * degree;
-			pitch += Math.sin( floatAngle * 0.81 + 2.1 ) * sway.floatRoll * 0.5 * degree;
-
-		}
+		// 漂浮：坐船、飞行、固定机位
+		const floatAngle = time * Math.PI * 2 / sway.floatPeriod;
+		up += Math.sin( floatAngle ) * sway.floatHeight * floatWeight;
+		side += Math.sin( floatAngle * 0.73 + 1.3 ) * sway.floatHeight * 0.6 * floatWeight;
+		roll += Math.sin( floatAngle * 0.59 + 0.4 ) * sway.floatRoll * degree * floatWeight;
+		pitch += Math.sin( floatAngle * 0.81 + 2.1 ) * sway.floatRoll * 0.5 * degree * floatWeight;
 
 		swayRight.set( 1, 0, 0 ).applyQuaternion( camera.quaternion );
 		camera.position.y += up;
@@ -471,11 +503,66 @@ export function createDirector( ctx ) {
 
 	}
 
+	// 松手后指数阻尼回正（路线、固定机位、飞行时的拖动）
+	function returnDragOffsets( dt, damping ) {
+
+		if ( dragging ) return;
+		if ( dragOptions && ! externalState.active ) {
+
+			// 全景：松手后等 returnDelay 秒再慢慢回正（看一圈不会被马上拽回去）
+			if ( performance.now() - lastDragTime < dragOptions.returnDelay * 1000 ) return;
+			damping = dragOptions.returnDamping;
+
+		}
+
+		const decay = Math.exp( - damping * dt );
+		yawOffset *= decay;
+		pitchOffset *= decay;
+		if ( Math.abs( yawOffset ) < 0.01 ) yawOffset = 0;
+		if ( Math.abs( pitchOffset ) < 0.01 ) pitchOffset = 0;
+
+	}
+
+	// 基础位姿加上拖动偏移写进相机：偏航绕世界 Y，俯仰绕相机自己的 X
+	function writeWithDrag( position, quaternion, fov ) {
+
+		lastBase.position.copy( position );
+		lastBase.quaternion.copy( quaternion );
+		lastBase.fov = fov;
+		yawQuaternion.setFromAxisAngle( axisY, THREE.MathUtils.degToRad( yawOffset ) );
+		pitchQuaternion.setFromAxisAngle( axisX, THREE.MathUtils.degToRad( pitchOffset ) );
+		finalQuaternion.copy( yawQuaternion ).multiply( quaternion ).multiply( pitchQuaternion );
+		camera.position.copy( position );
+		camera.quaternion.copy( finalQuaternion );
+		applyFov( fov );
+
+	}
+
+	function updateActivity( dt ) {
+
+		const pressingMove = pressedKeys.has( 'w' ) || pressedKeys.has( 'a' ) || pressedKeys.has( 's' ) || pressedKeys.has( 'd' );
+		const stillWalking = walkState.enabled && Math.hypot( walkState.velocity.x, walkState.velocity.z ) > 0.05;
+		if ( pressingMove || dragging || stillWalking ) activity.idleSeconds = 0;
+		else activity.idleSeconds += dt;
+
+	}
+
 	function update( dt ) {
+
+		updateActivity( dt );
 
 		if ( director.freeMode ) {
 
 			updateFree( dt );
+			return;
+
+		}
+
+		if ( externalState.active ) {
+
+			returnDragOffsets( dt, flightDrag.returnDamping );
+			writeWithDrag( externalState.position, externalState.quaternion, externalState.fov );
+			applySway( dt, 0, 'float' );
 			return;
 
 		}
@@ -486,33 +573,18 @@ export function createDirector( ctx ) {
 			const previousX = walkState.position.x;
 			const previousZ = walkState.position.z;
 			updateWalk( dt );
+			lastBase.position.copy( camera.position );
+			lastBase.quaternion.copy( camera.quaternion );
+			lastBase.fov = cameraConfig.fov;
 			const travelled = Math.hypot( walkState.position.x - previousX, walkState.position.z - previousZ );
 			applySway( dt, dt > 0 ? travelled / dt : 0, 'walk' );
 			return;
 
 		}
 
-		// 松手后指数阻尼回正
-		if ( ! dragging ) {
-
-			const decay = Math.exp( - cameraConfig.dragReturnDamping * dt );
-			yawOffset *= decay;
-			pitchOffset *= decay;
-			if ( Math.abs( yawOffset ) < 0.01 ) yawOffset = 0;
-			if ( Math.abs( pitchOffset ) < 0.01 ) pitchOffset = 0;
-
-		}
-
+		returnDragOffsets( dt, cameraConfig.dragReturnDamping );
 		evaluateRoute();
-
-		// 偏航绕世界 Y，俯仰绕相机自己的 X
-		yawQuaternion.setFromAxisAngle( axisY, THREE.MathUtils.degToRad( yawOffset ) );
-		pitchQuaternion.setFromAxisAngle( axisX, THREE.MathUtils.degToRad( pitchOffset ) );
-		finalQuaternion.copy( yawQuaternion ).multiply( baseQuaternion ).multiply( pitchQuaternion );
-
-		camera.position.copy( tempPosition );
-		camera.quaternion.copy( finalQuaternion );
-		applyFov( currentFov );
+		writeWithDrag( tempPosition, baseQuaternion, currentFov );
 		applySway( dt, 0, 'float' );
 
 	}
@@ -569,10 +641,17 @@ export function createDirector( ctx ) {
 
 		}
 
+		// 飞行时最多 ±30°（规格书 5.3），固定机位（星月夜）按 config.camera 的 ±60° / ±25°，全景模式按 dragOptions（转一整圈）
+		const options = dragOptions && ! externalState.active ? dragOptions : null;
+		const yawMax = externalState.active ? flightDrag.yawMax : ( options ? options.yawMax : cameraConfig.dragYawMax );
+		const pitchMax = externalState.active ? flightDrag.pitchMax : ( options ? options.pitchMax : cameraConfig.dragPitchMax );
+		lastDragTime = performance.now();
 		yawOffset -= deltaX * cameraConfig.dragSensitivity;
 		pitchOffset -= deltaY * cameraConfig.dragSensitivity;
-		yawOffset = Math.max( - cameraConfig.dragYawMax, Math.min( cameraConfig.dragYawMax, yawOffset ) );
-		pitchOffset = Math.max( - cameraConfig.dragPitchMax, Math.min( cameraConfig.dragPitchMax, pitchOffset ) );
+		// 能转一整圈时把偏航包到 ±180°（回正走近的那一边）
+		if ( yawMax >= 180 ) yawOffset = ( ( yawOffset + 180 ) % 360 + 360 ) % 360 - 180;
+		else yawOffset = Math.max( - yawMax, Math.min( yawMax, yawOffset ) );
+		pitchOffset = Math.max( - pitchMax, Math.min( pitchMax, pitchOffset ) );
 
 	}
 
@@ -613,11 +692,74 @@ export function createDirector( ctx ) {
 	window.addEventListener( 'keyup', onKeyUp );
 	window.addEventListener( 'blur', onBlur );
 
-	function getBaseState() {
+	// 飞行：时间线每帧给位姿（当前渲染场景的坐标系）。第一次进来时把拖动偏移清零（起点位姿已经带着她拖过的朝向）
+	function setExternalPose( position, quaternion, fov = cameraConfig.fov ) {
 
-		evaluateRoute();
-		const forward = new THREE.Vector3( 0, 0, - 1 ).applyQuaternion( baseQuaternion );
-		return { position: tempPosition.clone(), forward };
+		if ( ! externalState.active ) {
+
+			externalState.active = true;
+			yawOffset = 0;
+			pitchOffset = 0;
+
+		}
+
+		externalState.position.copy( position );
+		externalState.quaternion.copy( quaternion );
+		externalState.fov = fov;
+
+	}
+
+	// 飞行结束交还：步行时把还没回正的拖动偏移并进朝向（不跳），路线、固定机位保留偏移让它自己回正
+	function clearExternal() {
+
+		if ( ! externalState.active ) return;
+		externalState.active = false;
+		if ( walkState.enabled ) {
+
+			walkState.yaw += THREE.MathUtils.degToRad( yawOffset );
+			walkState.pitch += THREE.MathUtils.degToRad( pitchOffset );
+			yawOffset = 0;
+			pitchOffset = 0;
+
+		}
+
+	}
+
+	// 现在的位姿（没加晃动，当前渲染场景的坐标，带着她拖过的朝向）；返回视场角。
+	// 按当前模式现算，不等下一帧（刚进地点就起飞时 lastBase 还是旧的）
+	function getBasePose( targetPosition, targetQuaternion ) {
+
+		if ( externalState.active ) {
+
+			targetPosition.copy( externalState.position );
+			targetQuaternion.copy( externalState.quaternion );
+			return externalState.fov;
+
+		}
+
+		if ( walkState.enabled ) {
+
+			walkEuler.set( walkState.pitch, walkState.yaw, 0, 'YXZ' );
+			targetPosition.copy( walkState.position );
+			targetQuaternion.setFromEuler( walkEuler );
+			return cameraConfig.fov;
+
+		}
+
+		if ( keyframes.length > 0 ) {
+
+			evaluateRoute();
+			yawQuaternion.setFromAxisAngle( axisY, THREE.MathUtils.degToRad( yawOffset ) );
+			pitchQuaternion.setFromAxisAngle( axisX, THREE.MathUtils.degToRad( pitchOffset ) );
+			targetPosition.copy( tempPosition );
+			targetQuaternion.copy( yawQuaternion ).multiply( baseQuaternion ).multiply( pitchQuaternion );
+			return currentFov;
+
+		}
+
+		targetPosition.copy( lastBase.position );
+		targetQuaternion.copy( lastBase.quaternion );
+		return lastBase.fov;
 
 	}
 
@@ -670,7 +812,25 @@ export function createDirector( ctx ) {
 
 		},
 		update,
-		getBaseState,
+		// 全景模式的拖动选项（null 恢复默认）
+		setDragOptions: ( options ) => {
+
+			dragOptions = options || null;
+
+		},
+		setExternalPose,
+		clearExternal,
+		isExternal: () => externalState.active,
+		getBasePose,
+		// 她多久没动了（秒）：预加载、起飞前等她停下用
+		getIdleSeconds: () => activity.idleSeconds,
+		isMoving: () => activity.idleSeconds === 0,
+		// 时间线的连续时钟（换地点不归零），晃动按它走；传 null 回到按场景时间
+		setSwayClock: ( time ) => {
+
+			swayState.clock = Number.isFinite( time ) ? time : null;
+
+		},
 		dispose,
 		// 自由相机开关：打开时从当前镜头位姿接手
 		get freeMode() {

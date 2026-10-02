@@ -10,10 +10,14 @@
 //   浪尖透绿、浪峰和礁石边的泡沫、浅水色；反射：高中档用 reflector() 平面反射，低档用环境光贴图
 //   礁石岸：CPU 高度场（岸线、脊状噪声、块状起伏），平缓的低处是沙滩；程序化海蚀柱和礁石；湿的部分更暗更光滑
 //   海鸥：两只 V 形剪影，翅膀在顶点着色器里扇
+//
+// 接入秘境（4b）：远处的海岸、山、其他地点都由常驻远景画（原来自己的"远岸"删了）；太阳按世界的时刻走（18:50 → 19:00，
+// 和阶段 2 一样从 2.6° 竖直沉到 1.0°）；天空是叠加层，交接时渐变到统一天空；内容按 locationVeil 化进同色薄雾；
+// 海雾也盖到远景上（接缝看不出来）；远景的海在海面圆盘里沉下去、海面在世界的陆地底下沉下去，两层水不重面
 
 import * as THREE from 'three/webgpu';
 import {
-	Fn, uniform, float, vec2, vec3, vec4, color, texture, varying, attribute,
+	Fn, uniform, float, vec2, vec3, vec4, color, texture, varying, attribute, NodeUpdateType,
 	positionGeometry, positionWorld, positionView, normalWorld, normalViewGeometry, cameraPosition, screenCoordinate, faceDirection,
 	mix, smoothstep, clamp, max, min, abs, pow, exp, sqrt, sin, cos, floor, length, normalize, dot, cross, reflect,
 	dFdx, dFdy, fwidth, luminance, pmremTexture, reflector,
@@ -22,7 +26,7 @@ import { SkyMesh } from 'three/addons/objects/SkyMesh.js';
 import { mergeGeometries, mergeVertices } from 'three/addons/utils/BufferGeometryUtils.js';
 import { hash21, fbm2D, fbm3D, voronoi2D, jsFbm2D, jsValueNoise2D, jsHash21 } from '../tsl/noise.js';
 import { sparkleLayer } from '../tsl/sparkle.js';
-import { heightFog } from '../tsl/fog.js';
+import { heightFog, applyVeil } from '../tsl/fog.js';
 
 export const key = 'sunset';
 
@@ -57,7 +61,7 @@ const state = {
 	sky: null,
 	environmentScene: null,
 	environmentTarget: null,
-	pmremGenerator: null,
+	environmentReady: false,   // 真正的环境光贴图生成过没有（init 时先画一张空的，天空编好以后再画真的）
 	lastEnvironmentElevation: - 99,
 	lastEnvironmentDarken: - 1,
 	sunLight: null,
@@ -66,8 +70,12 @@ const state = {
 	reflectorNode: null,
 	reflectorTarget: null,
 	seagulls: null,
-	distantCoast: null,
 	waves: null,
+	veil: null,                // 交接薄雾的参数（fog.js 的 veil）
+	reflectionPass: null,      // 平面反射：每帧画主场景之前在最外层画（见 createOceanMaterial）
+	oceanCenterWorld: [ 0, 0 ],
+	fogColor: new THREE.Color(),
+	fogScatter: new THREE.Color(),
 	sunDirection: new THREE.Vector3(),
 	sunTint: new THREE.Color(),
 	environmentCameraPosition: new THREE.Vector3( 0, 2, 0 ),
@@ -83,7 +91,8 @@ const state = {
 
 // ===================== 地形（CPU 高度场）=====================
 
-function terrainHeightRaw( x, z ) {
+// edgeHeight：这一点远景地形画出来的高度（本地坐标），半岛岸上那几边落到它下面 0.5 米接进世界的地面；没有就沉到 −4
+function terrainHeightRaw( x, z, edgeHeight = NaN ) {
 
 	const distance = z - shoreZ( x );   // 正 = 陆地一侧
 
@@ -103,9 +112,10 @@ function terrainHeightRaw( x, z ) {
 	// 陆地里面再加几座缓丘，回头看时天际线不是一条直线
 	height += ( jsFbm2D( x / 45 - 6.2, z / 45 + 2.4, 3 ) - 0.5 ) * 9 * smoothstepJs( 30, 60, distance );
 
-	// 整块陆地是个半岛：左右两端和最里面慢慢沉进海里，地形网格的边缘都藏在水下
+	// 半岛的边：海里那边慢慢沉到 −4（藏在水下），岸上那几边落到远景地形下面 0.5 米，接进世界的地面，不留一圈水沟
 	const island = smoothstepJs( 108, 82, Math.abs( x ) ) * smoothstepJs( 118, 92, z );
-	height = - 4 + ( height + 4 ) * island;
+	const edge = Number.isFinite( edgeHeight ) ? - 4 + ( edgeHeight - 0.5 + 4 ) * smoothstepJs( - 3, 3, distance ) : - 4;
+	height = edge + ( height - edge ) * island;
 
 	// 中尺度的块状岩石：值噪声量化成几级再平滑，出平台和陡坎，但不是一圈圈的等高线
 	const blocks = jsValueNoise2D( x / 3.2 + 9.1, z / 3.2 - 4.4 );
@@ -191,7 +201,7 @@ async function buildHeightField( spots ) {
 		for ( let i = 0; i < resolution; i ++ ) {
 
 			const x = - terrainSize / 2 + i * cellSize;
-			const ground = terrainHeightRaw( x, z );
+			const ground = terrainHeightRaw( x, z, backdropHeightAt( x, z ) );
 			// 礁石的网格半径大约在 0.7~1.2 倍 radius 之间，泡沫圈从 0.8 倍铺到 1.9 倍
 			let rockProximity = 0;
 			for ( const spot of nearbySpots ) {
@@ -219,6 +229,46 @@ async function buildHeightField( spots ) {
 	heightTexture.needsUpdate = true;
 
 	return { heights, heightTexture };
+
+}
+
+// 远景地形在本地 (x, z) 画出来的高度（本地坐标）；只在半岛边上用得到，里面不查（省时间）
+const tempWorldPoint = new THREE.Vector3();
+function backdropHeightAt( x, z ) {
+
+	if ( Math.abs( x ) < 80 && z < 90 ) return NaN;
+	const ctx = state.ctx;
+	const location = ctx.world.locations[ key ];
+	ctx.world.toWorld( tempWorldPoint.set( x, 0, z ), key, tempWorldPoint );
+	return ctx.backdrop.getTerrainHeight( tempWorldPoint.x, tempWorldPoint.z ) - location.origin[ 1 ];
+
+}
+
+// 海面每个顶点下面世界的地面有多高（本地坐标，海里是 0）：远景的陆地上不铺海。半岛范围里本地地形自己挡着，记 0
+async function fillLandHeights( geometry ) {
+
+	const ctx = state.ctx;
+	const location = ctx.world.locations[ key ];
+	const angle = - location.yaw * Math.PI / 180;
+	const cosine = Math.cos( angle );
+	const sine = Math.sin( angle );
+	const positions = geometry.attributes.position.array;
+	const count = positions.length / 3;
+	const heights = new Float32Array( count );
+	const slice = { start: performance.now() };
+	for ( let i = 0; i < count; i ++ ) {
+
+		if ( ( i & 4095 ) === 0 ) await yieldIfBusy( slice );
+		const x = positions[ i * 3 ];
+		const z = positions[ i * 3 + 2 ];
+		if ( Math.abs( x ) < terrainSize / 2 && Math.abs( z - terrainCenterZ ) < terrainSize / 2 ) continue;
+		const worldX = x * cosine + z * sine + location.origin[ 0 ];
+		const worldZ = - x * sine + z * cosine + location.origin[ 2 ];
+		heights[ i ] = Math.max( 0, ctx.backdrop.getTerrainHeight( worldX, worldZ ) - location.origin[ 1 ] );
+
+	}
+
+	geometry.setAttribute( 'landHeight', new THREE.BufferAttribute( heights, 1 ) );
 
 }
 
@@ -562,8 +612,7 @@ function buildOceanGeometry( angularSegments ) {
 
 // ===================== 天空 =====================
 
-// 地平线一圈的雾霭色：朝太阳那边偏暗橙金，背着太阳是灰紫蓝（地球自己的影子投在大气里的那条带）。
-// 天空贴地平线的部分和远岸的大气透视都用它，山溶进天里不会有一道色差
+// 地平线一圈的雾霭色：朝太阳那边偏暗橙金，背着太阳是灰紫蓝（地球自己的影子投在大气里的那条带）。天空贴地平线的部分用它
 function horizonHazeColor( direction ) {
 
 	const uniforms = state.uniforms;
@@ -655,21 +704,74 @@ function createSky() {
 		return vec4( graded.mul( uniforms.skyDarken ).mul( dither.add( 1 ) ).add( sunDisc ).add( halo ), 1 );
 
 	} )();
+	// 交接：天空是一层叠加在统一天空（远景天空球）上面的透明层，不透明度 = 1 − worldSkyBlend；停留时是 1，和阶段 2 逐像素一样
+	sky.material.transparent = true;
+	sky.material.opacityNode = uniforms.skyOpacity;
 
 	state.disposables.push( sky.geometry, sky.material );
 	return sky;
 
 }
 
-// 重新生成环境光贴图（只有天空，不含太阳圆盘），礁石的环境光、低档海面的反射都用它
+// 阴影替身（4b 修卡顿）：three 画阴影时会把材质的整个 colorNode 拖进阴影着色器（只为了取一个 alpha），
+// 重材质第一次画阴影要同步编译 0.2~0.5 秒。投影的网格各挂一个子网格当替身：同一个几何体、材质什么颜色都不算，
+// 只放在 1 号层（灯的阴影相机只看 1 号层，主相机看不见），原网格不再投影。阴影只由几何体决定，画面不变
+function addShadowProxies( scene, light ) {
+
+	const materials = new Map();
+	const proxyMaterialFor = ( source ) => {
+
+		const cacheKey = source.side + ':' + source.shadowSide;
+		if ( ! materials.has( cacheKey ) ) {
+
+			const material = new THREE.MeshBasicNodeMaterial();
+			material.name = '阴影替身';
+			material.side = source.side;
+			material.shadowSide = source.shadowSide;
+			state.disposables.push( material );
+			materials.set( cacheKey, material );
+
+		}
+
+		return materials.get( cacheKey );
+
+	};
+
+	const casters = [];
+	scene.traverse( ( object ) => {
+
+		if ( object.isMesh && object.castShadow ) casters.push( object );
+
+	} );
+	for ( const mesh of casters ) {
+
+		const proxy = new THREE.Mesh( mesh.geometry, proxyMaterialFor( mesh.material ) );
+		proxy.name = mesh.name + '·阴影替身';
+		proxy.layers.set( 1 );
+		proxy.castShadow = true;
+		proxy.frustumCulled = mesh.frustumCulled;
+		mesh.add( proxy );
+		mesh.castShadow = false;
+
+	}
+
+	light.shadow.camera.layers.set( 1 );
+
+}
+
+// 重新生成环境光贴图（只有天空，不含太阳圆盘），礁石的环境光、低档海面的反射都用它。
+// 生成器是整个程序共用的 ctx.pmrem（开场卡阶段热过身，模糊和背景盒的着色器已经编好）
 function updateEnvironment() {
 
 	const uniforms = state.uniforms;
 	uniforms.sunDiscVisible.value = 0;
+	// 环境光贴图里只有这片天，不能是半透明的（交接时天空正在淡出）
+	const opacity = uniforms.skyOpacity.value;
+	uniforms.skyOpacity.value = 1;
 	state.environmentScene.add( state.sky );
 	try {
 
-		state.environmentTarget = state.pmremGenerator.fromScene( state.environmentScene, 0, 0.1, 3000, {
+		state.environmentTarget = state.ctx.pmrem.fromScene( state.environmentScene, 0, 0.1, 3000, {
 			size: 128,
 			position: state.environmentCameraPosition,
 			renderTarget: state.environmentTarget,
@@ -681,6 +783,7 @@ function updateEnvironment() {
 		// 出错也要把天空放回主场景、太阳圆盘打开，不然整场没有天
 		state.scene.add( state.sky );
 		uniforms.sunDiscVisible.value = 1;
+		uniforms.skyOpacity.value = opacity;
 
 	}
 
@@ -700,6 +803,9 @@ function createOceanMaterial( tierName, useReflector ) {
 	if ( useReflector ) {
 
 		mirror = reflector( { resolutionScale: state.ctx.quality.params.reflectionScale, bounces: false } );
+		// 不在画海面时嵌套着画倒影（那样在预编译 compileAsync 里也会同步渲染整场，卡 0.6~2 秒），
+		// 改成后期管线每帧画主场景之前在最外层画一次（state.reflectionPass），和主场景是同一个渲染上下文，预编译对得上
+		mirror.reflector.updateBeforeType = NodeUpdateType.NONE;
 		mirror.target.rotation.x = - Math.PI / 2;
 		state.reflectorNode = mirror;
 		state.reflectorTarget = mirror.target;
@@ -719,9 +825,14 @@ function createOceanMaterial( tierName, useReflector ) {
 		// 这一圈顶点的间距（米），按它淡出画不下的短波，免得远处的网格走样
 		const spacing = centerDistance.add( scale ).mul( growth );
 		const waves = gerstnerNodes( base.xz, uniforms.sceneTime, uniforms.waveAmount, spacing );
-		// 最外一圈慢慢抬到相机高度：有限大的海面在地平线下会留一条缝，抬起来正好补到地平线
-		const lift = cameraPosition.y.mul( smoothstep( oceanRadius * 0.6, oceanRadius * 0.98, centerDistance ) ).mul( 0.98 );
-		return base.add( waves.offset ).add( vec3( 0, lift, 0 ) );
+		// 最外一圈慢慢抬到相机高度：有限大的海面在地平线下会留一条缝，抬起来正好补到地平线。
+		// 只在人站着的高度上这么做：起飞升到 24~40 米以上就不抬了（抬到几十米高会在远处立起一圈水墙）
+		const lift = cameraPosition.y.mul( smoothstep( oceanRadius * 0.6, oceanRadius * 0.98, centerDistance ) ).mul( 0.98 )
+			.mul( float( 1 ).sub( smoothstep( 24, 40, cameraPosition.y ) ) );
+		// 世界的陆地上不铺海：远景地形高出海面 1.2 米以上的地方，海面顶点沉到陆地底下（岸边浪打上来的那一窄条还留着）
+		const landHeight = attribute( 'landHeight', 'float' );
+		const landSink = smoothstep( 1.2, 2.2, landHeight ).mul( landHeight.add( 4 ) );
+		return base.add( waves.offset ).add( vec3( 0, lift.sub( landSink ), 0 ) );
 
 	} )();
 
@@ -869,7 +980,8 @@ function createOceanMaterial( tierName, useReflector ) {
 		// 黄昏里的泡沫：天空环境光 + 一点夕阳，逆光时边缘透亮一点；不能比天空还白
 		const foamLit = uniforms.foamColor.mul( ambient.mul( 1.2 ).add( uniforms.sunLightColor.mul( max( normalDotLight, 0 ).mul( 0.5 ).add( backLight.mul( 0.6 ) ) ).mul( uniforms.sunVisibleFraction ) ) );
 
-		return vec4( mix( water, foamLit, foamMask.mul( 0.7 ) ), 1 );
+		// 交接时化进同色薄雾（海面不吃场景雾，自己混）
+		return vec4( applyVeil( mix( water, foamLit, foamMask.mul( 0.7 ) ), state.veil ), 1 );
 
 	} )();
 
@@ -1040,104 +1152,6 @@ async function createRockMeshes( material, shadows ) {
 
 }
 
-// ===================== 远岸 =====================
-// 背着太阳的那大半圈加一圈远处的海岬和山：两侧的海岬沿海岸线伸出去慢慢没入海里，身后是一层近山一层远山。
-// 这样站在沙滩上转一圈，看到的是一个海湾，而不是孤零零漂在海上的小岛；朝太阳的那一面留空，海平线不被挡。
-// 太阳只有 1~3°，阳光贴着地面过来：山顶朝西的一面还被染成玫瑰金（高山辉），山脚已经落进地球的影子里，是暗紫蓝。
-// 很远，所以按距离往地平线的雾霭色混（大气透视），雾霭色和天空地平线那一圈用同一个函数，接得上
-
-// 方位角 θ 从太阳方向（-z）起顺时针量；远岸覆盖 θ ∈ [70°, 290°]
-const coastStart = 70;
-const coastEnd = 290;
-const coastCenter = new THREE.Vector2( 0, 10 );
-
-function buildCoastRidge( { baseRadius, extraRadius, baseHeight, heightNoise, seed, segments } ) {
-
-	const positions = [];
-	const ridgeHeights = [];
-	const indices = [];
-	for ( let i = 0; i <= segments; i ++ ) {
-
-		const degrees = coastStart + ( coastEnd - coastStart ) * i / segments;
-		const angle = THREE.MathUtils.degToRad( degrees );
-		// 两侧（90°、270°）近，正后方（180°）远：两侧是沿岸的海岬，身后是隔着海湾的山
-		const radius = baseRadius + extraRadius * ( 0.5 - 0.5 * Math.cos( 2 * ( angle - Math.PI / 2 ) ) );
-		// 两端慢慢降到海面以下，像海岬伸进海里
-		const taper = smoothstepJs( coastStart, coastStart + 35, degrees ) * smoothstepJs( coastEnd, coastEnd - 35, degrees );
-		const sampleX = Math.sin( angle ) * 5 + seed;
-		const sampleY = Math.cos( angle ) * 5 - seed;
-		const shape = jsFbm2D( sampleX, sampleY, 4 ) * heightNoise + Math.pow( jsValueNoise2D( sampleX * 3, sampleY * 3 ), 2 ) * heightNoise * 0.35;
-		const height = ( baseHeight + shape ) * taper - 8 * ( 1 - taper );
-		const x = coastCenter.x + Math.sin( angle ) * radius;
-		const z = coastCenter.y - Math.cos( angle ) * radius;
-		positions.push( x, - 12, z, x, height, z );
-		ridgeHeights.push( 0, 1 );
-
-	}
-
-	for ( let i = 0; i < segments; i ++ ) {
-
-		const bottomLeft = i * 2;
-		indices.push( bottomLeft, bottomLeft + 2, bottomLeft + 1, bottomLeft + 1, bottomLeft + 2, bottomLeft + 3 );
-
-	}
-
-	const geometry = new THREE.BufferGeometry();
-	geometry.setAttribute( 'position', new THREE.Float32BufferAttribute( positions, 3 ) );
-	// 0 = 山脚，1 = 山脊线；片元里按它分出山顶的余晖和山脚的影子
-	geometry.setAttribute( 'ridge', new THREE.Float32BufferAttribute( ridgeHeights, 1 ) );
-	geometry.setIndex( indices );
-	geometry.computeBoundingSphere();
-	return geometry;
-
-}
-
-function createDistantCoast() {
-
-	const uniforms = state.uniforms;
-	const group = new THREE.Group();
-	group.name = '远岸';
-
-	const layers = [
-		// 近的一层：两侧海岬 650 米，身后 1150 米，高 35~90 米
-		{ baseRadius: 650, extraRadius: 500, baseHeight: 30, heightNoise: 70, seed: 3.7, segments: 420, haze: 0.0 },
-		// 远的一层：再远 350 米、更高，颜色更淡，给出纵深
-		{ baseRadius: 1000, extraRadius: 450, baseHeight: 55, heightNoise: 110, seed: 9.1, segments: 360, haze: 0.18 },
-	];
-
-	for ( const layer of layers ) {
-
-		const geometry = buildCoastRidge( layer );
-		const material = new THREE.MeshBasicNodeMaterial();
-		material.name = '远岸';
-		material.side = THREE.DoubleSide;
-		material.fog = false;
-
-		const ridge = attribute( 'ridge', 'float' );
-		const toCamera = positionWorld.sub( cameraPosition );
-		const direction = normalize( toCamera );
-		const distance = length( toCamera );
-		// 余晖：人背对太阳看过去的山，朝西的坡正对着太阳，最亮（高山辉总是出现在太阳对面）；两侧的海岬是侧光，弱一些。
-		// 只有山脊附近还照得到，山脚在影子里
-		const litFace = max( dot( normalize( vec2( direction.x, direction.z ) ), normalize( vec2( uniforms.sunDirection.x, uniforms.sunDirection.z ) ) ).negate(), 0 );
-		const glow = pow( ridge, 3 ).mul( litFace.mul( 0.6 ).add( 0.4 ) ).mul( uniforms.sunVisibleFraction ).mul( uniforms.coastGlowAmount );
-		const land = mix( uniforms.coastShadowColor, uniforms.coastGlowColor, glow ).mul( uniforms.skyDarken );
-		// 大气透视：越远越接近地平线的雾霭色；远的那层再多混一些
-		const haze = float( 1 ).sub( exp( distance.div( - 4000 ) ) ).add( layer.haze ).clamp( 0, 0.9 );
-		material.colorNode = mix( land, horizonHazeColor( direction ), haze );
-
-		const mesh = new THREE.Mesh( geometry, material );
-		mesh.name = '远岸';
-		mesh.frustumCulled = false;
-		group.add( mesh );
-		state.disposables.push( geometry, material );
-
-	}
-
-	return group;
-
-}
-
 // ===================== 海鸥 =====================
 // 几何体在本地空间：+z 是飞行方向，x 是翼展（约 1.4 米）。顶点着色器按 |x|（离身体多远）扇翅膀
 
@@ -1263,7 +1277,8 @@ function sunDirectionFrom( azimuthDegrees, elevationDegrees, target ) {
 
 function tierOf( ctx ) {
 
-	return ctx.quality && ctx.quality.tier ? ctx.quality.tier : 'mid';
+	// 内容参数档（hi / mid / lo）：mid 档用"低"那一列，见 quality.js
+	return ctx.quality && ctx.quality.content ? ctx.quality.content : 'mid';
 
 }
 
@@ -1327,10 +1342,18 @@ async function buildScene( ctx ) {
 
 	const unresolvedVariance = coxMunkVariance - state.waves.resolvedVariance - rippleVarianceA - rippleVarianceB;
 
+	// 太阳按世界的时刻走：这个地点在别的地点停留时后台加载，世界此刻是别的时刻，按自己开始的时刻（18:50）先摆好
+	const location = ctx.world.locations[ key ];
+	const startHours = ctx.world.locationHours( key )[ 0 ];
+	const startSun = ctx.world.anglesAt( startHours ).sun;
+	state.veil = { amount: ctx.world.uniforms.locationVeil, yawDegrees: location.yaw, sky: ctx.world.uniforms };
+	const oceanCenterWorld = ctx.world.toWorld( new THREE.Vector3( oceanCenter.x, 0, oceanCenter.y ), key );
+	state.oceanCenterWorld = [ oceanCenterWorld.x, oceanCenterWorld.z ];
+
 	const sunAngularRadius = THREE.MathUtils.degToRad( sunsetConfig.sunAngularRadius );
 	state.uniforms = {
 		sceneTime: uniform( 0 ),
-		sunDirection: uniform( sunDirectionFrom( sunsetConfig.sunAzimuth, sunsetConfig.sunElevationStart, new THREE.Vector3() ) ),
+		sunDirection: uniform( sunDirectionFrom( startSun.azimuth - location.yaw, startSun.elevation, new THREE.Vector3() ) ),
 		sunRadiance: uniform( new THREE.Color( sunsetConfig.sunColor ).multiplyScalar( sunsetConfig.sunDiscIntensity ) ),
 		sunAngularRadius: uniform( sunAngularRadius ),
 		sunSolidAngle: uniform( Math.PI * sunAngularRadius * sunAngularRadius ),
@@ -1347,9 +1370,7 @@ async function buildScene( ctx ) {
 		beltColor: uniform( new THREE.Color( sunsetConfig.beltColor ) ),
 		zenithColor: uniform( new THREE.Color( sunsetConfig.zenithColor ) ),
 		cloudAwayColor: uniform( new THREE.Color( sunsetConfig.cloudAwayColor ) ),
-		coastShadowColor: uniform( new THREE.Color( sunsetConfig.coastShadowColor ) ),
-		coastGlowColor: uniform( new THREE.Color( sunsetConfig.coastGlowColor ) ),
-		coastGlowAmount: uniform( 1 ),
+		skyOpacity: uniform( 1 ),
 		twilightToggle: uniform( 1 ),
 		cloudThreshold: uniform( 1 - sunsetConfig.cloudCoverage ),
 		cloudBrightness: uniform( sunsetConfig.cloudBrightness ),
@@ -1426,22 +1447,26 @@ async function buildScene( ctx ) {
 	state.sky = createSky();
 	scene.add( state.sky );
 	state.environmentScene = new THREE.Scene();
-	state.pmremGenerator = new THREE.PMREMGenerator( ctx.renderer );
-	state.environmentTarget = null;
+	if ( ! ctx.pmrem ) throw new Error( '落日场景：ctx.pmrem（共用的环境光贴图生成器）没建' );
+	// 先画一张空的环境光贴图（天空的着色器还没编，现在画会同步编译、卡住上一个地点）：
+	// 贴图对象从这里起不再换，场景的预编译按它来；compile() 编好天空以后再画进真正的天空
+	state.environmentTarget = ctx.pmrem.fromScene( state.environmentScene, 0, 0.1, 3000, { size: 128, position: state.environmentCameraPosition } );
+	state.environmentReady = false;
 	// 天空光：黄昏的阴影是被整片天照亮的（偏蓝紫），不是黑的；环境光贴图本身是按天空真实亮度算的，这里再整体提一点
 	scene.environmentIntensity = sunsetConfig.environmentIntensity;
-	state.lastEnvironmentElevation = sunsetConfig.sunElevationStart;
+	state.lastEnvironmentElevation = startSun.elevation;
 	state.lastEnvironmentDarken = 0;
-	sunDirectionFrom( sunsetConfig.sunAzimuth, sunsetConfig.sunElevationStart, state.sunDirection );
+	sunDirectionFrom( startSun.azimuth - location.yaw, startSun.elevation, state.sunDirection );
 	state.sky.sunPosition.value.copy( state.sunDirection );
-	updateEnvironment();
-	await markStep( '天空和环境光' );
+	scene.environment = state.environmentTarget.texture;
+	await markStep( '天空' );
 
 	// ---------- 海面 ----------
 	state.rippleTexture = await buildRippleTexture();
 	state.disposables.push( state.rippleTexture );
 	await markStep( '波纹贴图' );
 	state.oceanGrid = buildOceanGeometry( sunsetConfig.oceanSegments[ tier ] );
+	await fillLandHeights( state.oceanGrid.geometry );
 	state.disposables.push( state.oceanGrid.geometry );
 	await markStep( '海面网格' );
 	const useReflector = params.reflectionScale > 0;
@@ -1454,6 +1479,12 @@ async function buildScene( ctx ) {
 	scene.add( ocean );
 	state.ocean = ocean;
 	if ( state.reflectorTarget ) scene.add( state.reflectorTarget );
+	state.reflectionPass = () => {
+
+		if ( ! state.ready || ! state.reflectorNode || state.ocean.material !== state.oceanMaterials.reflective ) return;
+		state.reflectorNode.reflector.updateBefore( { scene: state.scene, camera: state.ctx.camera, renderer: state.ctx.renderer, material: state.ocean.material } );
+
+	};
 
 	// ---------- 光 ----------
 	const sunLight = new THREE.DirectionalLight( sunsetConfig.sunLightColor, sunsetConfig.sunLightIntensity );
@@ -1479,14 +1510,13 @@ async function buildScene( ctx ) {
 	scene.add( sunLight );
 	scene.add( sunLight.target );
 	state.sunLight = sunLight;
+	if ( shadows ) addShadowProxies( scene, sunLight );
 
 	// ---------- 海鸥 ----------
 	const seagullCount = Math.min( Math.max( 0, Math.round( sunsetConfig.seagullCount ) ), seagullPaths.length );
 	if ( seagullCount !== sunsetConfig.seagullCount ) console.warn( `落日场景：seagullCount 只能是 0~${ seagullPaths.length }，按 ${ seagullCount } 只画` );
 	state.seagulls = createSeagulls( seagullCount );
 	scene.add( state.seagulls );
-	state.distantCoast = createDistantCoast();
-	scene.add( state.distantCoast );
 	updateSeagulls( 0 );
 
 	// ---------- 雾：海面上一层暖色薄雾，朝太阳方向前向散射更亮（海面自己不叠雾）----------
@@ -1498,6 +1528,7 @@ async function buildScene( ctx ) {
 		lightDirection: uniforms.sunDirection,
 		anisotropy: float( 0.65 ),
 		amount: uniforms.fogAmount,
+		veil: state.veil,
 	} );
 
 	// ---------- 调试开关 ----------
@@ -1519,11 +1550,6 @@ async function buildScene( ctx ) {
 		浅水: uniforms.shallowToggle,
 		湿岩石: uniforms.wetToggle,
 		暮光天空: uniforms.twilightToggle,
-		远岸: ( enabled ) => {
-
-			state.distantCoast.visible = enabled;
-
-		},
 		海鸥: ( enabled ) => {
 
 			state.seagulls.visible = enabled;
@@ -1533,7 +1559,7 @@ async function buildScene( ctx ) {
 	};
 
 	state.ready = true;
-	applySunState( 0 );
+	applySunState( startHours );
 	await markStep( '其余' );
 	console.log( `落日场景：初始化完成，用时 ${ ( performance.now() - started ).toFixed( 0 ) } ms（${ stepTimes.join( '，' ) }），档位 ${ tier }，Cox–Munk σ² = ${ coxMunkVariance.toFixed( 4 ) }（浪 ${ state.waves.resolvedVariance.toFixed( 4 ) } + 波纹 ${ ( rippleVarianceA + rippleVarianceB ).toFixed( 4 ) } + 高光瓣 ${ Math.max( unresolvedVariance, 0.002 ).toFixed( 4 ) }）` );
 	return { scene };
@@ -1542,18 +1568,24 @@ async function buildScene( ctx ) {
 
 // ===================== 每帧 =====================
 
-// 太阳位置、颜色、天色随场景时间变：整场缓慢下沉一点点，最后 20 秒天变暗
-function applySunState( time ) {
+// 太阳位置、颜色、天色按世界的时刻（小时）走：停留期间 18:50 → 19:00 从 2.6° 竖直沉到 1.0°（config.world.skyKeys），
+// 最后 20 秒天变暗。时刻跑出停留范围（起飞时继续往后走）就停在结尾的样子
+function applySunState( hours ) {
 
 	const sunsetConfig = state.ctx.config.sunset;
+	const world = state.ctx.world;
 	const duration = state.duration;
 	const uniforms = state.uniforms;
+	const location = world.locations[ key ];
+	const [ startHours, endHours ] = world.locationHours( key );
 
-	const progress = Math.min( 1, Math.max( 0, time / duration ) );
-	const elevation = sunsetConfig.sunElevationStart + ( sunsetConfig.sunElevationEnd - sunsetConfig.sunElevationStart ) * progress;
-	const darken = smoothstepJs( duration - 20, duration, time ) * sunsetConfig.endDarken;
+	const sinceStart = ( ( hours - startHours + 12 ) % 24 + 24 ) % 24 - 12;
+	const progress = Math.min( 1, Math.max( 0, sinceStart / ( endHours - startHours ) ) );
+	const sun = world.anglesAt( hours ).sun;
+	const elevation = sun.elevation;
+	const darken = smoothstepJs( 1 - 20 / duration, 1, progress ) * sunsetConfig.endDarken;
 
-	sunDirectionFrom( sunsetConfig.sunAzimuth, elevation, state.sunDirection );
+	sunDirectionFrom( sun.azimuth - location.yaw, elevation, state.sunDirection );
 	uniforms.sunDirection.value.copy( state.sunDirection );
 	state.sky.sunPosition.value.copy( state.sunDirection );
 
@@ -1568,7 +1600,7 @@ function applySunState( time ) {
 	state.sunLight.intensity = sunsetConfig.sunLightIntensity * visibleFraction * ( 1 - darken );
 
 	// 环境光贴图：太阳沉够一定角度、或者天暗了一截才重新生成（生成一次要渲 6 面 + 模糊，不能每帧做）
-	if ( Math.abs( elevation - state.lastEnvironmentElevation ) > sunsetConfig.environmentInterval || Math.abs( darken - state.lastEnvironmentDarken ) > 0.05 ) {
+	if ( state.environmentReady && ( Math.abs( elevation - state.lastEnvironmentElevation ) > sunsetConfig.environmentInterval || Math.abs( darken - state.lastEnvironmentDarken ) > 0.05 ) ) {
 
 		state.lastEnvironmentElevation = elevation;
 		state.lastEnvironmentDarken = darken;
@@ -1583,6 +1615,7 @@ export function enter() {
 	if ( ! state.ready ) throw new Error( '落日场景：还没 init 就调了 enter' );
 
 	const ctx = state.ctx;
+	ctx.pipeline.addPrePass( state.reflectionPass );
 	const start = playerStart();
 	// 岸上的石头和半泡在水里的礁石都挡人（礁石网格最宽约 1.5 倍 radius）；海蚀柱在水里，本来就走不到
 	const obstacles = state.rockSpots.filter( ( spot ) => spot.kind !== 'stack' ).map( ( spot ) => ( { x: spot.x, z: spot.z, radius: spot.radius * 1.5 + 0.3 } ) );
@@ -1605,6 +1638,74 @@ export function enter() {
 		ctx.debug.addLayerToggle( key, label, state.layers[ label ] );
 
 	}
+
+}
+
+// 预编译（时间线在停留期间调）：平面反射是画到它自己的渲染目标里的（和主场景不是同一个渲染上下文），
+// 落日的场景和挂进来的远景都要在反射目标上再编一遍，不然降落后第一帧画倒影时同步编译，卡 0.5 秒。海面自己在倒影里不画
+// 倒影目标和环境光贴图目标附件格式一样、色彩空间不同，共用一个渲染上下文，不能同时编（见 pipeline.compileScene 的说明）：
+// 先编倒影，编完再编环境光贴图里的天空，最后画真正的环境光贴图
+export async function compile() {
+
+	if ( ! state.ready ) return;
+	const ctx = state.ctx;
+
+	if ( state.reflectorNode ) {
+
+		const reflector = state.reflectorNode.reflector;
+		const virtualCamera = reflector.getVirtualCamera( ctx.camera );
+		const target = reflector.getRenderTarget( virtualCamera );
+		const oceanMaterial = state.ocean.material;
+		let jobs;
+		oceanMaterial.visible = false;
+		try {
+
+			jobs = [
+				ctx.pipeline.compileScene( state.scene, virtualCamera, null, target ),
+				ctx.pipeline.compileScene( ctx.backdrop.getRoot(), virtualCamera, state.scene, target ),
+			];
+
+		} finally {
+
+			oceanMaterial.visible = true;
+
+		}
+
+		await Promise.all( jobs );
+		if ( ! state.ready ) return;
+
+	}
+
+	// 天空在环境光贴图那个渲染目标格式上先异步编好（HalfFloat、线性色彩空间、带深度，同 PMREMGenerator 的立方体目标），再画真正的环境光贴图
+	const environmentTarget = new THREE.RenderTarget( 1, 1, { type: THREE.HalfFloatType, format: THREE.RGBAFormat, colorSpace: THREE.LinearSRGBColorSpace, depthBuffer: true } );
+	const environmentCamera = new THREE.PerspectiveCamera( 90, 1, 0.1, 3000 );
+	try {
+
+		await ctx.pipeline.compileScene( state.sky, environmentCamera, state.environmentScene, environmentTarget );
+
+	} finally {
+
+		environmentTarget.dispose();
+
+	}
+
+	if ( ! state.ready ) return;
+	updateEnvironment();
+	state.environmentReady = true;
+
+}
+
+// 出生点（本地坐标）：飞过来的终点
+// 本地 (x, z) 的地面高度（全景烘焙点按它放眼睛）
+export function groundHeightAt( x, z ) {
+
+	return heightAt( x, z );
+
+}
+
+export function getSpawn() {
+
+	return state.ready ? playerStart() : null;
 
 }
 
@@ -1644,7 +1745,8 @@ export function update( dt, time ) {
 
 	}
 
-	applySunState( time );
+	applySunState( ctx.world.getDayTime() );
+	applyWorldSettings();
 
 	// ---------- 阴影相机跟着人 ----------
 	state.sunLight.target.position.set( camera.position.x, 0, camera.position.z - 20 );
@@ -1652,6 +1754,37 @@ export function update( dt, time ) {
 	state.sunLight.target.updateMatrixWorld();
 
 	updateSeagulls( time );
+
+}
+
+// 和远景的对接，每帧设一遍（只改 uniform 和显隐）：
+//   天空：统一天空混进来的程度 worldSkyBlend；完全是自己的天空时不画远景天空球（省一整层云）
+//   远景的海在海面圆盘里沉 2 米（大浪的波谷最深约 −1.4 米），两层水不重面
+//   海雾也盖到远景上，地形边上看不出接缝；化进薄雾时海雾跟着淡掉（化完以后只画远景，那里没有海雾）
+function applyWorldSettings() {
+
+	const ctx = state.ctx;
+	const sunsetConfig = ctx.config.sunset;
+	const uniforms = state.uniforms;
+	const worldUniforms = ctx.world.uniforms;
+	const blend = worldUniforms.worldSkyBlend.value;
+	uniforms.skyOpacity.value = 1 - blend;
+	ctx.backdrop.setSkyVisible( blend > 0.001 );
+	// 化进薄雾时增益慢慢回到 1（化完以后只画远景，用的是统一天空本来的亮度）
+	ctx.backdrop.setSurfaceGain( 1 + ( sunsetConfig.backdropGain - 1 ) * ( 1 - worldUniforms.locationVeil.value ) );
+	ctx.backdrop.setSeaCut( { center: state.oceanCenterWorld, radius: oceanRadius, fade: 150, depth: 2 } );
+	state.fogColor.set( sunsetConfig.fogColor ).multiplyScalar( uniforms.skyDarken.value );
+	state.fogScatter.copy( uniforms.sunLightColor.value ).multiplyScalar( sunsetConfig.fogScatter * uniforms.sunVisibleFraction.value );
+	ctx.backdrop.setLocationFog( {
+		density: sunsetConfig.fogDensity,
+		falloff: sunsetConfig.fogFalloff,
+		baseHeight: ctx.world.locations[ key ].origin[ 1 ],
+		color: state.fogColor,
+		scatterColor: state.fogScatter,
+		lightDirection: ctx.world.directionToWorld( state.sunDirection, key, tempWorldPoint ),
+		anisotropy: 0.65,
+		amount: uniforms.fogAmount.value * ( 1 - worldUniforms.locationVeil.value ),
+	} );
 
 }
 
@@ -1694,6 +1827,7 @@ function switchOceanMaterial( wantReflector, tier ) {
 export function exit() {
 
 	if ( ! state.ctx ) return;
+	state.ctx.pipeline.removePrePass( state.reflectionPass );
 	state.ctx.debug.removeSceneToggles( key );
 	state.ctx.director.clearWalk();
 
@@ -1710,12 +1844,11 @@ function releaseResources() {
 	state.disposables = [];
 	if ( state.reflectorNode ) state.reflectorNode.dispose();
 	if ( state.environmentTarget ) state.environmentTarget.dispose();
-	if ( state.pmremGenerator ) state.pmremGenerator.dispose();
 	if ( state.sunLight && state.sunLight.shadow ) state.sunLight.shadow.dispose();
 	state.reflectorNode = null;
 	state.reflectorTarget = null;
 	state.environmentTarget = null;
-	state.pmremGenerator = null;
+	state.environmentReady = false;
 
 }
 
@@ -1723,6 +1856,7 @@ export function dispose() {
 
 	if ( ! state.scene && state.disposables.length === 0 ) return;
 	state.ready = false;
+	if ( state.ctx ) state.ctx.pipeline.removePrePass( state.reflectionPass );
 
 	releaseResources();
 	clearScene();
@@ -1759,8 +1893,9 @@ function resetState() {
 	state.oceanMaterials = { reflective: null, plain: null };
 	state.pendingOceanSwitch = false;
 	state.seagulls = null;
-	state.distantCoast = null;
 	state.sunLight = null;
+	state.reflectionPass = null;
+	state.veil = null;
 	state.uniforms = null;
 	state.layers = null;
 	state.waves = null;
@@ -1794,7 +1929,7 @@ export function getShotViews() {
 		{ name: '高处光路', position: [ highX, highGround + eyeHeight, highZ ], lookAt: [ 0, highGround + eyeHeight + 14, - 200 ] },
 		{ name: '礁石浪花', position: [ sideX, sideGround + eyeHeight, sideZ ], lookAt: [ - 27, 2.5, - 44 ] },
 		{ name: '低头看海', position: start.position, lookAt: [ start.position[ 0 ] + 1, 0, start.position[ 2 ] - 9 ] },
-		// 背对太阳往回看：沙丘、远岸的山和维纳斯带，检查转身以后世界也是完整的
+		// 背对太阳往回看：沙丘、秘境的山（远景）和维纳斯带，检查转身以后世界也是完整的
 		{ name: '回望海湾', position: [ highX, highGround + eyeHeight, highZ ], lookAt: [ highX + 87, highGround + eyeHeight + 3, highZ + 50 ] },
 	];
 

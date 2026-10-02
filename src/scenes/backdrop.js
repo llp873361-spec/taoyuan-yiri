@@ -5,17 +5,17 @@
 // 着色全在世界坐标里算：几何体坐标就是世界坐标，相机的世界坐标 = sceneToWorld × cameraPosition（换了相机的反射 pass 也对）。
 // 远处的顶点做"径向深度压缩"：compressStart 以外沿视线拉近，屏幕位置不变、只改深度，给 4b 里 far = 2000 的地点相机用；俯瞰模式不压。
 // 做法参照 three r186 自带的 TerrainGenerator（大气透视、岩层）和 ForestGenerator（一次实例化画完所有树、按距离随机稀疏）。
-// 山洞的洞壁和洞口近景放到阶段 7（开场序列）一起做，这里只在地形上留好洞口前的平台和洞顶的山梁（world.js）。
+// 山洞（阶段 7）：洞壁、洞口的石头在这里，所有地点和飞行都看得到；地形穿过洞的那一截挖掉（caveCutout）。
 //
 // 着色器里的几条规矩（Metal / Vulkan 上的坑）：pow 的底数一律先夹到 ≥ 0（平方用 pow2）；
 // 要在分支里用的贴图取样和屏幕导数，先在分支外 toVar 落地（TSL 按第一次用到的位置生成代码）。
 
 import * as THREE from 'three/webgpu';
 import {
-	Fn, If, float, vec2, vec3, vec4, uniform, attribute, texture, color, varying,
+	Fn, If, Loop, Discard, float, vec2, vec3, vec4, uniform, uniformArray, attribute, texture, color, varying, select, frontFacing,
 	positionLocal, positionWorld, positionGeometry, normalGeometry, normalWorld, modelWorldMatrix,
 	cameraPosition, cameraViewMatrix, cameraProjectionMatrix, screenSize,
-	normalize, length, dot, max, min, mix, smoothstep, exp, pow, abs, sin, fwidth, reflect, step,
+	normalize, length, dot, max, min, mix, smoothstep, exp, pow, abs, sin, atan, fwidth, reflect, step,
 } from 'three/tsl';
 import { mergeVertices } from 'three/addons/utils/BufferGeometryUtils.js';
 import { jsFbm2D, createNoiseTextureData, sampleNoiseTexture } from '../tsl/noise.js';
@@ -69,7 +69,8 @@ function createRandom( seed ) {
 
 function tierOf( ctx ) {
 
-	return ctx.quality && ctx.quality.tier ? ctx.quality.tier : 'mid';
+	// 内容参数档（hi / mid / lo）：mid 档用"低"那一列，见 quality.js
+	return ctx.quality && ctx.quality.content ? ctx.quality.content : 'mid';
 
 }
 
@@ -98,6 +99,8 @@ const state = {
 	forest: [],
 	proxyGroups: {},      // 地点 key → 替身 Group（4b 交接时单独显隐）
 	houseFootprints: [],  // 小镇房子的 [x, z, 半径]：树不种在房子里
+	caveUniforms: null,   // 山洞的中线折线、截面、包围盒（地形挖洞和洞里的光用）
+	caveMeshes: [],
 	core: null,
 	outer: null,
 	horizon: null,
@@ -108,6 +111,453 @@ const tempVector = new THREE.Vector3();
 const tempMatrix = new THREE.Matrix4();
 const cloudSunWarm = new THREE.Color( '#ff8a5c' );
 const cloudSunWhite = new THREE.Color( '#fff2e0' );
+
+// ===================== 山洞（规格书 5.1.1）=====================
+// 洞壁：沿 world.cave 的中线每 0.5 米一圈截面（超椭圆，底是平的），岩块往洞里凸；两头洞口外围一圈半埋的石头。
+// 高度场做不出山洞：地形穿过洞的那一截直接不画（caveCutout，地点自己的地形也调它），从外面看就是山上的一个口子。
+// 洞里的光只从两头的口子进来：按离洞口的距离衰减，朝着洞口的壁亮一些；内口那头是秘境的晨光，略暖、略亮（"仿佛若有光"）
+
+const caveRingSegments = 40;
+const caveCutoutSegments = 16;
+const caveLightFalloff = 7;      // 洞里的光每 7 米弱 e 倍：洞中间（35 米）只剩洞口的 0.7%，比外面暗两个多数量级
+
+// 截面：angle 绕洞一圈；返回 [横向, 离地高度]（米）。超椭圆（指数 2.5）比椭圆方一点，像人工凿过又被水磨圆的洞；
+// 中心在 0.45 × 高，下半截压平成地面
+function caveSection( angle, width, height ) {
+
+	const cosine = Math.cos( angle );
+	const sine = Math.sin( angle );
+	const lateral = width / 2 * Math.sign( cosine ) * Math.pow( Math.abs( cosine ), 0.8 );
+	const up = Math.max( 0, height * 0.45 + height * 0.55 * Math.sign( sine ) * Math.pow( Math.abs( sine ), 0.8 ) );
+	return [ lateral, up ];
+
+}
+
+function buildCaveGeometry( cave ) {
+
+	const rings = cave.points.length;
+	const count = rings * ( caveRingSegments + 1 );
+	const positions = new Float32Array( count * 3 );
+	const along = new Float32Array( count );
+	const sample = {};
+	const side = new THREE.Vector3();
+	for ( let i = 0; i < rings; i ++ ) {
+
+		const distance = i * cave.spacing;
+		cave.at( distance, sample );
+		side.set( - sample.tangent.z, 0, sample.tangent.x );
+		for ( let j = 0; j <= caveRingSegments; j ++ ) {
+
+			const angle = j / caveRingSegments * Math.PI * 2;
+			const [ lateral, up ] = caveSection( angle, sample.width, sample.height );
+			// 岩块往洞里凸：噪声坐标用 (cos, sin) 绕一圈是连续的；凸出量不超过宽的 11%（窄的地方镜头还要过得去），地面几乎不凸
+			const ring = [ Math.cos( angle ) * 1.6, Math.sin( angle ) * 1.6 ];
+			const bump = jsFbm2D( distance * 0.45 + ring[ 0 ], ring[ 1 ] + distance * 0.17, 4 );
+			const floorAmount = up < 0.02 ? 0.15 : 1;
+			const inward = Math.min( 0.3, sample.width * 0.11 ) * Math.max( 0, bump - 0.3 ) / 0.7 * floorAmount;
+			const centerUp = sample.height * 0.45;
+			const toCenterLateral = - lateral;
+			const toCenterUp = centerUp - up;
+			const toCenterLength = Math.hypot( toCenterLateral, toCenterUp ) || 1;
+			const finalLateral = lateral + toCenterLateral / toCenterLength * inward;
+			const finalUp = up < 0.02 ? up + inward * 0.3 : up + toCenterUp / toCenterLength * inward;
+			const index = i * ( caveRingSegments + 1 ) + j;
+			positions[ index * 3 ] = sample.position.x + side.x * finalLateral;
+			positions[ index * 3 + 1 ] = sample.position.y + finalUp;
+			positions[ index * 3 + 2 ] = sample.position.z + side.z * finalLateral;
+			along[ index ] = distance;
+
+		}
+
+	}
+
+	const indices = [];
+	for ( let i = 0; i < rings - 1; i ++ ) {
+
+		for ( let j = 0; j < caveRingSegments; j ++ ) {
+
+			const a = i * ( caveRingSegments + 1 ) + j;
+			const b = a + caveRingSegments + 1;
+			indices.push( a, b, a + 1, a + 1, b, b + 1 );
+
+		}
+
+	}
+
+	const geometry = new THREE.BufferGeometry();
+	geometry.setAttribute( 'position', new THREE.BufferAttribute( positions, 3 ) );
+	geometry.setAttribute( 'caveAlong', new THREE.BufferAttribute( along, 1 ) );
+	geometry.setIndex( indices );
+	geometry.computeVertexNormals();
+	// 正面朝洞里：拿中间一圈顶上那个点检查法线方向，朝外就把三角形绕序整个翻过来
+	const probe = Math.floor( rings / 2 ) * ( caveRingSegments + 1 ) + Math.round( caveRingSegments / 4 );
+	cave.at( Math.floor( rings / 2 ) * cave.spacing, sample );
+	const normal = geometry.attributes.normal;
+	const towardCenter = ( sample.position.y + sample.height * 0.45 ) - positions[ probe * 3 + 1 ];
+	if ( normal.getY( probe ) * towardCenter < 0 ) {
+
+		for ( let i = 0; i < indices.length; i += 3 ) {
+
+			const swap = indices[ i + 1 ];
+			indices[ i + 1 ] = indices[ i + 2 ];
+			indices[ i + 2 ] = swap;
+
+		}
+
+		geometry.setIndex( indices );
+		geometry.computeVertexNormals();
+
+	}
+
+	geometry.computeBoundingSphere();
+	return geometry;
+
+}
+
+// 洞口外围的石头：一圈半埋的块石，盖住洞壁和山坡相接的地方
+function buildCavePortalRocks( cave ) {
+
+	const random = createRandom( 5170 );
+	const parts = [];
+	const sample = {};
+	const side = new THREE.Vector3();
+	for ( const end of [ 0, cave.length ] ) {
+
+		cave.at( end, sample );
+		side.set( - sample.tangent.z, 0, sample.tangent.x );
+		const outward = end === 0 ? - 1 : 1;   // 沿切向往洞外的方向
+		const rockCount = 9;
+		for ( let k = 0; k < rockCount; k ++ ) {
+
+			// 从一侧地面经过洞顶到另一侧地面（−15° ~ 195°），两侧贴地的石头大一些
+			const angle = ( - 15 + 210 * ( k + 0.2 + random() * 0.6 ) / rockCount ) * degree;
+			const [ lateral, up ] = caveSection( angle, sample.width, sample.height );
+			const nearGround = 1 - Math.min( 1, up / sample.height );
+			const radius = ( 0.35 + random() * 0.45 + nearGround * ( 0.5 + random() * 0.6 ) ) * 0.72;
+			// 石头中心离洞口截面至少 0.85 个半径，不挡口子
+			const centerUp = sample.height * 0.45;
+			const offsetLateral = lateral;
+			const offsetUp = up - centerUp;
+			const offsetLength = Math.hypot( offsetLateral, offsetUp ) || 1;
+			const push = radius * ( 0.85 + random() * 0.3 );
+			const rockLateral = lateral + offsetLateral / offsetLength * push;
+			const rockUp = up + offsetUp / offsetLength * push - nearGround * radius * 0.35;
+			// 沿洞的方向：大半埋进崖里（往洞里那边），只露出口子边上的一截
+			const rockAlong = - outward * ( 0.45 + random() * 0.5 ) * radius;
+			const center = new THREE.Vector3(
+				sample.position.x + side.x * rockLateral + sample.tangent.x * rockAlong,
+				sample.position.y + rockUp,
+				sample.position.z + side.z * rockLateral + sample.tangent.z * rockAlong,
+			);
+			parts.push( lumpyRock( center, radius, random ) );
+
+		}
+
+	}
+
+	return mergeRockParts( parts );
+
+}
+
+// 一块不规则的石头：二十面体细分两次，按低频噪声压扁、鼓包
+function lumpyRock( center, radius, random ) {
+
+	// 细分一次、不合并顶点：每个三角形自己的法线，是一块块平的碎面
+	const geometry = new THREE.IcosahedronGeometry( 1, 2 );
+	geometry.deleteAttribute( 'uv' );
+	const position = geometry.attributes.position;
+	const seed = random() * 100;
+	const squash = 0.6 + random() * 0.3;
+	const yaw = random() * Math.PI * 2;
+	const cosine = Math.cos( yaw );
+	const sine = Math.sin( yaw );
+	for ( let i = 0; i < position.count; i ++ ) {
+
+		const x = position.getX( i );
+		const y = position.getY( i );
+		const z = position.getZ( i );
+		const lump = 0.72 + 0.56 * jsFbm2D( x * 1.1 + seed, z * 1.1 + y * 0.8, 2 );
+		const scaledX = x * lump * radius * 1.15;
+		const scaledY = y * lump * radius * squash;
+		const scaledZ = z * lump * radius;
+		position.setXYZ( i, center.x + scaledX * cosine - scaledZ * sine, center.y + scaledY, center.z + scaledX * sine + scaledZ * cosine );
+
+	}
+
+	geometry.computeVertexNormals();
+	geometry.setIndex( Array.from( { length: position.count }, ( value, index ) => index ) );
+	return geometry;
+
+}
+
+function mergeRockParts( parts ) {
+
+	let vertexCount = 0;
+	let indexCount = 0;
+	for ( const part of parts ) {
+
+		vertexCount += part.attributes.position.count;
+		indexCount += part.index.count;
+
+	}
+
+	const positions = new Float32Array( vertexCount * 3 );
+	const normals = new Float32Array( vertexCount * 3 );
+	const indices = new Uint32Array( indexCount );
+	let vertexOffset = 0;
+	let indexOffset = 0;
+	for ( const part of parts ) {
+
+		positions.set( part.attributes.position.array, vertexOffset * 3 );
+		normals.set( part.attributes.normal.array, vertexOffset * 3 );
+		for ( let i = 0; i < part.index.count; i ++ ) indices[ indexOffset + i ] = part.index.array[ i ] + vertexOffset;
+		vertexOffset += part.attributes.position.count;
+		indexOffset += part.index.count;
+		part.dispose();
+
+	}
+
+	const geometry = new THREE.BufferGeometry();
+	geometry.setAttribute( 'position', new THREE.BufferAttribute( positions, 3 ) );
+	geometry.setAttribute( 'normal', new THREE.BufferAttribute( normals, 3 ) );
+	geometry.setIndex( new THREE.BufferAttribute( indices, 1 ) );
+	geometry.computeBoundingSphere();
+	return geometry;
+
+}
+
+// 洞的体积：点在洞里返回 1（地形在这里挖掉）。中线按 16 段折线近似，截面和洞壁同一个超椭圆，外扩 6 厘米；
+// 只在洞的包围盒里才逐段算（包围盒外一条比较就返回）
+export function caveCutout( point ) {
+
+	const uniforms = state.caveUniforms;
+	if ( ! uniforms ) return float( 0 );
+	return Fn( () => {
+
+		const inside = float( 0 ).toVar();
+		const inBox = point.x.greaterThan( uniforms.boxMin.x ).and( point.x.lessThan( uniforms.boxMax.x ) )
+			.and( point.y.greaterThan( uniforms.boxMin.y ) ).and( point.y.lessThan( uniforms.boxMax.y ) )
+			.and( point.z.greaterThan( uniforms.boxMin.z ) ).and( point.z.lessThan( uniforms.boxMax.z ) );
+		If( inBox, () => {
+
+			Loop( caveCutoutSegments, ( { i } ) => {
+
+				const start = uniforms.points.element( i );
+				const end = uniforms.points.element( i.add( 1 ) );
+				const startSize = uniforms.sizes.element( i );
+				const endSize = uniforms.sizes.element( i.add( 1 ) );
+				const span = end.xz.sub( start.xz );
+				const amount = dot( point.xz.sub( start.xz ), span ).div( max( dot( span, span ), 1e-4 ) );
+				const within = amount.greaterThanEqual( - 0.02 ).and( amount.lessThanEqual( 1.02 ) );
+				const t = amount.clamp( 0, 1 );
+				const lateral = length( point.xz.sub( start.xz.add( span.mul( t ) ) ) );
+				const floorY = mix( start.y, end.y, t );
+				const size = mix( startSize, endSize, t );
+				const halfWidth = size.x.mul( 0.5 ).add( 0.06 );
+				const centerY = floorY.add( size.y.mul( 0.45 ) );
+				const radiusY = size.y.mul( 0.55 ).add( 0.06 );
+				const shape = pow( lateral.div( halfWidth ).clamp( 0, 4 ), 2.5 ).add( pow( abs( point.y.sub( centerY ) ).div( radiusY ).clamp( 0, 4 ), 2.5 ) );
+				If( within.and( shape.lessThan( 1 ) ).and( point.y.greaterThan( floorY.sub( 0.05 ) ) ), () => {
+
+					inside.assign( 1 );
+
+				} );
+
+			} );
+
+		} );
+		return inside;
+
+	} )();
+
+}
+
+function createCaveUniforms( cave ) {
+
+	const points = [];
+	const sizes = [];
+	const sample = {};
+	const boxMin = new THREE.Vector3( Infinity, Infinity, Infinity );
+	const boxMax = new THREE.Vector3( - Infinity, - Infinity, - Infinity );
+	for ( let i = 0; i <= caveCutoutSegments; i ++ ) {
+
+		cave.at( cave.length * i / caveCutoutSegments, sample );
+		points.push( new THREE.Vector4( sample.position.x, sample.position.y, sample.position.z, 0 ) );
+		sizes.push( new THREE.Vector2( sample.width, sample.height ) );
+		const reach = sample.width / 2 + 0.5;
+		boxMin.min( tempVector.set( sample.position.x - reach, sample.position.y - 0.5, sample.position.z - reach ) );
+		boxMax.max( tempVector.set( sample.position.x + reach, sample.position.y + sample.height + 0.5, sample.position.z + reach ) );
+
+	}
+
+	// 两个洞口截面的中心（洞里的光从这两个点进来）
+	const outerMouth = cave.at( 0, {} );
+	const innerMouth = cave.at( cave.length, {} );
+	return {
+		points: uniformArray( points, 'vec4' ),
+		sizes: uniformArray( sizes, 'vec2' ),
+		boxMin: uniform( boxMin ),
+		boxMax: uniform( boxMax ),
+		outerMouth: uniform( outerMouth.position.clone().add( new THREE.Vector3( 0, outerMouth.height * 0.5, 0 ) ) ),
+		innerMouth: uniform( innerMouth.position.clone().add( new THREE.Vector3( 0, innerMouth.height * 0.5, 0 ) ) ),
+		length: uniform( cave.length ),
+		innerWarmth: uniform( new THREE.Color( '#ffe2c8' ) ),
+	};
+
+}
+
+// 岩石反照率：灰褐，按两层噪声起伏；洞口附近长一点青苔
+function caveRockAlbedo( point, normal, mossAmount ) {
+
+	// 三向投影：按法线三个轴向加权，石头的侧面、洞壁不会拉成条
+	const weights = pow( abs( normal ), vec3( 4 ) );
+	const weightSum = weights.x.add( weights.y ).add( weights.z );
+	const triplanar = ( layerName, scale, channel ) => noiseAt( layerName, point.zy.mul( scale ) )[ channel ].mul( weights.x )
+		.add( noiseAt( layerName, point.xz.mul( scale ) )[ channel ].mul( weights.y ) )
+		.add( noiseAt( layerName, point.xy.mul( scale ) )[ channel ].mul( weights.z ) ).div( weightSum );
+	const patch = triplanar( 'small', 6, 'r' );
+	const grain = triplanar( 'rippleFine', 5, 'g' );
+	const crack = float( 1 ).sub( smoothstep( 0, 0.02, abs( triplanar( 'rippleFine', 2.2, 'r' ).sub( 0.5 ) ) ) ).mul( 0.18 );
+	const rock = mix( color( '#55524d' ), color( '#86817a' ), patch ).mul( grain.mul( 0.25 ).add( 0.85 ) ).mul( float( 1 ).sub( crack ) );
+	const moss = mix( color( '#3f4a33' ), color( '#56603f' ), grain );
+	const mossCover = smoothstep( 0.55, 0.9, normal.y.add( patch.mul( 0.3 ) ) ).mul( mossAmount ).mul( 0.7 );
+	return mix( rock, moss, mossCover );
+
+}
+
+function createCaveWallMaterial() {
+
+	const sky = state.world.uniforms;
+	const caveUniforms = state.caveUniforms;
+	const material = new THREE.MeshBasicNodeMaterial();
+	material.name = '山洞洞壁';
+	material.fog = false;
+	material.lights = false;
+	material.side = THREE.DoubleSide;
+	material.positionNode = compressedPosition( positionLocal );
+
+	material.colorNode = Fn( () => {
+
+		const point = positionGeometry;
+		const along = attribute( 'caveAlong', 'float' );
+		const normal = normalize( normalGeometry ).toVar();
+		const fromInner = caveUniforms.length.sub( along );
+		const albedo = nightAlbedo( caveRockAlbedo( point, normal, max( fadeOut( 1, 5, along ), fadeOut( 1, 6, fromInner ) ) ) );
+
+		// 洞口外的天光（天空半球平均色）+ 太阳出来以后的直射散进来的一点
+		const skyAmbient = mix( sky.horizonColor, sky.zenithColor, 0.5 ).mul( sky.skyIntensity ).add( sky.sunLightColor.mul( max( sky.sunDirection.y, 0 ).mul( 0.25 ) ) );
+		const towardOuter = normalize( caveUniforms.outerMouth.sub( point ) );
+		const towardInner = normalize( caveUniforms.innerMouth.sub( point ) );
+		const outerLight = exp( along.div( - caveLightFalloff ) ).mul( max( dot( normal, towardOuter ), 0 ).mul( 0.6 ).add( 0.4 ) );
+		const innerLight = exp( fromInner.div( - caveLightFalloff ) ).mul( max( dot( normal, towardInner ), 0 ).mul( 0.6 ).add( 0.4 ) ).mul( 1.3 );
+		// 外口里那团暖光（见 buildCaveGlows）照亮口子里头几米的洞壁，从溪上看洞口里是暖的
+		const mouthWarm = color( '#ffc98f' ).mul( state.ctx.config.overture.mouthGlow * 0.4 ).mul( exp( abs( along.sub( 4 ) ).div( - 2.5 ) ) );
+		const light = skyAmbient.mul( outerLight.add( innerLight.mul( caveUniforms.innerWarmth ) ).add( 0.003 ) ).add( mouthWarm ).mul( state.toggles.山洞.mul( 0.98 ).add( 0.02 ) );
+		const surface = albedo.mul( light );
+		// 洞壁外面那一面（从洞口和山坡的缝里偶尔看得到）：暗岩
+		const outside = albedo.mul( skyAmbient ).mul( 0.05 );
+		return applyAtmosphere( select( frontFacing, surface, outside ), point, viewerPosition() );
+
+	} )();
+
+	return material;
+
+}
+
+function createCaveRockMaterial() {
+
+	const sky = state.world.uniforms;
+	const uniforms = state.uniforms;
+	const material = new THREE.MeshBasicNodeMaterial();
+	material.name = '山洞口石头';
+	material.fog = false;
+	material.lights = false;
+	material.positionNode = compressedPosition( positionLocal );
+
+	material.colorNode = Fn( () => {
+
+		const point = positionGeometry;
+		const normal = normalize( normalGeometry );
+		// 比洞壁暗一些、苔多一些，和开场崖面的深色岩石接得上（不像几块浅色卵石粘在洞口）
+		const albedo = nightAlbedo( caveRockAlbedo( point, normal, float( 1.3 ) ).mul( 0.62 ) );
+		const sunShadow = terrainShadow( point, uniforms.sunHorizon, sky.sunElevation, 1.3 );
+		const moonShadow = terrainShadow( point, uniforms.moonHorizon, sky.moonElevation, 3 );
+		const surface = albedo.mul( lightAt( normal, sunShadow, moonShadow, float( 0.8 ), 0.3 ) );
+		return applyAtmosphere( surface, point, viewerPosition() );
+
+	} )();
+
+	return material;
+
+}
+
+// 洞口的光（"仿佛若有光"）：外口往里 4 米一张朝外的发光片，从溪上看，黑黑的洞口里透出一点暖光；
+// 内口往外 1 米一张朝里的发光片，在洞里往前看，出口一圈有空气里散开的光晕（单面，从外面看不到）。
+// 亮度跟着天光走，加法混合、不写深度
+function buildCaveGlows( cave ) {
+
+	const sky = state.world.uniforms;
+	const parts = [];
+	for ( const [ distance, facingOut, size ] of [ [ 4, true, 2.4 ], [ cave.length + 1, false, 7 ] ] ) {
+
+		const sample = cave.at( Math.min( cave.length, distance ), {} );
+		const geometry = new THREE.PlaneGeometry( size, size );
+		const material = new THREE.MeshBasicNodeMaterial();
+		material.name = facingOut ? '洞口的光（外）' : '洞口的光（内）';
+		material.transparent = true;
+		material.depthWrite = false;
+		material.blending = THREE.AdditiveBlending;
+		material.fog = false;
+		material.lights = false;
+		material.positionNode = compressedPosition( positionLocal );
+		const strength = facingOut ? 0.16 : 0.5;
+		// 外口（只在开场从溪上看得到）：天光之外再加一团不跟天色走的暖光，黎明前天还暗，洞里那点光要看得出来，靠泛光晕开
+		const warmth = facingOut ? state.ctx.config.overture.mouthGlow : 0;
+		material.colorNode = Fn( () => {
+
+			const uv = attribute( 'uv', 'vec2' ).sub( 0.5 ).mul( 2 );
+			const falloff = pow( max( float( 1 ).sub( length( uv ) ), 0 ), 2.2 );
+			const skyLight = mix( sky.horizonColor, sky.zenithColor, 0.4 ).mul( sky.skyIntensity ).add( sky.sunLightColor.mul( max( sky.sunDirection.y, 0 ).mul( 0.3 ) ) );
+			const glow = skyLight.mul( color( '#ffe6cf' ) ).mul( strength ).add( color( '#ffc98f' ).mul( warmth ) );
+			return vec4( glow.mul( falloff ).mul( state.toggles.山洞 ), 1 );
+
+		} )();
+		const mesh = new THREE.Mesh( geometry, material );
+		mesh.name = material.name;
+		mesh.frustumCulled = false;
+		mesh.renderOrder = 20;
+		const center = sample.position.clone().add( new THREE.Vector3( 0, sample.height * 0.48, 0 ) );
+		if ( distance > cave.length ) center.addScaledVector( sample.tangent, distance - cave.length );
+		mesh.position.copy( center );
+		// 平面的正面是 +z，两张都朝 −切向：外口那张朝洞外，内口外面那张朝洞里
+		mesh.lookAt( center.clone().addScaledVector( sample.tangent, - 1 ) );
+		state.disposables.push( geometry, material );
+		parts.push( mesh );
+
+	}
+
+	return parts;
+
+}
+
+function buildCave( world ) {
+
+	const cave = world.cave;
+	state.caveUniforms = createCaveUniforms( cave );
+	const wallGeometry = buildCaveGeometry( cave );
+	const rockGeometry = buildCavePortalRocks( cave );
+	const wallMaterial = createCaveWallMaterial();
+	const rockMaterial = createCaveRockMaterial();
+	const wall = new THREE.Mesh( wallGeometry, wallMaterial );
+	wall.name = '山洞';
+	wall.frustumCulled = false;
+	const rocks = new THREE.Mesh( rockGeometry, rockMaterial );
+	rocks.name = '山洞口石头';
+	rocks.frustumCulled = false;
+	state.disposables.push( wallGeometry, rockGeometry, wallMaterial, rockMaterial );
+	return [ wall, rocks, ...buildCaveGlows( cave ) ];
+
+}
 
 // ===================== 世界采样：规则网格 =====================
 
@@ -243,7 +693,8 @@ function matchCoreEdges( grid, outerSpacing ) {
 
 }
 
-// 网格上的双线性高度；出了网格返回 NaN
+// 网格上的高度，按三角形插值（和 buildGridGeometry 的对角线一样：从 (i, j+1) 连到 (i+1, j)），
+// 就是网格真正画出来的那个面；地点自己的地形要贴着它接缝，差几厘米都会闪。出了网格返回 NaN
 function gridHeight( grid, x, z ) {
 
 	const cellX = ( x - grid.minX ) / grid.spacing;
@@ -255,9 +706,12 @@ function gridHeight( grid, x, z ) {
 	const fractionZ = cellZ - j;
 	const index = j * grid.countX + i;
 	const heights = grid.heights;
-	const bottom = heights[ index ] + ( heights[ index + 1 ] - heights[ index ] ) * fractionX;
-	const top = heights[ index + grid.countX ] + ( heights[ index + grid.countX + 1 ] - heights[ index + grid.countX ] ) * fractionX;
-	return bottom + ( top - bottom ) * fractionZ;
+	const near = heights[ index ];
+	const nearRight = heights[ index + 1 ];
+	const far = heights[ index + grid.countX ];
+	const farRight = heights[ index + grid.countX + 1 ];
+	if ( fractionX + fractionZ <= 1 ) return near + ( nearRight - near ) * fractionX + ( far - near ) * fractionZ;
+	return farRight + ( far - farRight ) * ( 1 - fractionX ) + ( nearRight - farRight ) * ( 1 - fractionZ );
 
 }
 
@@ -571,7 +1025,7 @@ async function buildBiomeMap( world, worldConfig, slice ) {
 
 		const nearest = world.nearestOnRiver( peachRiver, x, z );
 		const aboveStream = terrainHeightAt( x, z ) - nearest.level;
-		const peach = smoothJs( 170, 60, nearest.distance ) * smoothJs( 1690, 1770, z ) * smoothJs( 45, 20, aboveStream );
+		const peach = smoothJs( 170, 60, nearest.distance ) * smoothJs( 1668, 1715, z ) * smoothJs( 45, 20, aboveStream );
 		data[ offset + 1 ] = Math.round( peach * 255 );
 
 	} );
@@ -760,11 +1214,13 @@ function lightAt( normal, sunShadow, moonShadow, skyView, wrap = 0.2 ) {
 
 // 大气透视 + 贴地薄雾。透视的颜色就是天空贴地平线那一圈（dayAerialColor），远山溶进天里看不出接缝；
 // 外圈地形的边缘也溶进去，看不出世界的边
-function applyAtmosphere( surface, point, viewer ) {
+function applyAtmosphere( litSurface, point, viewer ) {
 
 	const sky = state.world.uniforms;
 	const uniforms = state.uniforms;
 	const worldConfig = state.world.config;
+	// 亮度增益：地点自己的光比统一天空亮很多时（雪原的月光是世界月光的 9 倍），远景跟着提亮，接缝处亮度对得上
+	const surface = litSurface.mul( uniforms.surfaceGain );
 	const toPoint = point.sub( viewer );
 	const distance = max( length( toPoint ), 1e-3 );
 	const direction = toPoint.div( distance );
@@ -783,7 +1239,16 @@ function applyAtmosphere( surface, point, viewer ) {
 	const sunForward = henyeyGreenstein( dot( direction, sky.sunDirection ), float( 0.55 ) );
 	const moonForward = henyeyGreenstein( dot( direction, sky.moonDirection ), float( 0.55 ) );
 	const mistColor = aerial.mul( 0.92 ).add( sky.sunLightColor.mul( sunForward.mul( 0.05 ) ) ).add( sky.moonLightColor.mul( moonForward.mul( 0.08 ) ) );
-	return mix( hazed, mistColor, mist );
+	const misted = mix( hazed, mistColor, mist );
+
+	// 地点自己的贴地雾（落日的海雾、雪原的贴地雾）也盖到远景上，地点地形的边上看不出接缝；没在地点里时 amount 是 0。
+	// 高度从雾的底面（地点原点的海拔）量；底面以下 15~40 米以外不吃这层雾（雪原的雾不会灌进崖下的盆地），也防 exp 溢出
+	const fogPoint = vec3( point.x, max( point.y.sub( uniforms.locationFogBase ), - 40 ), point.z );
+	const fogEye = vec3( viewer.x, viewer.y.sub( uniforms.locationFogBase ), viewer.z );
+	const locationFog = heightFogFactor( uniforms.locationFogDensity, uniforms.locationFogFalloff, fogPoint, fogEye )
+		.mul( smoothstep( - 40, - 15, point.y.sub( uniforms.locationFogBase ) ) ).mul( uniforms.locationFogAmount );
+	const locationFogColor = uniforms.locationFogColor.add( uniforms.locationFogScatter.mul( henyeyGreenstein( dot( direction, uniforms.locationFogLight ), uniforms.locationFogAnisotropy ).mul( 0.25 ) ) );
+	return mix( misted, locationFogColor, locationFog );
 
 }
 
@@ -821,11 +1286,28 @@ function createTerrainMaterial() {
 	const material = new THREE.MeshBasicNodeMaterial();
 	material.name = '远景地形';
 	material.fog = false;
-	material.positionNode = compressedPosition( positionLocal );
+	material.lights = false;   // 不吃场景的灯光（光照全是自己算的）：挂进不同地点的场景时生成的着色器一样，显卡管线可以复用
+
+	// 地点自己画的东西底下，远景要让开，不然两层地面、两层海面互相穿插闪烁：
+	//   海面下沉（落日）：海面圆盘里远景的海顶点往下沉（岸上的点不动，着色还是按原来的位置算，颜色不变）
+	//   内容挖洞（雪原）：地点局部坐标的一个矩形里，远景整体压低（地点自己的地形边上贴着远景的高度，跨在边上的三角形只会往下斜）
+	const seaVertex = step( 0, attribute( 'terrainInfo', 'vec3' ).x );
+	const seaSink = seaVertex.mul( fadeOut( uniforms.seaCutRadius, uniforms.seaCutRadius.add( uniforms.seaCutFade ), length( positionLocal.xz.sub( uniforms.seaCutCenter ) ) ) ).mul( uniforms.seaCutDepth );
+	const scenePoint = modelWorldMatrix.mul( vec4( positionLocal, 1 ) ).xyz;
+	const inHole = step( uniforms.holeMin.x, scenePoint.x ).mul( step( scenePoint.x, uniforms.holeMax.x ) ).mul( step( uniforms.holeMin.y, scenePoint.z ) ).mul( step( scenePoint.z, uniforms.holeMax.y ) );
+	// 湖面下沉（哥特城堡）：湖岸线（和 world.lakeRadius 同一个带起伏的椭圆）以内的顶点往下沉，地点自己的湖面盖上去
+	const lakeConfig = state.world.config.lake;
+	const lakeOffset = positionLocal.xz.sub( vec2( lakeConfig.center[ 0 ], lakeConfig.center[ 1 ] ) ).div( vec2( lakeConfig.radiusX, lakeConfig.radiusZ ) );
+	const lakeAngle = atan( lakeOffset.y, lakeOffset.x );
+	const lakeWobble = float( 1 ).add( sin( lakeAngle.mul( 3 ).add( 0.7 ) ).mul( 0.08 ) ).add( sin( lakeAngle.mul( 7 ) ).mul( 0.05 ) );
+	const lakeSink = step( length( lakeOffset ).div( lakeWobble ), 1.02 ).mul( uniforms.lakeCutDepth );
+	material.positionNode = compressedPosition( positionLocal.sub( vec3( 0, seaSink.add( inHole.mul( uniforms.holeDepth ) ).add( lakeSink ), 0 ) ) );
 
 	material.colorNode = Fn( () => {
 
 		const point = positionGeometry;   // 几何体就建在世界坐标里
+		// 山洞穿过的那一截地形不画（从外面看是山上的口子，从洞里看是洞壁）
+		Discard( caveCutout( point ).greaterThan( 0.5 ) );
 		const viewer = viewerPosition();
 		const toPoint = point.sub( viewer );
 		const distance = max( length( toPoint ), 1e-3 );
@@ -927,7 +1409,8 @@ function createTerrainMaterial() {
 		// ---------- 水：海按顶点（海岸线由顶点插值），湖、河、水池按地表图（4 米一个像素，按像素足迹软边）----------
 		const seaWater = smoothstep( - 0.04, 0.04, terrainInfo.x );
 		const insideWater = biome.r.sub( 0.5 ).mul( 16 );   // 米，水里为正
-		const inlandWater = smoothstep( footprint.mul( - 0.6 ), footprint.mul( 0.6 ), insideWater ).mul( insideCore );
+		// 陡的地方不会是水面：地表图 4 米一个像素，溪源头那面头墙（每米抬 6 米）会被水边的插值刷上一条"水"
+		const inlandWater = smoothstep( footprint.mul( - 0.6 ), footprint.mul( 0.6 ), insideWater ).mul( insideCore ).mul( fadeOut( 0.22, 0.4, slope ) );
 		const water = max( seaWater, inlandWater ).mul( toggles.水面 );
 
 		If( water.greaterThan( 0.001 ), () => {
@@ -1005,6 +1488,7 @@ function createSkyMaterial( tier ) {
 	material.side = THREE.BackSide;
 	material.depthWrite = false;
 	material.fog = false;
+	material.lights = false;
 
 	material.colorNode = Fn( () => {
 
@@ -1113,6 +1597,7 @@ function createForestMaterial() {
 	const material = new THREE.MeshBasicNodeMaterial();
 	material.name = '远景树林';
 	material.fog = false;
+	material.lights = false;
 
 	const treeData = attribute( 'treeData', 'vec4' );    // rgb 树冠色（线性），w 随机数
 	const treeBase = attribute( 'treeBase', 'vec3' );    // 树根的世界坐标
@@ -1167,6 +1652,18 @@ function treeClearings( world ) {
 		const directionZ = ( to[ 2 ] - from[ 2 ] ) / length;
 		return { startX: from[ 0 ], startZ: from[ 2 ], directionX, directionZ, length: length - 120, halfWidth: 30 };
 
+	} );
+	// 开场的整段溪谷（原点 → 洞外口，两岸各 100 米）：开场自己种了桃树，远景的树不再种（不然一棵针叶树会立在桃林里）
+	const outer = world.config.cave.outer;
+	const overture = locations.overture.origin;
+	const valleyLength = Math.hypot( outer[ 0 ] - overture[ 0 ], outer[ 2 ] - overture[ 2 ] );
+	sightlines.push( {
+		startX: overture[ 0 ] - ( outer[ 0 ] - overture[ 0 ] ) / valleyLength * 60,
+		startZ: overture[ 2 ] - ( outer[ 2 ] - overture[ 2 ] ) / valleyLength * 60,
+		directionX: ( outer[ 0 ] - overture[ 0 ] ) / valleyLength,
+		directionZ: ( outer[ 2 ] - overture[ 2 ] ) / valleyLength,
+		length: valleyLength + 60,
+		halfWidth: 100,
 	} );
 	return { circles, sightlines };
 
@@ -1270,9 +1767,15 @@ async function buildForest( tier, slice ) {
 		const count = kind.items.length;
 		state.disposables.push( kind.geometry );
 		if ( count === 0 ) continue;
-		const treeData = new Float32Array( count * 4 );
-		const treeBase = new Float32Array( count * 3 );
-		const mesh = new THREE.InstancedMesh( kind.geometry, material, count );
+		// 不到 4096 棵也按 4096 个实例分配，多出来的缩放为 0（退化成一个点，不画任何东西）：
+		// three 对实例矩阵总量不超过 uniform 缓冲上限（约 1024 个）的 InstancedMesh，每挂进一个新的地点场景就生成一份新着色器
+		// （缓冲名字带唯一编号），旧场景的程序一直留着，renderer.info 的程序数每换一次地点就涨（4b 实测桃树林 470 棵）
+		const allocated = Math.max( count, 4096 );
+		const treeData = new Float32Array( allocated * 4 );
+		const treeBase = new Float32Array( allocated * 3 );
+		const mesh = new THREE.InstancedMesh( kind.geometry, material, allocated );
+		const collapsed = new THREE.Matrix4().makeScale( 0, 0, 0 );
+		for ( let index = count; index < allocated; index ++ ) mesh.setMatrixAt( index, collapsed );
 		tintFirst.set( kind.colors[ 0 ] );
 		tintSecond.set( kind.colors[ 1 ] );
 
@@ -1502,7 +2005,8 @@ function buildGothicCastle( world, windows ) {
 	const facing = Math.atan2( gothic.origin[ 0 ] - castleX, gothic.origin[ 2 ] - castleZ );
 	const cosine = Math.cos( facing );
 	const sine = Math.sin( facing );
-	const toWorld = ( x, y, z ) => [ castleX + x * cosine + z * sine, groundY + y, castleZ - x * sine + z * cosine ];
+	const castleScale = state.ctx.config.gothic.castleScale;
+	const toWorld = ( x, y, z ) => [ castleX + ( x * cosine + z * sine ) * castleScale, groundY + y * castleScale, castleZ + ( - x * sine + z * cosine ) * castleScale ];
 	const stone = '#545a72';
 	const roof = '#2c3247';
 	const parts = [];
@@ -1514,7 +2018,7 @@ function buildGothicCastle( world, windows ) {
 		const [ worldX, worldY, worldZ ] = toWorld( x + outwardX * 0.3, y, z + outwardZ * 0.3 );
 		const normalX = outwardX * cosine + outwardZ * sine;
 		const normalZ = - outwardX * sine + outwardZ * cosine;
-		windows.push( { x: worldX, y: worldY, z: worldZ, normalX, normalZ, width, height, floor: y / topHeight, random: random() } );
+		windows.push( { x: worldX, y: worldY, z: worldZ, normalX, normalZ, width: width * castleScale, height: height * castleScale, floor: y / topHeight, random: random() } );
 
 	}
 
@@ -1594,7 +2098,9 @@ function buildGothicCastle( world, windows ) {
 	parts.push( paint( placeLocal( new THREE.ConeGeometry( 1.6, 16, 8 ), 18, 34, - 14 ), roof ) );
 	for ( let x = 7; x <= 17; x += 2.5 ) addWindow( x, 9, - 9, 0, 1, 38, 1.3, 3.2 );
 
-	return [ mergeToWorld( parts, castleX, groundY, castleZ, facing ) ];
+	const merged = mergeToWorld( parts, 0, 0, 0, 0 );
+	merged.applyMatrix4( new THREE.Matrix4().makeTranslation( castleX, groundY, castleZ ).multiply( new THREE.Matrix4().makeRotationY( facing ) ).multiply( new THREE.Matrix4().makeScale( castleScale, castleScale, castleScale ) ) );
+	return [ merged ];
 
 }
 
@@ -1732,6 +2238,7 @@ function createProxyMaterial() {
 	const material = new THREE.MeshBasicNodeMaterial();
 	material.name = '远景替身';
 	material.fog = false;
+	material.lights = false;
 	material.positionNode = compressedPosition( positionLocal );
 
 	material.colorNode = Fn( () => {
@@ -1825,6 +2332,7 @@ function createWindowMaterial() {
 	const material = new THREE.MeshBasicNodeMaterial();
 	material.name = '远景窗灯';
 	material.fog = false;
+	material.lights = false;
 	material.transparent = true;
 	material.depthWrite = false;
 	material.blending = THREE.AdditiveBlending;
@@ -2009,6 +2517,24 @@ async function build( ctx ) {
 		iceFallX: uniform( iceSource.x ),
 		iceFallBottom: uniform( iceSource.y ),
 		iceFallZ: uniform( new THREE.Vector2( - 1785, - 1645 ) ),   // 冰瀑的南北范围：台地崖顶 → 崖脚
+		// 地点对接（见 setSeaCut / setContentHole / setLocationFog / setSurfaceGain）；默认都不起作用
+		surfaceGain: uniform( 1 ),
+		seaCutCenter: uniform( new THREE.Vector2() ),
+		seaCutRadius: uniform( 0 ),
+		seaCutFade: uniform( 1 ),
+		seaCutDepth: uniform( 0 ),
+		holeMin: uniform( new THREE.Vector2( 1e7, 1e7 ) ),
+		holeMax: uniform( new THREE.Vector2( - 1e7, - 1e7 ) ),
+		holeDepth: uniform( 0 ),
+		lakeCutDepth: uniform( 0 ),
+		locationFogDensity: uniform( 0 ),
+		locationFogFalloff: uniform( 10 ),
+		locationFogBase: uniform( 0 ),
+		locationFogColor: uniform( new THREE.Color() ),
+		locationFogScatter: uniform( new THREE.Color() ),
+		locationFogLight: uniform( new THREE.Vector3( 0, 1, 0 ) ),
+		locationFogAnisotropy: uniform( 0.6 ),
+		locationFogAmount: uniform( 0 ),
 		insideCore: ( point ) => insideCoreNode( point, 0.01 ),
 		insideCoreWide: ( point ) => insideCoreNode( point, 0.08 ),
 	};
@@ -2026,6 +2552,7 @@ async function build( ctx ) {
 		薄云: uniform( 1 ),
 		树林显示: uniform( 1 ),
 		窗灯: uniform( 1 ),
+		山洞: uniform( 1 ),
 	};
 	state.toggles = toggles;
 	if ( ! Number.isFinite( cloudConfig.direction ) ) throw new Error( '远景：config.world.clouds.direction（云往哪个方位飘，度）没填' );
@@ -2050,6 +2577,10 @@ async function build( ctx ) {
 	root.add( skyDome );
 	state.skyDome = skyDome;
 	state.disposables.push( skyGeometry, skyMaterial );
+
+	// 山洞：先建（地形材质的挖洞要用它的 uniform）
+	state.caveMeshes = buildCave( world );
+	for ( const mesh of state.caveMeshes ) root.add( mesh );
 
 	// 地形：核心区（带 40 米裙边）+ 外圈（挖掉核心区）
 	const terrainMaterial = createTerrainMaterial();
@@ -2235,13 +2766,159 @@ export function setProxyVisible( locationKey, visible ) {
 
 }
 
+export function getProxyKeys() {
+
+	return Object.keys( state.proxyGroups );
+
+}
+
 export function getRoot() {
 
 	return state.root;
 
 }
 
+// 远景自己的场景：没有灯、背景黑；飞行时直接画它（root 是单位变换，世界坐标）
+export function getScene() {
+
+	return state.scene;
+
+}
+
+// 统一天空球的显隐：地点自带天空（落日的 SkyMesh、雪原的极光天空）完全不透明时关掉，省掉一整层云的着色
+export function setSkyVisible( visible ) {
+
+	if ( state.skyDome ) state.skyDome.visible = Boolean( visible );
+
+}
+
+// 海面下沉：center 是世界坐标 [x, z]，半径以内远景的海顶点沉 depth 米，fade 米内过渡；传 null 关掉
+export function setSeaCut( cut ) {
+
+	if ( ! state.ready ) return;
+	const uniforms = state.uniforms;
+	if ( ! cut ) {
+
+		uniforms.seaCutDepth.value = 0;
+		return;
+
+	}
+
+	uniforms.seaCutCenter.value.set( cut.center[ 0 ], cut.center[ 1 ] );
+	uniforms.seaCutRadius.value = cut.radius;
+	uniforms.seaCutFade.value = Math.max( 1, cut.fade );
+	uniforms.seaCutDepth.value = cut.depth;
+
+}
+
+// 内容挖洞：当前锚点（地点）局部坐标的矩形 [minX, maxX] × [minZ, maxZ] 里，远景地形压低 depth 米；传 null 关掉
+export function setContentHole( hole ) {
+
+	if ( ! state.ready ) return;
+	const uniforms = state.uniforms;
+	if ( ! hole ) {
+
+		uniforms.holeMin.value.set( 1e7, 1e7 );
+		uniforms.holeMax.value.set( - 1e7, - 1e7 );
+		uniforms.holeDepth.value = 0;
+		return;
+
+	}
+
+	uniforms.holeMin.value.set( hole.minX, hole.minZ );
+	uniforms.holeMax.value.set( hole.maxX, hole.maxZ );
+	uniforms.holeDepth.value = hole.depth;
+
+}
+
+// 地点的贴地雾盖到远景上：{ density, falloff, baseHeight（雾底面的海拔）, color, scatterColor（THREE.Color）,
+// lightDirection（世界方向）, anisotropy, amount }；传 null 关掉。每帧可以调（只改 uniform）
+export function setLocationFog( fog ) {
+
+	if ( ! state.ready ) return;
+	const uniforms = state.uniforms;
+	if ( ! fog ) {
+
+		uniforms.locationFogAmount.value = 0;
+		return;
+
+	}
+
+	uniforms.locationFogDensity.value = fog.density;
+	uniforms.locationFogFalloff.value = fog.falloff;
+	uniforms.locationFogBase.value = fog.baseHeight;
+	uniforms.locationFogColor.value.copy( fog.color );
+	uniforms.locationFogScatter.value.copy( fog.scatterColor );
+	uniforms.locationFogLight.value.copy( fog.lightDirection );
+	uniforms.locationFogAnisotropy.value = fog.anisotropy;
+	uniforms.locationFogAmount.value = fog.amount;
+
+}
+
+// 地形、树林、替身的亮度倍数（窗灯和天空不乘）
+export function setSurfaceGain( gain ) {
+
+	if ( state.ready ) state.uniforms.surfaceGain.value = Number.isFinite( gain ) ? gain : 1;
+
+}
+
+// 把上面几项对接设置全部还原（地点退出时调）
+// 湖面下沉：depth 米（0 关掉）
+export function setLakeCut( depth ) {
+
+	if ( ! state.ready ) return;
+	state.uniforms.lakeCutDepth.value = Number.isFinite( depth ) ? Math.max( 0, depth ) : 0;
+
+}
+
+export function resetLocationSettings() {
+
+	setSeaCut( null );
+	setLakeCut( 0 );
+	setContentHole( null );
+	setLocationFog( null );
+	setSurfaceGain( 1 );
+	setSkyVisible( true );
+
+}
+
 // 远景网格画出来的地面高度（米）；还没建好返回 NaN。机位、飞行要贴着"看得见的地面"时用它，不用 world.worldHeight（网格是 12.5 米一格的近似）
+// 地点自己的东西（开场、花园……）用和远景同一套光照、大气：point、normal 是场景坐标（地点局部），返回已经乘过光照的颜色。
+// 必须在远景 init 之后建材质时调（要用远景的 uniform 和地平线图）
+export function worldLighting( albedo, normal, point, { skyView = float( 1 ), wrap = 0.2 } = {} ) {
+
+	const uniforms = state.uniforms;
+	const sky = state.world.uniforms;
+	const worldPoint = uniforms.sceneToWorld.mul( vec4( point, 1 ) ).xyz;
+	const worldNormal = normalize( uniforms.sceneToWorld.mul( vec4( normal, 0 ) ).xyz );
+	const sunShadow = terrainShadow( worldPoint, uniforms.sunHorizon, sky.sunElevation, 1.3 );
+	const moonShadow = terrainShadow( worldPoint, uniforms.moonHorizon, sky.moonElevation, 3 );
+	return nightAlbedo( albedo ).mul( lightAt( worldNormal, sunShadow, moonShadow, skyView, wrap ) );
+
+}
+
+// 大气透视 + 贴地薄雾 + 地点的雾（同远景）；point 是场景坐标
+export function worldAtmosphere( surface, point ) {
+
+	const worldPoint = state.uniforms.sceneToWorld.mul( vec4( point, 1 ) ).xyz;
+	return applyAtmosphere( surface, worldPoint, viewerPosition() );
+
+}
+
+// 场景坐标 → 世界坐标的矩阵 uniform（每帧按远景挂到的场景更新）：地点的材质要换到世界坐标时用
+export function getSceneToWorld() {
+
+	return state.uniforms.sceneToWorld;
+
+}
+
+// 场景坐标的方向 → 世界方向（天空、反射用）
+export function sceneDirectionToWorld( direction ) {
+
+	return normalize( state.uniforms.sceneToWorld.mul( vec4( direction, 0 ) ).xyz );
+
+}
+
 export function getTerrainHeight( x, z ) {
 
 	return state.ready ? terrainHeightAt( x, z ) : NaN;
@@ -2266,6 +2943,8 @@ export function dispose() {
 	state.skyDome = null;
 	state.terrainMeshes = [];
 	state.forest = [];
+	state.caveMeshes = [];
+	state.caveUniforms = null;
 	state.proxyGroups = {};
 	state.houseFootprints = [];
 	state.core = null;
@@ -2305,6 +2984,11 @@ export function getLayers() {
 		树林网格: ( enabled ) => {
 
 			for ( const mesh of state.forest ) mesh.visible = enabled;
+
+		},
+		山洞网格: ( enabled ) => {
+
+			for ( const mesh of state.caveMeshes ) mesh.visible = enabled;
 
 		},
 		// 整个远景都不画（量后期链本身的开销用）

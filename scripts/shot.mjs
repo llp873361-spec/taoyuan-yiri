@@ -30,6 +30,7 @@ function printHelp() {
 		'  --software                    加 --use-angle=swiftshader 模拟没显卡的机器（WebGPU 会自动退回 WebGL2）',
 		'  --layers                      额外截逐层对比图：每个机位全开一张，再每次只关一层（输出到 <out>/<backend>/layers/）',
 		'  --query=a=1&b=2               追加到页面地址后的查询参数，比如 --query=q=lo 强制低档',
+		'  --flights                     只截飞行：每段航线在 0 / 25 / 50 / 75 / 100% 处各一张（不加 --scene 时默认也会截）',
 		'  --world                       秘境俯瞰模式（?world=1）：3 公里高空俯瞰（清晨、正午、黄昏、午夜）、正上方地图、',
 		'                                每个地点在自己的时刻 8 方向环视；加 --layers 再截黄昏俯瞰的逐层对比',
 		'  --help                        打印这段',
@@ -40,12 +41,13 @@ function printHelp() {
 }
 
 function parseArgs( argv ) {
-	const options = { backend: 'both', scene: '', out: 'shots', software: false, layers: false, query: '', help: false, world: false };
+	const options = { backend: 'both', scene: '', out: 'shots', software: false, layers: false, query: '', help: false, world: false, flights: false };
 	for ( const arg of argv ) {
 		if ( arg === '--help' || arg === '-h' ) options.help = true;
 		else if ( arg === '--software' ) options.software = true;
 		else if ( arg === '--layers' ) options.layers = true;
 		else if ( arg === '--world' ) options.world = true;
+		else if ( arg === '--flights' ) options.flights = true;
 		else if ( arg.startsWith( '--query=' ) ) options.query = arg.slice( '--query='.length );
 		else if ( arg.startsWith( '--backend=' ) ) options.backend = arg.slice( '--backend='.length );
 		else if ( arg.startsWith( '--scene=' ) ) options.scene = arg.slice( '--scene='.length );
@@ -176,6 +178,8 @@ async function shootBackend( requested, options ) {
 		}
 
 		await callGift( page, 'start', [], '__gift.start()' );
+		// 开场卡是 CSS 过渡淡出（真实时间 1.2 秒），等它退干净再截，不然第一张图上还盖着半透明的卡片
+		await page.waitForTimeout( 1500 );
 
 		const config = await withTimeout( page.evaluate( () => window.__gift.getConfig() ), '__gift.getConfig()' );
 		const scenes = config.scenes;
@@ -186,6 +190,8 @@ async function shootBackend( requested, options ) {
 			targets = targets.filter( ( target ) => target.key === options.scene );
 			if ( targets.length === 0 ) throw new Error( '没有 key 为 ' + options.scene + ' 的场景，可选：' + scenes.map( ( scene ) => scene.key ).join( ', ' ) );
 		}
+
+		if ( options.flights ) targets = [];
 
 		// 逐场景逐时间点截图；自由漫游的场景每个时间点再按机位各截一张
 		for ( const target of targets ) {
@@ -199,6 +205,25 @@ async function shootBackend( requested, options ) {
 				for ( const view of views ) {
 					await callGift( page, 'setView', [ view ], '__gift.setView(' + view + ')' );
 					await capture( target.key + '_' + formatTime( seconds ) + 's_' + view + '.png', settleFrames, { scene: target.key, time: seconds, view } );
+				}
+			}
+		}
+
+		// 飞行（规格书 13 阶段 4b 的验收）：每段航线在几个进度点各截一张。先瞬时跳到出发地停留的结尾、站在出生点，结果可复现；
+		// 截图时冻结时间（照样渲染），文件名 flight_<出发>-<到达>_<进度>.png
+		if ( options.flights || ! options.scene ) {
+			for ( const leg of config.world.legs ) {
+				const toIndex = scenes.findIndex( ( scene ) => scene.key === leg.to );
+				if ( toIndex < 0 ) continue;
+				for ( const progress of leg.shots || [ 0, 0.25, 0.5, 0.75, 1 ] ) {
+					const ok = await callGift( page, 'flightTo', [ toIndex, progress ], '__gift.flightTo(' + toIndex + ', ' + progress + ')' );
+					if ( ! ok ) {
+						result.errors.push( '飞行 ' + leg.from + '→' + leg.to + ' 进度 ' + progress + ' 没跳过去' );
+						continue;
+					}
+					await callGift( page, 'pause', [], '__gift.pause' );
+					await capture( 'flight_' + leg.from + '-' + leg.to + '_' + formatTime( progress ) + '.png', settleFrames, { flight: leg.from + '-' + leg.to, progress } );
+					await callGift( page, 'resume', [], '__gift.resume' );
 				}
 			}
 		}

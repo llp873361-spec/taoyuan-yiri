@@ -13,13 +13,35 @@ import { createAudio } from './core/audio.js';
 import { createDebug } from './core/debug.js';
 import { createWorld, directionFromAngles } from './core/world.js';
 import * as backdrop from './scenes/backdrop.js';
+import * as overture from './scenes/overture.js';
 import * as garden from './scenes/garden.js';
 import * as sunset from './scenes/sunset.js';
 import * as gothic from './scenes/gothic.js';
 import * as starry from './scenes/starry.js';
 import * as aurora from './scenes/aurora.js';
+import { createPanoramaModule, createFlightVideo, panoramaAvailable } from './scenes/panorama.js';
+import { createCssView } from './core/cssview.js';
 
-const sceneModules = [ garden, sunset, gothic, starry, aurora ];
+const sceneModules = [ overture, garden, sunset, gothic, starry, aurora ];
+// 全景替身（pano 档用）：每个地点一个，接口和普通场景一样
+const panoramaModules = sceneModules.map( ( module ) => createPanoramaModule( module.key ) );
+
+// ===== 长任务（主线程一次卡 50 毫秒以上）：截图脚本按时间线的阶段归类，验收"飞行期间没有长任务" =====
+const longTasks = [];
+if ( typeof PerformanceObserver !== 'undefined' && PerformanceObserver.supportedEntryTypes && PerformanceObserver.supportedEntryTypes.includes( 'longtask' ) ) {
+
+	new PerformanceObserver( ( list ) => {
+
+		for ( const entry of list.getEntries() ) {
+
+			longTasks.push( { start: entry.startTime, duration: entry.duration } );
+			if ( longTasks.length > 2000 ) longTasks.shift();
+
+		}
+
+	} ).observe( { type: 'longtask', buffered: true } );
+
+}
 
 // ===== 收集 console 的 warn / error，截图脚本会读 window.__gift.logs =====
 const logs = [];
@@ -42,6 +64,8 @@ const forcedTier = params.get( 'q' ) || '';
 const debugEnabled = params.has( 'debug' );
 const isShotMode = params.get( 'shot' ) === '1';
 const worldMode = params.get( 'world' ) === '1';   // 秘境俯瞰：只看常驻远景（规格书 6.3）
+const bakeMode = params.get( 'bake' ) === '1';     // 全景烘焙（scripts/bake-pano.mjs 用）
+const cssMode = params.get( 'css' ) === '1';       // 强制走 CSS 立方体全景（测兜底用）
 
 // ===== DOM =====
 const elements = {
@@ -102,6 +126,9 @@ const gift = {
 	setCameraRange: null,
 	setCompression: null,
 	measureGpu: null,
+	flightTo: null,
+	longTasks: null,
+	preloadNext: null,
 };
 window.__gift = gift;
 // 没人接这个 Promise 的拒绝时别再多报一条错
@@ -179,6 +206,208 @@ function setProgress( value, statusText ) {
 
 }
 
+// ===== 致谢列表 =====
+function fillCredits() {
+
+	const items = ( credits && Array.isArray( credits.items ) ) ? credits.items : [];
+	const panel = elements.creditsPanel;
+	panel.innerHTML = '';
+	const title = document.createElement( 'h3' );
+	title.textContent = config.creditsLabel;
+	panel.appendChild( title );
+
+	const list = document.createElement( 'ul' );
+	if ( items.length === 0 ) {
+
+		const item = document.createElement( 'li' );
+		item.textContent = '这一版全部是程序生成的画面，没有用到外部素材。';
+		list.appendChild( item );
+
+	}
+
+	for ( const entry of items ) {
+
+		const item = document.createElement( 'li' );
+		const name = document.createElement( 'div' );
+		name.textContent = `${ entry.title || '' }　${ entry.author ? '· ' + entry.author : '' }`;
+		const meta = document.createElement( 'span' );
+		meta.textContent = `${ entry.license || '' }　${ entry.url || '' }`;
+		item.appendChild( name );
+		item.appendChild( meta );
+		list.appendChild( item );
+
+	}
+
+	panel.appendChild( list );
+
+}
+
+// ===== 全屏 =====
+function requestFullscreenSafe() {
+
+	const root = document.documentElement;
+	if ( ! root.requestFullscreen ) {
+
+		console.warn( '这个浏览器不支持全屏接口' );
+		return;
+
+	}
+
+	root.requestFullscreen().catch( ( error ) => {
+
+		console.warn( '进入全屏失败（可以按 F 再试）：', error && error.message ? error.message : error );
+
+	} );
+
+}
+
+function toggleFullscreen() {
+
+	if ( document.fullscreenElement ) {
+
+		document.exitFullscreen().catch( () => {} );
+
+	} else {
+
+		requestFullscreenSafe();
+
+	}
+
+}
+
+// ===== 兜底：CSS 3D 立方体全景（规格书 6.5）=====
+// 没有渲染器，只有 DOM：开场卡照常，点开以后按时间线顺序看各地点的全景，地点之间放飞行视频；音频、结尾、致谢、再走一遍照常
+function startCssFallback( reason ) {
+
+	console.warn( `渲染器打不开（${ reason }），改用 CSS 3D 全景` );
+	let view;
+	const audio = createAudio( { config } );
+	try {
+
+		view = createCssView( { host: document.body, config, audio, onEnd: showCssEnding } );
+
+	} catch ( error ) {
+
+		showFatalPage( `这台电脑的浏览器打不开 3D 画面，全景也没准备好（${ error.message }）` );
+		rejectReady( error );
+		return;
+
+	}
+
+	elements.cardStatus.textContent = '这台电脑的浏览器画不了实时 3D，改用全景画册';
+	let started = false;
+	let endingTimers = [];
+
+	function showCssEnding() {
+
+		elements.ending.textContent = config.endingText || '';
+		const endingConfig = config.ending;
+		endingTimers.push( setTimeout( () => {
+
+			elements.ending.classList.add( 'visible' );
+			elements.replayButton.classList.add( 'visible' );
+
+		}, endingConfig.textDelay * 1000 ) );
+		endingTimers.push( setTimeout( () => elements.creditsButton.classList.add( 'visible' ), ( endingConfig.textDelay + endingConfig.creditsDelay ) * 1000 ) );
+
+	}
+
+	function hideCssEnding() {
+
+		endingTimers.forEach( clearTimeout );
+		endingTimers = [];
+		for ( const element of [ elements.ending, elements.creditsButton, elements.replayButton, elements.creditsPanel ] ) element.classList.remove( 'visible' );
+
+	}
+
+	elements.cardStart.addEventListener( 'click', async () => {
+
+		if ( started ) return;
+		started = true;
+		elements.cardStart.disabled = true;
+		audio.unlock();
+		if ( ! isShotMode ) requestFullscreenSafe();
+		elements.cardProgress.classList.add( 'visible' );
+		progressAnimation = requestAnimationFrame( drawProgress );
+		setProgress( 0.05, '正在展开全景' );
+		try {
+
+			await view.prepare( ( value ) => setProgress( 0.05 + value * 0.95 ) );
+
+		} catch ( error ) {
+
+			showFatalPage( `全景打不开：${ error && error.message ? error.message : error }` );
+			return;
+
+		}
+
+		elements.card.classList.add( 'fadeOut' );
+		elements.cardBackdrop.classList.add( 'fadeOut' );
+		if ( progressAnimation !== null ) {
+
+			cancelAnimationFrame( progressAnimation );
+			progressAnimation = null;
+
+		}
+
+		await view.start();
+		console.log( '开始播放（CSS 全景）' );
+
+	} );
+
+	elements.creditsButton.addEventListener( 'click', () => {
+
+		fillCredits();
+		elements.creditsPanel.classList.toggle( 'visible' );
+
+	} );
+
+	elements.replayButton.addEventListener( 'click', () => {
+
+		hideCssEnding();
+		view.restart();
+
+	} );
+
+	window.addEventListener( 'keydown', ( event ) => {
+
+		if ( event.repeat ) return;
+		const keyName = event.key.toLowerCase();
+		if ( keyName === ' ' ) {
+
+			event.preventDefault();
+			if ( started ) view.togglePause();
+
+		} else if ( keyName === 'arrowleft' || keyName === 'arrowright' ) {
+
+			event.preventDefault();
+			if ( started && view.jump( keyName === 'arrowleft' ? - 1 : 1 ) ) hideCssEnding();
+
+		} else if ( keyName === 'f' ) {
+
+			toggleFullscreen();
+
+		} else if ( keyName === 'h' ) {
+
+			elements.hud.classList.toggle( 'hidden' );
+
+		}
+
+	} );
+
+	gift.cssView = view;
+	gift.start = () => new Promise( ( resolve ) => {
+
+		elements.cardStart.click();
+		const check = () => ( view.info().phase !== 'idle' ? resolve( true ) : setTimeout( check, 100 ) );
+		check();
+
+	} );
+	gift.info = () => ( { backend: 'css', tier: 'css', ...view.info() } );
+	resolveReady();
+
+}
+
 // ===== 主逻辑 =====
 async function boot() {
 
@@ -190,6 +419,13 @@ async function boot() {
 
 	}
 
+	if ( cssMode ) {
+
+		startCssFallback( '?css=1 强制指定' );
+		return;
+
+	}
+
 	let rendererBundle;
 	try {
 
@@ -198,6 +434,14 @@ async function boot() {
 	} catch ( error ) {
 
 		const reason = error && error.message ? error.message : String( error );
+		// 规格书 6.5：连 WebGL2 都拿不到，但有烘焙好的全景，就用 CSS 3D 立方体看同一套全景和飞行视频
+		if ( panoramaAvailable() ) {
+
+			startCssFallback( reason );
+			return;
+
+		}
+
 		const hint = forceWebGL
 			? '这台电脑的浏览器打不开 WebGL2。请换最新版 Chrome 或 Edge，或者更新显卡驱动后再试。'
 			: '这台电脑的浏览器既不支持 WebGPU 也打不开 WebGL2。请换最新版 Chrome 或 Edge，或者更新显卡驱动后再试。';
@@ -207,8 +451,38 @@ async function boot() {
 
 	}
 
-	const { renderer, backend, gpuName, timer, gpuTiming } = rendererBundle;
+	const { renderer, backend, gpuName, fallbackAdapter, timer, gpuTiming } = rendererBundle;
 	elements.canvasHost.appendChild( renderer.domElement );
+
+	// ?compilestats：记录每一次建渲染管线（同步还是异步、哪个材质、第几层渲染），查"哪一帧在同步编着色器"用。
+	// 只在这个参数下包一层，平时不碰渲染器
+	if ( params.has( 'compilestats' ) ) {
+
+		const compileStats = [];
+		const originalCreate = renderer.backend.createRenderPipeline.bind( renderer.backend );
+		renderer.backend.createRenderPipeline = ( renderObject, promises ) => {
+
+			compileStats.push( {
+				time: performance.now(),
+				sync: ! promises,
+				material: renderObject.material.name || renderObject.material.type,
+				object: renderObject.object.name || renderObject.object.type,
+				scene: renderObject.scene ? renderObject.scene.name : '',
+				callDepth: renderer._callDepth,
+				context: renderObject.context ? renderObject.context.id : - 1,
+				key: renderer.backend.getRenderCacheKey( renderObject ),
+				shader: renderObject.getNodeBuilderState().vertexShader.length + '/' + renderObject.getNodeBuilderState().fragmentShader.length,
+			} );
+			if ( compileStats.length > 5000 ) compileStats.shift();
+			return originalCreate( renderObject, promises );
+
+		};
+		gift.compileStats = () => compileStats.slice();
+		gift.programCode = ( name ) => [ ...renderer._pipelines.programs.vertex.values() ].filter( ( stage ) => stage.name === name ).map( ( stage ) => stage.code );
+		// 现存的着色器程序：名字（材质名）和还有几条管线在用
+		gift.programList = () => [ ...renderer._pipelines.programs.fragment.values(), ...renderer._pipelines.programs.vertex.values() ].map( ( stage ) => `${ stage.stage }·${ stage.name }:${ stage.usedTimes }` );
+
+	}
 
 	const camera = new THREE.PerspectiveCamera( config.camera.fov, Math.max( 1, window.innerWidth ) / Math.max( 1, window.innerHeight ), config.camera.near, config.camera.far );
 
@@ -216,6 +490,7 @@ async function boot() {
 		renderer,
 		backend,
 		gpuName,
+		fallbackAdapter,
 		timer,
 		gpuTiming,
 		camera,
@@ -226,10 +501,13 @@ async function boot() {
 		audio: null,
 		debug: null,
 		world: null,
+		backdrop,
 		isShotMode,
 	};
 
 	ctx.world = createWorld( config );
+	// 环境光贴图生成器整个程序共用一个（每个地点各建一个的话，每次都要同步编一遍模糊着色器）
+	ctx.pmrem = new THREE.PMREMGenerator( renderer );
 	ctx.quality = createQuality( ctx, forcedTier );
 	ctx.pipeline = createPipeline( ctx );
 	ctx.director = createDirector( ctx );
@@ -239,7 +517,9 @@ async function boot() {
 	ctx.pipeline.registerDebug();
 	ctx.pipeline.resize();
 
-	const timeline = createTimeline( ctx, sceneModules );
+	// 全景模式的飞行视频盖在画布上面（只在 pano 档用到；不用时是一个藏着的空元素）
+	ctx.flightVideo = createFlightVideo( elements.canvasHost );
+	const timeline = createTimeline( ctx, sceneModules, panoramaModules );
 	if ( ! worldMode ) ctx.debug.setTimelineHooks( {
 		getTime: timeline.getTime,
 		getDuration: timeline.getDuration,
@@ -278,6 +558,7 @@ async function boot() {
 
 		}
 
+		// 顺序：时间线（地点、飞行位姿）→ 镜头（拖动、晃动）→ 远景按相机最终位置跟上（天空球、场景坐标换算）→ 画
 		if ( started ) {
 
 			timeline.update( dt );
@@ -286,6 +567,7 @@ async function boot() {
 		}
 
 		ctx.director.update( dt );
+		if ( started ) timeline.lateUpdate( dt );
 		if ( overview ) overview.update( dt );
 		ctx.pipeline.render();
 		// 每帧都结算显卡时间戳（开场卡阶段也要，不然查询一直攒着）
@@ -345,41 +627,6 @@ async function boot() {
 
 	}
 
-	function fillCredits() {
-
-		const items = ( credits && Array.isArray( credits.items ) ) ? credits.items : [];
-		const panel = elements.creditsPanel;
-		panel.innerHTML = '';
-		const title = document.createElement( 'h3' );
-		title.textContent = config.creditsLabel;
-		panel.appendChild( title );
-
-		const list = document.createElement( 'ul' );
-		if ( items.length === 0 ) {
-
-			const item = document.createElement( 'li' );
-			item.textContent = '这一版全部是程序生成的画面，没有用到外部素材。';
-			list.appendChild( item );
-
-		}
-
-		for ( const entry of items ) {
-
-			const item = document.createElement( 'li' );
-			const name = document.createElement( 'div' );
-			name.textContent = `${ entry.title || '' }　${ entry.author ? '· ' + entry.author : '' }`;
-			const meta = document.createElement( 'span' );
-			meta.textContent = `${ entry.license || '' }　${ entry.url || '' }`;
-			item.appendChild( name );
-			item.appendChild( meta );
-			list.appendChild( item );
-
-		}
-
-		panel.appendChild( list );
-
-	}
-
 	timeline.onEnd( showEnding );
 
 	elements.creditsButton.addEventListener( 'click', () => {
@@ -392,11 +639,8 @@ async function boot() {
 	elements.replayButton.addEventListener( 'click', () => {
 
 		hideEnding();
-		timeline.restart().catch( ( error ) => {
-
-			console.error( '再走一遍失败：', error );
-
-		} );
+		// 同色薄雾淡出，在雾里回到第一个地点（阶段 7 以后是溪口）
+		if ( ! timeline.restart() ) console.warn( '再走一遍：现在不能重来（还没开始，或者正在跳转）' );
 
 	} );
 
@@ -426,12 +670,19 @@ async function boot() {
 			if ( ! isShotMode ) {
 
 				setProgress( 0.15, '正在测试显卡' );
-				await ctx.quality.runBenchmark( renderOneFrame );
+				await ctx.quality.runBenchmark();
 
 			}
 
-			setProgress( 0.35, '正在布置第一个场景' );
+			// 输出链各画一帧编掉，运行中切换不卡（pano 档只用全景链，软件渲染下别的链编起来要好几秒）
+			ctx.pipeline.prepareChains( ctx.quality.tier === 'pano' ? [ 'pano' ] : undefined );
+			setProgress( 0.3, '正在铺开秘境' );
+			// 共用的环境光贴图生成器先空跑一次：背景盒和模糊的着色器在开场卡这里编掉（同步的），之后地点里生成就不卡
+			ctx.pmrem.fromScene( new THREE.Scene(), 0, 0.1, 100, { size: 128 } ).dispose();
+			await timeline.prepareWorld();
+			setProgress( 0.6, '正在布置第一个地点' );
 			await timeline.prepareFirst();
+			for ( const [ label, target ] of Object.entries( backdrop.getLayers() ) ) ctx.debug.addLayerToggle( '远景', label, target );
 			setProgress( 1, '' );
 
 		} catch ( error ) {
@@ -476,39 +727,6 @@ async function boot() {
 
 	} );
 
-	// ===== 全屏 =====
-	function requestFullscreenSafe() {
-
-		const root = document.documentElement;
-		if ( ! root.requestFullscreen ) {
-
-			console.warn( '这个浏览器不支持全屏接口' );
-			return;
-
-		}
-
-		root.requestFullscreen().catch( ( error ) => {
-
-			console.warn( '进入全屏失败（可以按 F 再试）：', error && error.message ? error.message : error );
-
-		} );
-
-	}
-
-	function toggleFullscreen() {
-
-		if ( document.fullscreenElement ) {
-
-			document.exitFullscreen().catch( () => {} );
-
-		} else {
-
-			requestFullscreenSafe();
-
-		}
-
-	}
-
 	// ===== 键盘 =====
 	let hudHidden = false;
 
@@ -526,11 +744,12 @@ async function boot() {
 
 			event.preventDefault();
 			if ( ! started ) return;
+			// 同色薄雾淡出淡入（1.2 秒），飞行中按 → 等于跳过飞行直接到目的地
 			const delta = keyName === 'arrowleft' ? - 1 : 1;
-			const target = timeline.getSceneIndex() + delta;
+			const target = timeline.getNavigationIndex() + delta;
 			if ( target < 0 || target >= config.scenes.length ) return;
 			hideEnding();
-			timeline.jumpTo( target, 0 ).catch( ( error ) => console.error( '跳转场景失败：', error ) );
+			timeline.requestJump( target );
 
 		} else if ( keyName === 'f' ) {
 
@@ -616,7 +835,7 @@ async function boot() {
 		ctx.world.setDayTime( overviewConfig.startTime );
 		const overviewBuildStart = performance.now();
 		const result = await backdrop.init( ctx );
-		await renderer.compileAsync( result.scene, camera );
+		await ctx.pipeline.compileScene( result.scene, camera );
 		backdrop.enter();
 		ctx.pipeline.setScene( result.scene );
 		ctx.pipeline.setGrading( overviewConfig.grading );
@@ -726,12 +945,64 @@ async function boot() {
 		return true;
 
 	};
-	// 当前场景的效果层：列出名字、单独开关（俯瞰模式下是远景的层）
-	const layerModule = () => ( overview ? backdrop : timeline.getCurrentModule() );
+	// 调试用：自由相机放到当前场景坐标的任意位置（null 关掉，还给步行 / 路线）
+	gift.freeLook = ( position, lookAt ) => {
+
+		if ( ! position ) {
+
+			ctx.director.freeMode = false;
+			return true;
+
+		}
+
+		ctx.director.freeMode = true;
+		ctx.director.setFreePose( position, lookAt );
+		return true;
+
+	};
+	// 当前场景的效果层：列出名字、单独开关（俯瞰模式、飞行巡航时是远景的层）
+	const layerModule = () => ( overview ? backdrop : ( timeline.getCurrentModule() || backdrop ) );
 	gift.getLayers = () => {
 
 		const module = layerModule();
 		return module && typeof module.getLayers === 'function' ? Object.keys( module.getLayers() ) : [];
+
+	};
+	// 后期的层（泛光、调色、光束……）单独开关（调试、截图排查用）
+	gift.setPostLayer = ( name, enabled ) => {
+
+		const toggle = ctx.pipeline.layerToggles[ name ];
+		if ( ! toggle ) throw new Error( `后期没有叫「${ name }」的层` );
+		toggle.value = enabled ? 1 : 0;
+		return true;
+
+	};
+	// 远景自己的层、当前地点的模块（调试、截图排查用）
+	gift.backdropLayers = () => backdrop.getLayers();
+	gift.currentModule = () => timeline.getCurrentModule();
+	// 相机在世界里的位置和朝向（方位角从北顺时针、俯仰，度）；交接、飞行连续性自查用
+	gift.cameraWorld = () => {
+
+		camera.updateMatrixWorld();
+		const key = timeline.getSceneKey();
+		const position = new THREE.Vector3().setFromMatrixPosition( camera.matrixWorld );
+		const forward = new THREE.Vector3( 0, 0, - 1 ).applyQuaternion( camera.getWorldQuaternion( new THREE.Quaternion() ) );
+		const worldPosition = key && timeline.getPhase() !== 'flight' ? ctx.world.toWorld( position, key, new THREE.Vector3() ) : position;
+		const worldForward = key && timeline.getPhase() !== 'flight' ? ctx.world.directionToWorld( forward, key, new THREE.Vector3() ) : forward;
+		return {
+			x: worldPosition.x, y: worldPosition.y, z: worldPosition.z,
+			yaw: ( ( Math.atan2( worldForward.x, - worldForward.z ) * 180 / Math.PI ) + 360 ) % 360,
+			pitch: Math.asin( Math.max( - 1, Math.min( 1, worldForward.y ) ) ) * 180 / Math.PI,
+		};
+
+	};
+	gift.adaptation = () => ctx.pipeline.getAdaptation();
+	// 统一天空现在的几个量（调光照用）
+	gift.skyState = () => {
+
+		const sky = ctx.world.uniforms;
+		const pick = ( node ) => ( node.value.isColor ? node.value.toArray().map( ( value ) => Number( value.toFixed( 3 ) ) ) : ( node.value.isVector3 ? node.value.toArray().map( ( value ) => Number( value.toFixed( 3 ) ) ) : Number( node.value.toFixed ? node.value.toFixed( 3 ) : node.value ) ) );
+		return Object.fromEntries( [ 'dayTime', 'skyIntensity', 'sunElevation', 'sunLightColor', 'moonLightColor', 'zenithColor', 'horizonColor', 'sunHorizonColor', 'earthShadowColor', 'glowColor', 'glowAmount', 'mistAmount' ].map( ( name ) => [ name, pick( sky[ name ] ) ] ) );
 
 	};
 	gift.setLayer = ( label, enabled ) => {
@@ -746,6 +1017,85 @@ async function boot() {
 
 	};
 	// 秘境：设时刻、摆机位、列出地点、改相机远近裁剪面、远景深度压缩（只在俯瞰模式下有意义）
+	// 截图脚本：飞到第 toIndex 个地点那段航线的某个进度（0~1）
+	gift.flightTo = async ( toIndex, progress ) => {
+
+		if ( ! started ) throw new Error( '还没 start' );
+		hideEnding();
+		return timeline.flightTo( toIndex, progress );
+
+	};
+	// 长任务和时间线阶段记录（时间都是 performance.now 的毫秒）
+	gift.longTasks = () => ( { tasks: longTasks.slice(), phases: timeline.getPhaseLog(), now: performance.now() } );
+	gift.preloadNext = () => timeline.preloadNext();
+	// 秘境时刻：俯瞰模式下随便设；地点和飞行里时间线每帧会按自己的规则设回去（暂停时保留）
+	// ===== 全景烘焙接口（只在 ?bake=1 时有）=====
+	if ( bakeMode ) {
+
+		const degree = Math.PI / 180;
+		// 跳到某个地点的某个时间、冻结，关掉暗角、颗粒、画布（这些在播放时实时叠加），镜头不晃
+		gift.bakeLocation = async ( index, time ) => {
+
+			hideEnding();
+			// 提前 1 秒跳过去、正常跑 1 秒再冻结：极光贴图的时间累积、极光平均色的读回、环境光贴图都要跑几帧才到位
+			await timeline.jumpTo( index, Math.max( 0, time - 1 ) );
+			timeline.resume();
+			for ( let i = 0; i < 60; i ++ ) await gift.step( 1 / 60 );
+			timeline.pause();
+			ctx.director.setSwayEnabled( false );
+			for ( const name of [ '暗角', '颗粒', '画布' ] ) ctx.pipeline.layerToggles[ name ].value = 0;
+			return true;
+
+		};
+		// 烘焙点在本地坐标里的眼睛位置：'spawn' 是出生点；[x, z] 取那里的地面高度 + 眼高
+		gift.bakePointPosition = ( point ) => {
+
+			const module = timeline.getCurrentModule();
+			if ( point === 'spawn' ) return module.getSpawn().position;
+			if ( point && Number.isFinite( point.route ) ) {
+
+				if ( typeof module.getPoseAt !== 'function' ) throw new Error( `全景烘焙：「${ timeline.getSceneKey() }」没有镜头路线，不能用 { route } 烘焙点` );
+				return module.getPoseAt( point.route ).position.toArray();
+
+			}
+
+			const [ x, z ] = point;
+			let ground = typeof module.groundHeightAt === 'function' ? module.groundHeightAt( x, z ) : NaN;
+			if ( ! Number.isFinite( ground ) ) {
+
+				const key = timeline.getSceneKey();
+				const worldPoint = ctx.world.toWorld( new THREE.Vector3( x, 0, z ), key );
+				ground = backdrop.getTerrainHeight( worldPoint.x, worldPoint.z ) - ctx.world.locations[ key ].origin[ 1 ];
+
+			}
+
+			return [ x, ground + config.camera.eyeHeight, z ];
+
+		};
+		// 镜头：本地坐标的位置、偏航（度，0 = 本地 −z，往右为正）、俯仰、视场（竖直方向，度）
+		gift.bakePose = ( position, yaw, pitch, fov ) => {
+
+			const quaternion = new THREE.Quaternion().setFromEuler( new THREE.Euler( pitch * degree, - yaw * degree, 0, 'YXZ' ) );
+			ctx.director.setExternalPose( new THREE.Vector3().fromArray( position ), quaternion, fov );
+			return true;
+
+		};
+		// 输出链：'mask' 遮罩（R = 天空），null 恢复
+		gift.bakeChain = ( name ) => {
+
+			ctx.pipeline.setForcedChain( name );
+			return true;
+
+		};
+		gift.bakeGrain = ( enabled ) => {
+
+			ctx.pipeline.layerToggles.颗粒.value = enabled ? 1 : 0;
+			return true;
+
+		};
+
+	}
+
 	gift.setDayTime = ( hours ) => {
 
 		ctx.world.setDayTime( hours );
@@ -805,7 +1155,14 @@ async function boot() {
 			sceneTime: timeline.getTime(),
 			phase: timeline.state.phase,
 			paused: timeline.state.paused,
-			transitionTime: timeline.state.transitionTime,
+			flight: timeline.getFlightInfo(),
+			veil: ctx.pipeline.getVeil(),
+			worldSkyBlend: ctx.world.uniforms.worldSkyBlend.value,
+			locationVeil: ctx.world.uniforms.locationVeil.value,
+			canvasReveal: ctx.pipeline.getCanvasReveal(),
+			anchor: ctx.world.getAnchor(),
+			panorama: Boolean( timeline.getCurrentModule() && timeline.getCurrentModule().isPanorama ),
+			chain: ctx.pipeline.getChain(),
 			loadStates: timeline.getLoadStates(),
 			cameraPosition: camera.position.toArray().map( ( value ) => Math.round( value * 100 ) / 100 ),
 			geometries: info.memory.geometries,

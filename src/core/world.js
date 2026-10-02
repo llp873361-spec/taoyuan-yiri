@@ -23,6 +23,13 @@ function gaussian( distance, width ) {
 
 }
 
+// 平滑取小：同上，取小的那个
+function smoothMin( first, second, softness ) {
+
+	return 0.5 * ( first + second - Math.sqrt( ( first - second ) * ( first - second ) + softness * softness ) );
+
+}
+
 // 平滑取大：两座山交界处是圆的，不是一道折痕
 function smoothMax( first, second, softness ) {
 
@@ -36,6 +43,72 @@ export function directionFromAngles( azimuthDegrees, elevationDegrees, target ) 
 	const azimuth = azimuthDegrees * degree;
 	const elevation = elevationDegrees * degree;
 	return target.set( Math.sin( azimuth ) * Math.cos( elevation ), Math.sin( elevation ), - Math.cos( azimuth ) * Math.cos( elevation ) );
+
+}
+
+// 山洞中线和截面（见 createWorld 里的说明）
+function buildCave( caveConfig ) {
+
+	if ( ! caveConfig || ! Array.isArray( caveConfig.path ) || caveConfig.path.length < 2 ) throw new Error( '秘境：config.world.cave.path 至少要两个点' );
+	const curve = new THREE.CatmullRomCurve3( caveConfig.path.map( ( point ) => new THREE.Vector3( point[ 0 ], point[ 1 ], point[ 2 ] ) ), false, 'centripetal' );
+	// 先密采样（按参数），再按累计弧长重采样成等距点；getPointAt 的弧长参数浮点超过 1 一点会返回 NaN，这里不用它
+	const dense = [];
+	const denseCount = 800;
+	for ( let i = 0; i < denseCount; i ++ ) dense.push( curve.getPoint( i / ( denseCount - 1 ) ) );
+	const denseAlong = [ 0 ];
+	for ( let i = 1; i < dense.length; i ++ ) denseAlong.push( denseAlong[ i - 1 ] + dense[ i ].distanceTo( dense[ i - 1 ] ) );
+	const length = denseAlong[ denseAlong.length - 1 ];
+	const spacing = 0.5;
+	const count = Math.ceil( length / spacing ) + 1;
+	const points = [];
+	let cursor = 0;
+	for ( let i = 0; i < count; i ++ ) {
+
+		const target = Math.min( length, i * length / ( count - 1 ) );
+		while ( cursor < dense.length - 2 && denseAlong[ cursor + 1 ] < target ) cursor ++;
+		const span = denseAlong[ cursor + 1 ] - denseAlong[ cursor ] || 1;
+		points.push( new THREE.Vector3().lerpVectors( dense[ cursor ], dense[ cursor + 1 ], ( target - denseAlong[ cursor ] ) / span ) );
+
+	}
+
+	const step = length / ( count - 1 );
+	function table( rows, fraction ) {
+
+		if ( fraction <= rows[ 0 ][ 0 ] ) return rows[ 0 ][ 1 ];
+		for ( let i = 1; i < rows.length; i ++ ) {
+
+			if ( fraction <= rows[ i ][ 0 ] ) {
+
+				const t = ( fraction - rows[ i - 1 ][ 0 ] ) / ( rows[ i ][ 0 ] - rows[ i - 1 ][ 0 ] );
+				return rows[ i - 1 ][ 1 ] + ( rows[ i ][ 1 ] - rows[ i - 1 ][ 1 ] ) * t;
+
+			}
+
+		}
+
+		return rows[ rows.length - 1 ][ 1 ];
+
+	}
+
+	// 沿洞 distance 米处：地面中心、水平切向（外 → 内）、宽、高
+	function at( distance, target = {} ) {
+
+		const clamped = Math.min( length, Math.max( 0, distance ) );
+		const index = Math.min( count - 2, Math.floor( clamped / step ) );
+		const t = ( clamped - index * step ) / step;
+		target.position = ( target.position || new THREE.Vector3() ).lerpVectors( points[ index ], points[ index + 1 ], t );
+		const before = points[ Math.max( 0, index - 1 ) ];
+		const after = points[ Math.min( count - 1, index + 2 ) ];
+		target.tangent = ( target.tangent || new THREE.Vector3() ).set( after.x - before.x, 0, after.z - before.z ).normalize();
+		const fraction = clamped / length;
+		target.width = table( caveConfig.widths, fraction );
+		target.height = table( caveConfig.heights, fraction );
+		target.fraction = fraction;
+		return target;
+
+	}
+
+	return { points, length, spacing: step, at, handoffDistance: length * caveConfig.handoff, config: caveConfig };
 
 }
 
@@ -103,20 +176,10 @@ export function createWorld( config ) {
 
 	}
 
-	function setDayTime( hours ) {
-
-		if ( ! Number.isFinite( hours ) ) {
-
-			console.error( '秘境：setDayTime 收到的时刻不是数字，忽略：', hours );
-			return;
-
-		}
+	// 时刻 → 前后两个关键帧和插值比例（首尾相接，24 小时循环）。linear 给日月角度用（匀速走），amount 给颜色用（两头缓）
+	function keysAt( hours ) {
 
 		const time = ( ( hours % 24 ) + 24 ) % 24;
-		state.dayTime = time;
-		uniforms.dayTime.value = time;
-
-		// 找前后两个关键帧（首尾相接，24 小时循环）
 		let previous = skyKeys[ skyKeys.length - 1 ];
 		let next = skyKeys[ 0 ];
 		for ( let i = 0; i < skyKeys.length; i ++ ) {
@@ -133,12 +196,39 @@ export function createWorld( config ) {
 		const span = ( ( next.time - previous.time ) % 24 + 24 ) % 24 || 24;
 		const elapsed = ( ( time - previous.time ) % 24 + 24 ) % 24;
 		const linear = Math.min( 1, elapsed / span );
-		const amount = linear * linear * ( 3 - 2 * linear );
+		return { time, previous, next, linear, amount: linear * linear * ( 3 - 2 * linear ) };
 
-		sunAngles.azimuth = lerpAzimuth( previous.sun[ 0 ], next.sun[ 0 ], linear );
-		sunAngles.elevation = previous.sun[ 1 ] + ( next.sun[ 1 ] - previous.sun[ 1 ] ) * linear;
-		moonAngles.azimuth = lerpAzimuth( previous.moon[ 0 ], next.moon[ 0 ], linear );
-		moonAngles.elevation = previous.moon[ 1 ] + ( next.moon[ 1 ] - previous.moon[ 1 ] ) * linear;
+	}
+
+	// 某个时刻的日月角度（度），不改当前时刻：地点在别的时刻后台加载时，按自己的时刻先把环境光贴图做好
+	function anglesAt( hours ) {
+
+		const { previous, next, linear } = keysAt( hours );
+		return {
+			sun: { azimuth: lerpAzimuth( previous.sun[ 0 ], next.sun[ 0 ], linear ), elevation: previous.sun[ 1 ] + ( next.sun[ 1 ] - previous.sun[ 1 ] ) * linear },
+			moon: { azimuth: lerpAzimuth( previous.moon[ 0 ], next.moon[ 0 ], linear ), elevation: previous.moon[ 1 ] + ( next.moon[ 1 ] - previous.moon[ 1 ] ) * linear },
+		};
+
+	}
+
+	function setDayTime( hours ) {
+
+		if ( ! Number.isFinite( hours ) ) {
+
+			console.error( '秘境：setDayTime 收到的时刻不是数字，忽略：', hours );
+			return;
+
+		}
+
+		const { time, previous, next, amount } = keysAt( hours );
+		state.dayTime = time;
+		uniforms.dayTime.value = time;
+
+		const angles = anglesAt( time );
+		sunAngles.azimuth = angles.sun.azimuth;
+		sunAngles.elevation = angles.sun.elevation;
+		moonAngles.azimuth = angles.moon.azimuth;
+		moonAngles.elevation = angles.moon.elevation;
 		directionFromAngles( sunAngles.azimuth, sunAngles.elevation, uniforms.sunDirection.value );
 		directionFromAngles( moonAngles.azimuth, moonAngles.elevation, uniforms.moonDirection.value );
 
@@ -176,9 +266,12 @@ export function createWorld( config ) {
 
 	}
 
+	// 下面几个换算的 key 传 null 表示"世界本身"（飞行时渲染的就是世界坐标），原样拷贝
+
 	// 本地 → 世界：先绕 y 转（本地 −z 转到方位角 yaw），再平移到原点
 	function toWorld( localPoint, key, target = new THREE.Vector3() ) {
 
+		if ( key === null ) return target.copy( localPoint );
 		const location = locationOf( key );
 		const angle = - location.yaw * degree;
 		const cosine = Math.cos( angle );
@@ -191,6 +284,7 @@ export function createWorld( config ) {
 
 	function toLocal( worldPoint, key, target = new THREE.Vector3() ) {
 
+		if ( key === null ) return target.copy( worldPoint );
 		const location = locationOf( key );
 		const x = worldPoint.x - location.origin[ 0 ];
 		const y = worldPoint.y - location.origin[ 1 ];
@@ -204,6 +298,7 @@ export function createWorld( config ) {
 
 	function directionToLocal( worldDirection, key, target = new THREE.Vector3() ) {
 
+		if ( key === null ) return target.copy( worldDirection );
 		const location = locationOf( key );
 		const angle = location.yaw * degree;
 		const cosine = Math.cos( angle );
@@ -212,16 +307,51 @@ export function createWorld( config ) {
 
 	}
 
+	function directionToWorld( localDirection, key, target = new THREE.Vector3() ) {
+
+		if ( key === null ) return target.copy( localDirection );
+		const angle = - locationOf( key ).yaw * degree;
+		const cosine = Math.cos( angle );
+		const sine = Math.sin( angle );
+		return target.set( localDirection.x * cosine + localDirection.z * sine, localDirection.y, - localDirection.x * sine + localDirection.z * cosine );
+
+	}
+
+	// 朝向换算：本地 → 世界是先绕 y 转 −yaw（three 的偏航角 = −方位角），世界 → 本地反过来
+	const yawQuaternion = new THREE.Quaternion();
+	const axisY = new THREE.Vector3( 0, 1, 0 );
+	function quaternionToWorld( localQuaternion, key, target = new THREE.Quaternion() ) {
+
+		if ( key === null ) return target.copy( localQuaternion );
+		yawQuaternion.setFromAxisAngle( axisY, - locationOf( key ).yaw * degree );
+		return target.multiplyQuaternions( yawQuaternion, localQuaternion );
+
+	}
+
+	function quaternionToLocal( worldQuaternion, key, target = new THREE.Quaternion() ) {
+
+		if ( key === null ) return target.copy( worldQuaternion );
+		yawQuaternion.setFromAxisAngle( axisY, locationOf( key ).yaw * degree );
+		return target.multiplyQuaternions( yawQuaternion, worldQuaternion );
+
+	}
+
 	// 世界 → 当前锚点局部系的矩阵（远景根节点用它挂进地点的场景里）；锚点为空就是单位矩阵
 	const anchorRotation = new THREE.Matrix4();
 	const anchorTranslation = new THREE.Matrix4();
-	function worldToAnchorMatrix( target = new THREE.Matrix4() ) {
+	function worldToLocationMatrix( key, target = new THREE.Matrix4() ) {
 
-		if ( ! state.anchorKey ) return target.identity();
-		const location = locationOf( state.anchorKey );
+		if ( ! key ) return target.identity();
+		const location = locationOf( key );
 		anchorRotation.makeRotationY( location.yaw * degree );
 		anchorTranslation.makeTranslation( - location.origin[ 0 ], - location.origin[ 1 ], - location.origin[ 2 ] );
 		return target.multiplyMatrices( anchorRotation, anchorTranslation );
+
+	}
+
+	function worldToAnchorMatrix( target = new THREE.Matrix4() ) {
+
+		return worldToLocationMatrix( state.anchorKey, target );
 
 	}
 
@@ -229,6 +359,25 @@ export function createWorld( config ) {
 
 		if ( key !== null ) locationOf( key );
 		state.anchorKey = key;
+
+	}
+
+	// 地点停留的时刻范围 [开始, 结束]（小时）；结束可以超过 24（星月夜 23:40 → 00:30）
+	function locationHours( key ) {
+
+		const hours = locationOf( key ).time;
+		if ( ! Array.isArray( hours ) || hours.length !== 2 ) throw new Error( `秘境：地点「${ key }」没写 time: [开始, 结束]` );
+		return hours;
+
+	}
+
+	// 地点停留时的相机远近、远景深度压缩、替身要不要藏（没写的用默认值）。
+	// 默认 far 30000、不压缩：24 位深度的精度几乎只由 near 决定，far 从 2000 改成 30000 远处不会多闪（4b 实测两帧差分一样），
+	// 地点自己的海面、天空也就不用跟着压缩。压缩（compressStart → compressEnd，end 不超过 0.85 × far）留着给要小 far 的地点用
+	const defaultView = { near: 0.1, far: 30000, compressStart: null, compressEnd: null, hideProxy: true };
+	function locationView( key ) {
+
+		return { ...defaultView, ...( locationOf( key ).view || {} ) };
 
 	}
 
@@ -372,6 +521,40 @@ export function createWorld( config ) {
 
 	}
 
+	// 源头头墙抬起多少（米）。默认是"源头往上游每米抬 headWallSlope 米"的一面平墙；
+	// 河配了 headWallShape（桃花溪）时，墙脚、墙面按离溪轴线的横向距离加两层起伏：墙脚前后进退几米（大的扶壁、凹进去的湾），
+	// 墙面上一道道几米宽的竖棱；溪轴线两边 innerCalm 米以内不动（泉眼、洞口在那里），往外慢慢加满。
+	// 墙脚再加一段圆角（坡脚的碎石坡），不是从平地直角折上去
+	function headWallRise( river, x, z ) {
+
+		const slope = river.headWallSlope !== undefined ? river.headWallSlope : 6;
+		const segment = river.segments[ 0 ];
+		const axisX = segment.end.x - segment.start.x;
+		const axisZ = segment.end.z - segment.start.z;
+		const axisLength = Math.hypot( axisX, axisZ ) || 1;
+		const directionX = axisX / axisLength;
+		const directionZ = axisZ / axisLength;
+		const offsetX = x - segment.start.x;
+		const offsetZ = z - segment.start.z;
+		// 往源头上游多远（下游是负的）、离溪轴线横向多远
+		const behind = - ( offsetX * directionX + offsetZ * directionZ );
+		const shape = river.headWallShape;
+		if ( ! shape ) return Math.max( 0, behind ) * slope;
+		if ( behind < - shape.footRadius - shape.footWander ) return 0;
+		const lateral = offsetX * - directionZ + offsetZ * directionX;
+		const shaping = smooth( shape.innerCalm, shape.innerCalm + 9, Math.abs( lateral ) );
+		const ribs = smooth( 120, 80, Math.abs( lateral ) );   // 细棱只在开场的细地形那一块里，远景 12.5 米一格画不出
+		const wander = ( ( jsFbm2D( lateral / 13 + 7.3, behind / 22 + 1.9, 2 ) - 0.5 ) * 2 * shape.footWander
+			+ ( jsFbm2D( lateral / 3.6 - 2.2, behind / 9 + 4.4, 2 ) - 0.5 ) * 2 * shape.ribDepth * ribs ) * shaping;
+		// 墙脚圆角的大小也按横向变（碎石坡有的地方高、有的地方矮），从正面看墙脚不是一条水平线
+		const radius = shape.footRadius * ( 0.45 + 1.1 * jsFbm2D( lateral / 17 - 4.1, 2.6, 2 ) ) * shaping;
+		const reach = behind + wander;
+		if ( reach <= - radius ) return 0;
+		if ( reach >= radius ) return reach * slope;
+		return ( reach + radius ) * ( reach + radius ) / ( 4 * radius ) * slope;
+
+	}
+
 	const lake = worldConfig.lake;
 
 	function lakeRadius( x, z ) {
@@ -511,14 +694,17 @@ export function createWorld( config ) {
 	const flattenSpots = [
 		{ position: locations.garden.origin, radius: 260, height: locations.garden.origin[ 1 ] },
 		{ position: locations.garden.landmark, radius: 220, height: locations.garden.landmark[ 1 ] },
-		{ position: locations.sunset.origin, radius: 70, height: 1, facing: facingOf( locations.sunset.yaw + 180 ) },
+		// 落日：陆侧压到 0.3 米（落日自己的沙滩、礁石都比它高，不会穿出来）；海侧挖到 −3 米，世界的陆地不伸进落日自己的海里
+		{ position: locations.sunset.origin, radius: 130, height: 0.3, facing: facingOf( locations.sunset.yaw + 180 ) },
+		{ position: locations.sunset.origin, radius: 360, height: - 3, facing: facingOf( locations.sunset.yaw ), edgeWidth: 8 },
 		{ position: locations.gothic.origin, radius: 60, height: locations.gothic.origin[ 1 ] - 1.5 },
 		{ position: locations.gothic.landmark, radius: 90, height: locations.gothic.landmark[ 1 ] - 1 },
 		// 星月夜机位：只压平身后，前面顺着山坡在 90 米里缓缓降下去，站在坡上往下看得见小镇和湖（不能是一块平台挡住视线）
 		{ position: locations.starry.origin, radius: 80, height: locations.starry.origin[ 1 ] - 1.5, facing: facingOf( locations.starry.yaw + 180 ), edgeWidth: 90 },
 		{ position: locations.starry.landmark, radius: 160, height: locations.starry.landmark[ 1 ] },
-		{ position: locations.aurora.origin, radius: 450, height: locations.aurora.origin[ 1 ] },
-		{ position: locations.overture.origin, radius: 140, height: locations.overture.origin[ 1 ] + 0.8 },
+		// 雪原：原点在台地南缘崖边 20 米内（2026-10-01 定：先朝南看整个秘境的夜景，再转身往北沿脚印走）；
+		// 只压平北边（脚印那一侧），南边保留天然的崖缘，站在原点往南看得见下面的盆地
+		{ position: locations.aurora.origin, radius: 450, height: locations.aurora.origin[ 1 ], facing: facingOf( 0 ), edgeWidth: 8, frontSlope: 0.3, frontReach: 70 },
 		// 洞口只压平洞口外面的半边（facing 是洞口朝外的方向），洞顶上的山梁要留着
 		{ position: worldConfig.cave.outer, radius: 45, height: worldConfig.cave.outer[ 1 ], facing: caveFacing( worldConfig.cave.inner, worldConfig.cave.outer ) },
 		{ position: worldConfig.cave.inner, radius: 45, height: worldConfig.cave.inner[ 1 ], facing: caveFacing( worldConfig.cave.outer, worldConfig.cave.inner ) },
@@ -573,6 +759,15 @@ export function createWorld( config ) {
 			if ( spot.facing ) weight *= smooth( - ( spot.edgeWidth || 8 ), 2, offsetX * spot.facing[ 0 ] + offsetZ * spot.facing[ 1 ] );
 			height += ( spot.height - height ) * weight;
 
+			// 看台：不压平的那一侧（前方）地面不许高过"原点高度 − 前方距离 × frontSlope"，缓缓往下，站在原点能越过前面的边看到下面
+			if ( spot.frontSlope ) {
+
+				const front = - ( offsetX * spot.facing[ 0 ] + offsetZ * spot.facing[ 1 ] );
+				const cap = spot.height - Math.max( 0, front ) * spot.frontSlope;
+				if ( front > 0 && height > cap ) height += ( cap - height ) * smooth( spot.frontReach, spot.frontReach * 0.6, front );
+
+			}
+
 		}
 
 		height = applySightlines( x, z, height );
@@ -604,7 +799,8 @@ export function createWorld( config ) {
 			if ( x < bounds.minX - 300 || x > bounds.maxX + 300 || z < bounds.minZ - 300 || z > bounds.maxZ + 300 ) continue;
 			const nearest = nearestOnRiver( river, x, z );
 			if ( nearest.distance > 300 ) continue;
-			const headWall = nearest.upstream * 6;
+			// 源头往上游每米抬 headWallSlope 米（默认 6，一面陡墙；桃花溪 1.8："便得一山"是一面陡坡，洞口在坡脚）
+			const headWall = headWallRise( river, x, z );
 			if ( nearest.distance < river.halfWidth && nearest.upstream < river.halfWidth * 0.5 ) {
 
 				const ratio = nearest.distance / river.halfWidth;
@@ -618,9 +814,14 @@ export function createWorld( config ) {
 
 			} else {
 
+				// 岸：离水边每米抬 bankSlope 米（默认 0.32），再加一个二次项让河谷越往外越陡；桃花溪的河谷宽而平（两岸是桃林）
 				const excess = Math.max( 0, nearest.distance - river.halfWidth );
-				const bank = nearest.level + 0.4 + excess * 0.32 + excess * excess * 0.004 + headWall;
-				height += ( Math.min( height, bank ) - height ) * smooth( 300, 200, nearest.distance );
+				const bankSlope = river.bankSlope !== undefined ? river.bankSlope : 0.32;
+				const bankCurve = river.bankCurve !== undefined ? river.bankCurve : 0.004;
+				const bank = nearest.level + 0.4 + excess * bankSlope + excess * excess * bankCurve + headWall;
+				// 配了头墙起伏的溪（桃花溪）：挖出来的谷坡和原来的山坡交成圆角（平滑取小），头墙的两头不是一刀切出来的竖棱
+				const carved = river.headWallShape ? smoothMin( height, bank, river.headWallShape.creaseSoftness ) : Math.min( height, bank );
+				height += ( carved - height ) * smooth( 300, 200, nearest.distance );
 
 			}
 
@@ -644,6 +845,11 @@ export function createWorld( config ) {
 
 	}
 
+	// ===================== 山洞 =====================
+	// 洞地面的中线：config.world.cave.path 的控制点（外口 → 内口）用 Catmull-Rom 重采样成每 0.5 米一个点（按弧长）；
+	// 截面的宽、高按沿洞的比例从 widths / heights 表里线性插值。远景的洞壁、开场和花园的镜头都用它，交接时位置对得上
+	const cave = buildCave( worldConfig.cave );
+
 	setDayTime( 5 );
 
 	return {
@@ -655,17 +861,26 @@ export function createWorld( config ) {
 		getDayTime: () => state.dayTime,
 		getSunAngles: () => ( { ...sunAngles } ),
 		getMoonAngles: () => ( { ...moonAngles } ),
+		anglesAt,
 		toWorld,
 		toLocal,
 		directionToLocal,
+		directionToWorld,
+		quaternionToWorld,
+		quaternionToLocal,
 		worldToAnchorMatrix,
+		worldToLocationMatrix,
 		setAnchor,
 		getAnchor: () => state.anchorKey,
+		locationHours,
+		locationView,
 		sample,
 		worldHeight,
 		lakeRadius,
 		nearestOnRiver,
+		headWallRise,
 		getRiver,
+		cave,
 	};
 
 }

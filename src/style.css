@@ -351,3 +351,54 @@ body.cursorHidden {
 	font-size: 14px;
 	color: rgba(240, 236, 228, 0.8);
 }
+
+/* ===== CSS 3D 立方体全景（连 WebGL2 都没有时的兜底）===== */
+
+.cssView {
+	position: fixed;
+	inset: 0;
+	z-index: 0;
+	overflow: hidden;
+	background: #000;
+	cursor: grab;
+	touch-action: none;
+}
+
+.cssCamera,
+.cssCube {
+	position: absolute;
+	left: 50%;
+	top: 50%;
+	width: 0;
+	height: 0;
+	transform-style: preserve-3d;
+}
+
+.cssFace {
+	position: absolute;
+	left: -768px;
+	top: -768px;
+	width: 1538px;
+	height: 1538px;
+	margin: -1px 0 0 -1px;
+	backface-visibility: visible;
+}
+
+.cssFlight,
+.cssCurtain {
+	position: absolute;
+	inset: 0;
+	width: 100%;
+	height: 100%;
+	opacity: 0;
+	pointer-events: none;
+}
+
+.cssFlight {
+	object-fit: cover;
+	background: transparent;
+}
+
+.cssCurtain {
+	background: #000;
+}

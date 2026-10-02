@@ -58,12 +58,15 @@ export async function createRenderer( { forceWebGL = false, trackTimestamp = fal
 
 	const canvas = document.createElement( 'canvas' );
 
-	// antialias: true → MSAA 4x（Renderer.js:275）。不传 powerPreference：Windows 的 Chrome 会忽略它并打一条警告
+	// antialias: true → MSAA 4x（Renderer.js:275）。显卡偏好只在 Mac 上请求 high-performance（双显卡的 MacBook 会切到独显）；
+	// Windows 的 Chrome / Edge 会忽略它并打一条警告，用哪块显卡由 Windows 的"图形设置"决定（README 里写了）
+	const isMac = typeof navigator !== 'undefined' && /Mac/i.test( navigator.platform || navigator.userAgent || '' );
 	const renderer = new THREE.WebGPURenderer( {
 		canvas,
 		antialias: true,
 		forceWebGL: forceWebGL === true,
 		trackTimestamp: trackTimestamp === true,
+		...( isMac ? { powerPreference: 'high-performance' } : {} ),
 	} );
 
 	// r186 必须先 init 再 render；WebGPU 失败时 init 内部自动退回 WebGL2，两个都失败才会抛
@@ -111,6 +114,9 @@ export async function createRenderer( { forceWebGL = false, trackTimestamp = fal
 	}
 
 	const gpuName = readGpuName( renderer, backend );
+	// WebGPU 报告是兜底适配器（软件实现）：画质直接用全景
+	const device = backend === 'webgpu' ? renderer.backend.device : null;
+	const fallbackAdapter = Boolean( device && device.adapterInfo && device.adapterInfo.isFallbackAdapter === true );
 
 	// toneMapping 由 pipeline 决定，这里不设；outputColorSpace 保持默认 SRGB
 	renderer.shadowMap.enabled = true;
@@ -128,7 +134,7 @@ export async function createRenderer( { forceWebGL = false, trackTimestamp = fal
 	if ( backend === 'webgl2' ) renderer.backend.trackTimestamp = false;
 	const gpuTiming = trackTimestamp === true && backend === 'webgpu' && renderer.backend.trackTimestamp === true;
 
-	return { renderer, backend, gpuName, timer, gpuTiming };
+	return { renderer, backend, gpuName, fallbackAdapter, timer, gpuTiming };
 
 }
 
