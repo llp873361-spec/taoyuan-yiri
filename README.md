@@ -2,7 +2,11 @@
 
 送给她的单文件 3D 网页礼物，按《桃花源记》的结构：黎明乘小船沿桃花溪逆流而上，两岸桃林，林尽水源，穿过山洞，豁然开朗——
 在一片秘境里度过一整天：清晨白银花园城堡 → 黄昏落日海 → 入夜哥特城堡 → 深夜梵高星空 → 凌晨极光雪原。
-成品就是仓库根目录的 **`桃源一日.html`**（约 300 MB，一个文件），双击就能离线打开（Chrome / Edge / Safari），发给她只发这一个文件。规格和进度见 `CLAUDE.md`。
+成品是一个约 300 MB 的单文件 HTML，双击就能离线打开（Chrome / Edge / Safari），发给她只发这一个文件。规格和进度见 `CLAUDE.md`。
+
+**下载**：https://github.com/llp873361-spec/taoyuan-yiri/releases/tag/v1.0
+（GitHub 附件名不能用中文：`taoyuan-yiri.html` 直接下载就能双击打开；`taoyuan-yiri.zip` 小一些，解压出来是 `桃源一日.html`。超过 GitHub 单文件 100 MB 的上限，所以不在仓库文件里。）
+本地 `npm run build` 以后，根目录也会出一份 `桃源一日.html`（被 .gitignore 忽略）。
 
 ## 怎么构建
 
