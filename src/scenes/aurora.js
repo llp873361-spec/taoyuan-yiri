@@ -17,7 +17,7 @@
 
 import * as THREE from 'three/webgpu';
 import {
-	Fn, If, Loop, Break, uniform, float, int, vec2, vec3, vec4, color, texture, uv, varying, array, vertexIndex,
+	Fn, If, Loop, Break, Discard, uniform, float, int, vec2, vec3, vec4, color, texture, uv, varying, array, vertexIndex,
 	positionWorld, positionView, positionLocal, normalWorld, normalViewGeometry, normalWorldGeometry, cameraPosition, cameraViewMatrix,
 	instanceIndex, faceDirection, BRDF_Lambert, diffuseContribution, normalView,
 	mix, smoothstep, clamp, max, min, abs, pow, exp, sqrt, sin, cos, atan, asin, floor, fract, length, normalize, dot, cross,
@@ -106,7 +106,13 @@ const state = {
 	fogColor: new THREE.Color(),
 	fogScatter: new THREE.Color(),
 	worldMoon: new THREE.Vector3(),
+	auroraSkipped: false,  // 「极光」开关关着时不画极光贴图
+	shadowCenter: new THREE.Vector3( NaN, NaN, NaN ),   // 月光阴影图上一次画的中心（吸附后）
+	shadowLightDirection: new THREE.Vector3(),          // 上一次画阴影图时的月光方向
 };
+
+// 极光贴图每帧给的视野（镜头前向、看得见的锥半角），每帧不再 new
+const auroraView = { direction: new THREE.Vector3(), halfAngle: Math.PI };
 
 // ===================== 地形高度场（CPU）=====================
 
@@ -252,8 +258,20 @@ async function buildHeightField( resolution, size, centerZ, rocks ) {
 			const sampleZ = Math.min( z, cutZ[ i ] );
 			const raw = terrainHeightRaw( x, sampleZ, rocks, windCos, windSin );
 			const drawn = backdropHeightAt( x, sampleZ );
-			const interior = smooth01( Math.min( size / 2 - Math.abs( x ), sampleZ - minZ ) / borderBlend ) * ( sampleZ < 0 ? smooth01( - sampleZ / rimBlend ) : 0 );
-			heights[ j * resolution + i ] = drawn + 0.3 + ( raw - drawn - 0.3 ) * interior;
+			let interior = smooth01( Math.min( size / 2 - Math.abs( x ), sampleZ - minZ ) / borderBlend ) * ( sampleZ < 0 ? smooth01( - sampleZ / rimBlend ) : 0 );
+			// 融水冰槽（星月夜 → 雪原的窄处）：离槽中线 30 米以内跟着远景的高度走（槽是远景地形里挖的），不然雪原自己的雪把槽填平
+			if ( typeof state.ctx.world.iceNotchDistance === 'function' ) {
+
+				state.ctx.world.toWorld( tempWorldPoint.set( x, 0, sampleZ ), key, tempWorldPoint );
+				interior *= smooth01( ( state.ctx.world.iceNotchDistance( tempWorldPoint.x, tempWorldPoint.z ) - 18 ) / 14 );
+
+			}
+
+			// 崖边的雪檐（2026-10-02 审查 R2）：离裁切线 9 米以内，风把雪堆成一个个高低不一的雪包（0.3~1.9 米，沿崖边 6~8 米一个），
+			// 站在原点朝南看，雪面和盆地之间不再是一道笔直的水平线
+			const toCut = cutZ[ i ] - sampleZ;
+			const cornice = toCut < 9 ? ( 0.3 + 1.6 * Math.pow( jsFbm2D( x / 7.5 + 2.3, 4.1, 3 ), 1.6 ) ) * smooth01( 1 - toCut / 9 ) : 0;
+			heights[ j * resolution + i ] = drawn + 0.3 + ( raw - drawn - 0.3 ) * interior + cornice;
 
 		}
 
@@ -795,14 +813,16 @@ function createSnowMaterial( tierName ) {
 	const rippleFine = fbm2D( vec2( windAlong.mul( 0.45 ), windAcross.mul( 3.6 ) ).add( 13 ), 2 ).sub( 0.5 ).mul( 0.025 );
 	// 细风纹在远处淡出（2 个像素以下就是噪点）
 	const rippleFineFade = float( 1 ).sub( smoothstep( 0.1, 0.35, footprint.mul( 3.6 ) ) );
-	const rippleHeight = rippleLarge.add( rippleFine.mul( rippleFineFade ) ).mul( uniforms.windToggle );
+	// 贴着地面平视远处时风纹压到四成五（审查 R46：朝南看脚下一道道横向的亮暗条纹，像水面）；低头看近处还是满的
+	const rippleViewFade = mix( float( 0.45 ), float( 1 ), smoothstep( 0.05, 0.35, normalize( viewVector ).y ) );
+	const rippleHeight = rippleLarge.add( rippleFine.mul( rippleFineFade ) ).mul( rippleViewFade ).mul( uniforms.windToggle );
 
 	// ---------- ⑤ 颗粒：F2-F1 脊线 3 个八度 + value noise 各一半；按像素足迹逐个八度淡出 ----------
 	const grainBaseFrequency = 1 / 0.022;    // 最粗一级 2.2 厘米
 	const grainFrequencies = [ grainBaseFrequency, grainBaseFrequency * 1.9, grainBaseFrequency * 1.9 * 2.3 ];
 	const grainAmplitudes = [ 0.002, 0.0012, 0.0006 ];
 
-	function grainHeightAt( planeCoordinate ) {
+	function grainHeightAt( planeCoordinate, pixelFootprint ) {
 
 		// 先 domain warp：p += 0.35 * fbm(p * 0.5)，打破细胞形状的规则感
 		const warped = domainWarp2D( planeCoordinate.mul( grainBaseFrequency ), 0.35, 0.5, 2 );
@@ -819,7 +839,7 @@ function createSnowMaterial( tierName ) {
 			const soft = valueNoise2D( point.mul( scaleFromBase * 1.3 ).add( 31 ) );
 			const octave = mix( ridge, soft, 0.5 );
 			// 一个格子小于约 2.5 像素就开始淡出（footprint × 频率 = 每格占多少分之一像素）
-			const fade = float( 1 ).sub( smoothstep( 0.3, 0.8, footprint.mul( grainFrequencies[ i ] ) ) );
+			const fade = float( 1 ).sub( smoothstep( 0.3, 0.8, pixelFootprint.mul( grainFrequencies[ i ] ) ) );
 			total = total.add( octave.sub( 0.5 ).mul( grainAmplitudes[ i ] ).mul( fade ) );
 			// 八度之间旋转坐标
 			point = vec2( point.x.mul( 0.8 ).sub( point.y.mul( 0.6 ) ), point.x.mul( 0.6 ).add( point.y.mul( 0.8 ) ) ).add( 7.3 );
@@ -830,21 +850,33 @@ function createSnowMaterial( tierName ) {
 
 	}
 
+	const grainSkip = state.ctx.config.perf.scenesB.grainSkip;
 	const grainHeight = Fn( () => {
 
-		const height = grainHeightAt( sampleXZ ).toVar();
-		// 只在陡坡（|N.y| < 0.7）混 triplanar，平地不用
-		const steepness = abs( normalWorldGeometry.y );
-		If( steepness.lessThan( 0.7 ), () => {
+		// 像素足迹在分支外先算好（导数不能放进分支）。最粗一级颗粒 footprint × 频率 ≥ 0.8 时三个八度的 fade 都正好是 0，
+		// 整段颗粒（domain warp、三级 Voronoi、value noise，陡坡上再算两遍）结果就是 0：这时整段跳过，逐像素一样（性能，perf.scenesB.grainSkip）
+		const grainFootprint = footprint.toVar();
+		const height = float( 0 ).toVar();
+		const addGrain = () => {
 
-			const blend = float( 1 ).sub( smoothstep( 0.5, 0.7, steepness ) );
-			const weightX = abs( normalWorldGeometry.x );
-			const weightZ = abs( normalWorldGeometry.z );
-			const weightSum = weightX.add( weightZ ).max( 1e-3 );
-			const sideHeight = grainHeightAt( positionWorld.zy ).mul( weightX ).add( grainHeightAt( positionWorld.xy ).mul( weightZ ) ).div( weightSum );
-			height.assign( mix( height, sideHeight, blend ) );
+			height.assign( grainHeightAt( sampleXZ, grainFootprint ) );
+			// 只在陡坡（|N.y| < 0.7）混 triplanar，平地不用
+			const steepness = abs( normalWorldGeometry.y );
+			If( steepness.lessThan( 0.7 ), () => {
 
-		} );
+				const blend = float( 1 ).sub( smoothstep( 0.5, 0.7, steepness ) );
+				const weightX = abs( normalWorldGeometry.x );
+				const weightZ = abs( normalWorldGeometry.z );
+				const weightSum = weightX.add( weightZ ).max( 1e-3 );
+				const sideHeight = grainHeightAt( positionWorld.zy, grainFootprint ).mul( weightX ).add( grainHeightAt( positionWorld.xy, grainFootprint ).mul( weightZ ) ).div( weightSum );
+				height.assign( mix( height, sideHeight, blend ) );
+
+			} );
+
+		};
+
+		if ( grainSkip ) If( grainFootprint.mul( grainBaseFrequency ).lessThan( 0.8 ), addGrain );
+		else addGrain();
 		return height;
 
 	} )();
@@ -867,7 +899,21 @@ function createSnowMaterial( tierName ) {
 	// 脚印里反照率降 4%，蓝色加强（凹坑里的蓝影）
 	const footprintTint = mix( vec3( 1 ), vec3( 0.86, 0.92, 1.05 ), uniforms.blueShadowToggle );
 	// 斑驳会把某个通道推到 0.92 以上，夹住：雪的反照率不能接近 1
-	material.colorNode = min( mottledAlbedo.mul( mix( vec3( 1 ), footprintTint.mul( 0.96 ), insideFootprint ) ), vec3( 0.92 ) );
+	const snowColor = min( mottledAlbedo.mul( mix( vec3( 1 ), footprintTint.mul( 0.96 ), insideFootprint ) ), vec3( 0.92 ) );
+	// 融水冰槽的槽壁是冰（和远景地形同一个判断，见 backdrop.iceTroughAmount）：陡的地方偏青蓝、带竖纹
+	const backdrop = state.ctx.backdrop;
+	if ( typeof backdrop.iceTroughAmount === 'function' ) {
+
+		const origin = state.ctx.world.locations[ key ].origin;
+		const worldPoint = positionWorld.add( vec3( origin[ 0 ], origin[ 1 ], origin[ 2 ] ) );
+		const ice = backdrop.iceTroughAmount( worldPoint.xz ).mul( smoothstep( 0.86, 0.6, normalWorldGeometry.y ) );
+		material.colorNode = mix( snowColor, backdrop.iceTroughColor( worldPoint ).mul( 0.85 ), ice );
+
+	} else {
+
+		material.colorNode = snowColor;
+
+	}
 
 	material.roughnessNode = roughnessBase.sub( insideFootprint.mul( 0.15 ) ).clamp( 0.15, 1 );
 	// 凹坑里间接光少一些
@@ -898,6 +944,7 @@ function createSnowMaterial( tierName ) {
 		viewDirection: viewDirectionWorld,
 		density: sparkleDensity.mul( uniforms.sparkleToggle ),
 		levels: sparkleLevels,
+		lean: state.ctx.config.perf.scenesB.sparkleSkip,
 	};
 	const moonLightColor = uniforms.moonColor;
 	const auroraLightDirection = normalize( vec3( 0, 1, - 0.5 ) );
@@ -955,8 +1002,12 @@ function createSnowMaterial( tierName ) {
 
 // 极光半球贴图 pass。uniforms 要有 sceneTime、frameIndex、auroraSteps（int）、auroraResolution（vec2）、auroraBlend、auroraBrightness，
 // 可选 auroraRayScale（竖向光线的密度，默认 26；全景模式的低分辨率贴图用小一点，免得走样成竖条块）；
-// 雪原自己用，全景模式（panorama.js）也用它画实时极光（低分辨率、少步数）。返回的对象带 dispose()
-export function createAuroraPass( renderer, uniforms, auroraConfig ) {
+// 雪原自己用，全景模式（panorama.js）也用它画实时极光（低分辨率、少步数）。返回的对象带 dispose()。
+// options（可选，性能）：sheetSkip 帘幕外不算噪声（默认开）；slices 视野外分几片轮流算（默认 8，render() 不给 view 时整张算）
+export function createAuroraPass( renderer, uniforms, auroraConfig, options = {} ) {
+
+	const sheetSkip = options.sheetSkip !== false;
+	const sliceCount = Number.isInteger( options.slices ) && options.slices >= 1 ? options.slices : 8;
 
 
 	const makeTarget = ( width, height ) => {
@@ -985,6 +1036,16 @@ export function createAuroraPass( renderer, uniforms, auroraConfig ) {
 	const purple = color( '#9a4dff' );
 	const red = color( '#ff5f7e' );
 
+	// 只重算看得见的那部分（性能，2026-10-02）：贴图 2048×640 每个纹素 40 层 × 3 条帘幕，整张每帧重算是全场最贵的一项。
+	//   视野（镜头前向 viewForward 周围、半角余弦 viewCosLimit 的锥）里的纹素每帧照旧累积；
+	//   视野外的按方位切成 sliceCount 片，每帧轮到一片（sliceIndex）重算，混合比按"隔 sliceCount 帧一次"折算（sliceBlend = 1 − (1 − α)^片数），
+	//   时间常数不变；其余纹素原样抄上一帧。viewCosLimit = −2 时整张都算（全景模式、刚换尺寸、头几帧）。
+	//   下面"平均色"那一遍在 8×8 个点上双线性取样，每个点碰到的 2×2 个纹素也每帧照原样算：雪地的极光照明、闪光颜色和整张都算时一样
+	const viewForward = uniform( new THREE.Vector3( 0, 0, - 1 ) );
+	const viewCosLimit = uniform( - 2 );
+	const sliceIndex = uniform( 0 );
+	const sliceBlend = uniform( 1 );
+
 	const auroraColor = Fn( () => {
 
 		const mapUV = uv();
@@ -992,73 +1053,101 @@ export function createAuroraPass( renderer, uniforms, auroraConfig ) {
 		const time = uniforms.sceneTime;
 		const steps = uniforms.auroraSteps;
 		const stepCount = steps.toFloat();
+		// 上一帧（分支外取，取第 0 级：分支里不能用隐式导数）
+		const previous = previousNode.sample( mapUV ).level( 0 ).rgb;
+		const result = vec3( previous ).toVar();
+		const inView = dot( direction, viewForward ).greaterThan( viewCosLimit );
+		const inSlice = floor( mapUV.x.mul( sliceCount ) ).equal( sliceIndex );
+		// 平均色的取样点在 ((i + 0.5) / 8, (j + 0.5) / 8)：纹素中心离最近的取样点不到 1 个纹素（两个方向都是）就是被它碰到的纹素
+		const averageOffset = abs( fract( mapUV.mul( 8 ) ).sub( 0.5 ) ).mul( uniforms.auroraResolution.div( 8 ) );
+		const feedsAverage = averageOffset.x.lessThan( 1 ).and( averageOffset.y.lessThan( 1 ) );
+		const everyFrame = inView.or( feedsAverage );
 
-		// 每个像素的起始偏移用哈希抖动，配合时间累积去掉分层条纹
-		const pixel = floor( mapUV.mul( uniforms.auroraResolution ) );
-		const jitter = hash21( pixel.add( vec2( uniforms.frameIndex.mul( 17 ), uniforms.frameIndex.mul( 59 ) ) ) );
+		// 地平线以上 1.15° 以内 horizonFade 恒为 0（下面的 smoothstep( 0.02, 0.2 )），结果就是 0，不用分层采样
+		If( direction.y.lessThanEqual( 0.02 ), () => {
 
-		const accumulated = vec3( 0 ).toVar();
-		const viewY = max( direction.y, 0.03 );
-		// 人在地上走几百米，极光几乎不动：只给极小的视差
-		const cameraOffset = cameraPosition.xz.mul( 0.0004 );
+			result.assign( vec3( 0 ) );
 
-		Loop( { start: int( 0 ), end: steps, type: 'int', condition: '<' }, ( { i } ) => {
+		} ).ElseIf( everyFrame.or( inSlice ), () => {
 
-			// 层高随层号非线性增加：底部采得密（帘幕下缘最亮最细）
-			const layerFraction = pow( i.toFloat().add( jitter ).div( stepCount ), 1.35 );
-			const altitude = float( 1 ).add( layerFraction.mul( 1.6 ) );
-			// 视线和这一层水平面的交点：t = (高度 - 相机高度) / 视线.y，相机高度在这个尺度下当 0
-			const planePoint = direction.xz.mul( altitude.div( viewY ) ).add( cameraOffset );
+			// 每个像素的起始偏移用哈希抖动，配合时间累积去掉分层条纹
+			const pixel = floor( mapUV.mul( uniforms.auroraResolution ) );
+			const jitter = hash21( pixel.add( vec2( uniforms.frameIndex.mul( 17 ), uniforms.frameIndex.mul( 59 ) ) ) );
 
-			for ( const curtain of curtains ) {
+			const accumulated = vec3( 0 ).toVar();
+			const viewY = max( direction.y, 0.03 );
+			// 人在地上走几百米，极光几乎不动：只给极小的视差
+			const cameraOffset = cameraPosition.xz.mul( 0.0004 );
 
-				// 帘幕位置：先做一次低频弯曲 x += 0.8·sin(z·0.2 + t·0.05) 形成弧形光带，再叠一层更碎的弯
-				// 再加一层沿 x 的小褶皱，帘幕像布一样有折
-				const curtainLine = float( curtain.z0 )
-					.add( sin( planePoint.x.mul( 0.22 ).add( time.mul( 0.05 ) ).add( curtain.phase ) ).mul( curtain.bend ) )
-					.add( sin( planePoint.x.mul( 0.8 ).sub( time.mul( 0.07 ) ).add( curtain.phase * 2 ) ).mul( 0.22 ) )
-					.add( valueNoise2D( vec2( planePoint.x.mul( 3.0 ).add( time.mul( 0.03 ) ), curtain.phase + 21 ) ).sub( 0.5 ).mul( 0.12 ) );
-				const across = planePoint.y.sub( curtainLine ).div( curtain.width );
-				const sheet = exp( across.mul( across ).negate() );
+			Loop( { start: int( 0 ), end: steps, type: 'int', condition: '<' }, ( { i } ) => {
 
-				// 竖向光线：只沿帘幕方向（x）变化的高频噪声，每一层用同一个 x，所以在天上拉成竖条；缓慢横向漂移
-				const rayCoordinate = planePoint.x.mul( uniforms.auroraRayScale || 26 ).add( time.mul( auroraConfig.auroraDrift ) ).add( curtain.phase * 10 );
-				const rays = valueNoise2D( vec2( rayCoordinate, curtain.phase ) ).mul( 0.6 ).add( valueNoise2D( vec2( rayCoordinate.mul( 2.7 ), curtain.phase + 5 ) ).mul( 0.4 ) );
-				// 光线之外再有一层很慢的明暗分段：有的段亮、有的段几乎断开
-				const segment = smoothstep( 0.25, 0.75, valueNoise2D( vec2( planePoint.x.mul( 1.1 ).add( time.mul( 0.012 ) ), curtain.phase + 13 ) ) );
-				const rayShape = pow( rays, 2.6 ).mul( 2.2 ).add( 0.06 ).mul( segment.mul( 0.85 ).add( 0.15 ) );
+				// 层高随层号非线性增加：底部采得密（帘幕下缘最亮最细）
+				const layerFraction = pow( i.toFloat().add( jitter ).div( stepCount ), 1.35 );
+				const altitude = float( 1 ).add( layerFraction.mul( 1.6 ) );
+				// 视线和这一层水平面的交点：t = (高度 - 相机高度) / 视线.y，相机高度在这个尺度下当 0
+				const planePoint = direction.xz.mul( altitude.div( viewY ) ).add( cameraOffset );
 
-				// 帘幕下缘高度沿 x 起伏，下缘清晰、往上慢慢淡
-				const bottom = float( 0.03 ).add( valueNoise2D( vec2( planePoint.x.mul( 0.9 ).add( time.mul( 0.02 ) ), curtain.phase + 9 ) ).mul( 0.12 ) );
-				const heightAboveBottom = layerFraction.sub( bottom );
-				const rise = smoothstep( 0.0, 0.03, heightAboveBottom );
-				// 往上慢慢淡；下缘再额外亮一截（真实极光下缘最亮最锐）
-				const decay = exp( max( heightAboveBottom, 0 ).mul( - 2.2 ) ).mul( float( 1 ).add( exp( max( heightAboveBottom, 0 ).mul( - 22 ) ).mul( 1.5 ) ) );
+				for ( const curtain of curtains ) {
 
-				// 按层高着色：底部一窄条品红紫（氮分子），主体绿（氧 557.7nm），顶部淡红（氧 630nm）
-				const purpleWeight = float( 1 ).sub( smoothstep( 0.0, 0.07, heightAboveBottom ) );
-				const redWeight = smoothstep( 0.35, 0.85, heightAboveBottom );
-				const greenWeight = max( float( 1 ).sub( purpleWeight ).sub( redWeight ), 0 );
-				const layerColor = purple.mul( purpleWeight.mul( 0.9 ) ).add( green.mul( greenWeight ) ).add( red.mul( redWeight.mul( 0.5 ) ) );
+					// 帘幕位置：先做一次低频弯曲 x += 0.8·sin(z·0.2 + t·0.05) 形成弧形光带，再叠一层更碎的弯
+					// 再加一层沿 x 的小褶皱，帘幕像布一样有折
+					const curtainLine = float( curtain.z0 )
+						.add( sin( planePoint.x.mul( 0.22 ).add( time.mul( 0.05 ) ).add( curtain.phase ) ).mul( curtain.bend ) )
+						.add( sin( planePoint.x.mul( 0.8 ).sub( time.mul( 0.07 ) ).add( curtain.phase * 2 ) ).mul( 0.22 ) )
+						.add( valueNoise2D( vec2( planePoint.x.mul( 3.0 ).add( time.mul( 0.03 ) ), curtain.phase + 21 ) ).sub( 0.5 ).mul( 0.12 ) );
+					const across = planePoint.y.sub( curtainLine ).div( curtain.width );
+					const sheet = exp( across.mul( across ).negate() );
 
-				// 每条帘幕各自呼吸（5~15 秒周期）
-				const breath = float( 0.75 ).add( sin( time.mul( Math.PI * 2 / auroraConfig.auroraBreathPeriod ).add( curtain.phase ) ).mul( 0.25 ) );
-				const density = sheet.mul( rayShape ).mul( rise ).mul( decay ).mul( curtain.strength ).mul( breath );
-				accumulated.addAssign( layerColor.mul( density ) );
+					const addCurtain = () => {
 
-			}
+						// 竖向光线：只沿帘幕方向（x）变化的高频噪声，每一层用同一个 x，所以在天上拉成竖条；缓慢横向漂移
+						const rayCoordinate = planePoint.x.mul( uniforms.auroraRayScale || 26 ).add( time.mul( auroraConfig.auroraDrift ) ).add( curtain.phase * 10 );
+						const rays = valueNoise2D( vec2( rayCoordinate, curtain.phase ) ).mul( 0.6 ).add( valueNoise2D( vec2( rayCoordinate.mul( 2.7 ), curtain.phase + 5 ) ).mul( 0.4 ) );
+						// 光线之外再有一层很慢的明暗分段：有的段亮、有的段几乎断开
+						const segment = smoothstep( 0.25, 0.75, valueNoise2D( vec2( planePoint.x.mul( 1.1 ).add( time.mul( 0.012 ) ), curtain.phase + 13 ) ) );
+						const rayShape = pow( rays, 2.6 ).mul( 2.2 ).add( 0.06 ).mul( segment.mul( 0.85 ).add( 0.15 ) );
+
+						// 帘幕下缘高度沿 x 起伏，下缘清晰、往上慢慢淡
+						const bottom = float( 0.03 ).add( valueNoise2D( vec2( planePoint.x.mul( 0.9 ).add( time.mul( 0.02 ) ), curtain.phase + 9 ) ).mul( 0.12 ) );
+						const heightAboveBottom = layerFraction.sub( bottom );
+						const rise = smoothstep( 0.0, 0.03, heightAboveBottom );
+						// 往上慢慢淡；下缘再额外亮一截（真实极光下缘最亮最锐）
+						const decay = exp( max( heightAboveBottom, 0 ).mul( - 2.2 ) ).mul( float( 1 ).add( exp( max( heightAboveBottom, 0 ).mul( - 22 ) ).mul( 1.5 ) ) );
+
+						// 按层高着色：底部一窄条品红紫（氮分子），主体绿（氧 557.7nm），顶部淡红（氧 630nm）
+						const purpleWeight = float( 1 ).sub( smoothstep( 0.0, 0.07, heightAboveBottom ) );
+						const redWeight = smoothstep( 0.35, 0.85, heightAboveBottom );
+						const greenWeight = max( float( 1 ).sub( purpleWeight ).sub( redWeight ), 0 );
+						const layerColor = purple.mul( purpleWeight.mul( 0.9 ) ).add( green.mul( greenWeight ) ).add( red.mul( redWeight.mul( 0.5 ) ) );
+
+						// 每条帘幕各自呼吸（5~15 秒周期）
+						const breath = float( 0.75 ).add( sin( time.mul( Math.PI * 2 / auroraConfig.auroraBreathPeriod ).add( curtain.phase ) ).mul( 0.25 ) );
+						const density = sheet.mul( rayShape ).mul( rise ).mul( decay ).mul( curtain.strength ).mul( breath );
+						accumulated.addAssign( layerColor.mul( density ) );
+
+					};
+
+					// 离帘幕中线 2.6 个厚度以外 sheet < 0.001：这一层这条帘幕最多贡献 0.001 × 光线 2.3 × 下缘 2.5 × 6 / 步数，
+					// 看不出来，光线、分段、下缘那几个噪声都不算（性能，perf.scenesB.auroraSheetSkip）
+					if ( sheetSkip ) If( sheet.greaterThan( 1e-3 ), addCurtain );
+					else addCurtain();
+
+				}
+
+			} );
+
+			// 地平线附近淡出，天顶附近也减弱
+			const horizonFade = smoothstep( 0.02, 0.2, direction.y );
+			const zenithFade = float( 1 ).sub( smoothstep( 0.8, 1.0, direction.y ).mul( 0.5 ) );
+			// 6 / 步数：按层数归一化，步数变了亮度不变；6 是让主帘幕亮处落在 HDR 1~3 的经验值
+			const current = accumulated.mul( float( 6 ).div( stepCount ) ).mul( horizonFade ).mul( zenithFade ).mul( uniforms.auroraBrightness );
+
+			// 时间累积（指数滑动平均，alpha ≈ 0.1）：贴图是按方向存的，转头不会拖影。视野外轮到的那一片按隔几帧折算的混合比
+			result.assign( mix( previous, current, everyFrame.select( uniforms.auroraBlend, sliceBlend ) ) );
 
 		} );
 
-		// 地平线附近淡出，天顶附近也减弱
-		const horizonFade = smoothstep( 0.02, 0.2, direction.y );
-		const zenithFade = float( 1 ).sub( smoothstep( 0.8, 1.0, direction.y ).mul( 0.5 ) );
-		// 6 / 步数：按层数归一化，步数变了亮度不变；6 是让主帘幕亮处落在 HDR 1~3 的经验值
-		const current = accumulated.mul( float( 6 ).div( stepCount ) ).mul( horizonFade ).mul( zenithFade ).mul( uniforms.auroraBrightness );
-
-		// 时间累积（指数滑动平均，alpha ≈ 0.1）：贴图是按方向存的，转头不会拖影
-		const previous = previousNode.sample( mapUV ).rgb;
-		return vec4( mix( previous, current, uniforms.auroraBlend ), 1 );
+		return vec4( result, 1 );
 
 	} );
 
@@ -1109,6 +1198,7 @@ export function createAuroraPass( renderer, uniforms, auroraConfig ) {
 
 	let writeIndex = 1;
 	let freshTargets = true;
+	let renderCount = 0;
 
 	return {
 		targets,
@@ -1139,12 +1229,30 @@ export function createAuroraPass( renderer, uniforms, auroraConfig ) {
 			freshTargets = true;
 
 		},
-		render( blend ) {
+		// view：{ direction（镜头前向，单位向量，和半球贴图同一个坐标系）, halfAngle（看得见的锥半角，弧度，已含余量）}；
+		// 不给（全景模式）、刚换尺寸、blend ≥ 1 时整张都算
+		render( blend, view = null ) {
 
 			const readIndex = 1 - writeIndex;
 			previousNode.value = targets[ readIndex ].texture;
+			const fullRefresh = freshTargets || blend >= 1 || ! view;
 			uniforms.auroraBlend.value = freshTargets ? 1 : blend;
 			freshTargets = false;
+			if ( fullRefresh ) {
+
+				viewCosLimit.value = - 2;
+				sliceBlend.value = uniforms.auroraBlend.value;
+
+			} else {
+
+				viewForward.value.copy( view.direction );
+				viewCosLimit.value = view.halfAngle >= Math.PI ? - 2 : Math.cos( view.halfAngle );
+				sliceBlend.value = 1 - Math.pow( 1 - blend, sliceCount );
+
+			}
+
+			sliceIndex.value = renderCount % sliceCount;
+			renderCount ++;
 			const previousTarget = renderer.getRenderTarget();
 			renderer.setRenderTarget( targets[ writeIndex ] );
 			renderer.render( quadScene, quad.camera );
@@ -1478,8 +1586,8 @@ function createBlowingBand( layerHeight, layerIndex ) {
 	// 横向频率高、阈值窄：一缕一缕的细流，而不是大片的光带
 	const flow = vec2( windAlong.mul( 0.6 ).sub( time.mul( auroraConfig.windSpeed * 0.6 ) ), windAcross.mul( 3.5 ) ).add( layerIndex * 17 );
 	// fbm 大多落在 0.35~0.65，阈值要卡在这个范围里才有成条的卷流
-	const streak = smoothstep( 0.52, 0.64, fbm2D( flow, 4 ) );
-	const gust = smoothstep( 0.42, 0.6, fbm2D( fragmentXZ.div( 28 ).sub( vec2( time.mul( 0.08 ), 0 ) ), 2 ) );
+	const streakOf = () => smoothstep( 0.52, 0.64, fbm2D( flow, 4 ) );
+	const gustOf = () => smoothstep( 0.42, 0.6, fbm2D( fragmentXZ.div( 28 ).sub( vec2( time.mul( 0.08 ), 0 ) ), 2 ) );
 	const heightFade = float( 1 ).sub( smoothstep( 0.1, 1.2, float( layerHeight ) ) );
 	const fromCenter = length( fragmentXZ.sub( uniforms.bandCenter ) );
 	// 远处卷流叠在一起就成了大片光带，30 米外就淡掉
@@ -1490,8 +1598,36 @@ function createBlowingBand( layerHeight, layerIndex ) {
 	// 朝月亮看时卷流被照亮（前向散射）
 	const backLight = pow( max( dot( viewDirection, uniforms.moonDirection.negate() ), 0 ), 4 );
 	material.colorNode = uniforms.moonColor.mul( float( 0.2 ).add( backLight.mul( 1.2 ) ) ).add( uniforms.auroraLightColor.mul( 0.5 ) ).add( vec3( 0.06, 0.08, 0.13 ) );
-	material.opacityNode = streak.mul( gust.mul( 0.7 ).add( 0.3 ) ).mul( heightFade ).mul( edgeFade ).mul( nearFade ).mul( 0.32 )
-		.mul( insideRim ).mul( float( 1 ).sub( state.ctx.world.uniforms.locationVeil ) );
+	const veilFade = float( 1 ).sub( state.ctx.world.uniforms.locationVeil );
+	const opacityOf = ( streak ) => streak.mul( gustOf().mul( 0.7 ).add( 0.3 ) ).mul( heightFade ).mul( edgeFade ).mul( nearFade ).mul( 0.32 ).mul( insideRim ).mul( veilFade );
+	if ( state.ctx.config.perf.scenesB.driftSkip ) {
+
+		// 省算（性能，perf.scenesB.driftSkip）：面片 90 米见方，32 米外、镜头 3 米内、崖外乘出来正好是 0（约六成的面积），
+		// 那里两个 fbm 都不算、整个片元丢掉；卷流本身是 0 的地方（阈值以下）也丢掉、不算阵风。
+		// 透明、不写深度：丢掉和画一个 alpha 0 的片元结果一样（颜色 × 0 + 目标 × 1）；乘的顺序和原来一样，留下来的片元逐像素不变
+		material.opacityNode = Fn( () => {
+
+			const opacity = float( 0 ).toVar();
+			If( edgeFade.mul( nearFade ).mul( insideRim ).mul( veilFade ).greaterThan( 0 ), () => {
+
+				const streak = streakOf().toVar();
+				If( streak.greaterThan( 0 ), () => {
+
+					opacity.assign( opacityOf( streak ) );
+
+				} );
+
+			} );
+			Discard( opacity.lessThanEqual( 0 ) );
+			return opacity;
+
+		} )();
+
+	} else {
+
+		material.opacityNode = opacityOf( streakOf() );
+
+	}
 
 	const mesh = new THREE.Mesh( geometry, material );
 	mesh.name = '地吹雪';
@@ -1589,6 +1725,63 @@ function addShadowProxies( scene, light ) {
 
 }
 
+// 月光阴影图按需重画（性能，2026-10-02，perf.scenesB.shadowOnDemand）：原来每帧跟着镜头重画一张 2048 的阴影图。
+// 现在阴影中心按 shadowSnap（4）米吸附，再在光的横、竖两个方向上对齐到阴影图的纹素（中心挪一格时纹素格子不滑，影子边不闪）；
+// 中心换了格、或者月光方向比上次画时转了 0.05° 以上，才 needsUpdate 重画一次（停留期间月亮钉在一个方向，站着不动就一直用同一张）。
+// 灯的位置每帧按"中心 + 方向 × 距离"摆：照明方向每帧都是准的，阴影图的投影矩阵只在重画时更新（ShadowNode.renderShadow）
+const shadowTurnCos = Math.cos( 0.05 * Math.PI / 180 );
+const shadowFocus = new THREE.Vector3();
+const shadowCandidate = new THREE.Vector3();
+const shadowBasis = new THREE.Matrix4();
+const shadowRight = new THREE.Vector3();
+const shadowUp = new THREE.Vector3();
+const shadowBack = new THREE.Vector3();
+const shadowOrigin = new THREE.Vector3();
+
+function followShadow( light, focus, direction, distance, record ) {
+
+	const perf = state.ctx.config.perf.scenesB;
+	const shadow = light.shadow;
+	if ( ! perf.shadowOnDemand ) {
+
+		// 原来的做法：阴影相机每帧正对着人，每帧重画
+		shadow.autoUpdate = true;
+		light.target.position.copy( focus );
+		light.position.copy( focus ).addScaledVector( direction, distance );
+		light.target.updateMatrixWorld();
+		return;
+
+	}
+
+	const shadowSnap = perf.shadowSnap;
+	shadow.autoUpdate = false;
+	const shadowCamera = shadow.camera;
+	shadowCandidate.set( Math.round( focus.x / shadowSnap ) * shadowSnap, Math.round( focus.y / shadowSnap ) * shadowSnap, Math.round( focus.z / shadowSnap ) * shadowSnap );
+	// 阴影相机的横、竖、后三个轴：和 three 给平行光阴影相机 lookAt 的结果一样（相机在中心 + 方向 × 距离，朝中心看，up 是阴影相机的 up）
+	shadowBasis.lookAt( direction, shadowOrigin, shadowCamera.up ).extractBasis( shadowRight, shadowUp, shadowBack );
+	const texelX = ( shadowCamera.right - shadowCamera.left ) / Math.max( 1, shadow.mapSize.width );
+	const texelY = ( shadowCamera.top - shadowCamera.bottom ) / Math.max( 1, shadow.mapSize.height );
+	const alongRight = Math.round( shadowCandidate.dot( shadowRight ) / texelX ) * texelX;
+	const alongUp = Math.round( shadowCandidate.dot( shadowUp ) / texelY ) * texelY;
+	const alongBack = shadowCandidate.dot( shadowBack );
+	shadowCandidate.copy( shadowRight ).multiplyScalar( alongRight ).addScaledVector( shadowUp, alongUp ).addScaledVector( shadowBack, alongBack );
+
+	const moved = ! ( shadowCandidate.distanceToSquared( record.shadowCenter ) < 1e-6 );
+	const turned = direction.dot( record.shadowLightDirection ) < shadowTurnCos;
+	if ( moved || turned ) {
+
+		record.shadowCenter.copy( shadowCandidate );
+		record.shadowLightDirection.copy( direction );
+		shadow.needsUpdate = true;
+
+	}
+
+	light.target.position.copy( record.shadowCenter );
+	light.position.copy( record.shadowCenter ).addScaledVector( direction, distance );
+	light.target.updateMatrixWorld();
+
+}
+
 // ===================== 生命周期 =====================
 
 // 月亮按世界的时刻走（本地方向）；后台加载时世界是别的时刻，按自己开始的时刻（03:40）先摆好
@@ -1641,6 +1834,8 @@ async function buildScene( ctx ) {
 	state.ctx = ctx;
 	state.disposables = [];
 	state.readbackPending = false;
+	state.auroraSkipped = false;
+	state.shadowCenter.set( NaN, NaN, NaN );
 	const auroraConfig = ctx.config.aurora;
 	const tier = tierOf( ctx );
 	state.currentTier = tier;
@@ -1732,7 +1927,8 @@ async function buildScene( ctx ) {
 	scene.background = new THREE.Color( auroraConfig.skyHorizon );
 
 	// 极光半球贴图要在天空材质之前建（天空要采样它）
-	state.auroraPass = createAuroraPass( ctx.renderer, uniforms, auroraConfig );
+	const perf = ctx.config.perf.scenesB;
+	state.auroraPass = createAuroraPass( ctx.renderer, uniforms, auroraConfig, { sheetSkip: perf.auroraSheetSkip, slices: perf.auroraSlices } );
 	applyQualityResolution( params );
 	await markStep( '极光' );
 
@@ -1745,6 +1941,9 @@ async function buildScene( ctx ) {
 	terrain.castShadow = true;
 	// 地形只用背光面写阴影深度：雪丘照样能挡光，受光面不会自己挡自己出条纹
 	snowMaterial.shadowSide = THREE.BackSide;
+	// 阴影图只有镜头周围 ±70 米：远处的长影子会在阴影相机的边上被一条直线截断（飞到雪原时雪面上一块灰色平行四边形，2026-10-02 自查）。
+	// 50~66 米之间把阴影淡掉（月亮低，影子往月亮反方向拉得很长，取横向那一半 70 米以内）
+	snowMaterial.receivedShadowNode = Fn( ( [ shadow ] ) => mix( float( 1 ), shadow, float( 1 ).sub( smoothstep( 50, 66, length( positionWorld.xz.sub( cameraPosition.xz ) ) ) ) ) );
 	scene.add( terrain );
 	state.disposables.push( terrainGeometry, snowMaterial );
 	await markStep( '雪材质' );
@@ -1927,6 +2126,8 @@ export function enter() {
 	if ( ! state.ready ) throw new Error( '雪原场景：还没 init 就调了 enter' );
 
 	const ctx = state.ctx;
+	// 冰槽的冰凌、冰块是贴着远景的槽沿摆的，雪原自己的地形在那里差一点，看过去浮着；雪原显出来时藏起来（在槽里换场景的那一刻）
+	ctx.backdrop.setNarrowsHidden( 'trough', true );
 	const start = playerStart();
 	const size = state.terrainSize;
 	const auroraConfig = ctx.config.aurora;
@@ -1993,9 +2194,8 @@ export function update( dt, time ) {
 	state.skyDome.position.copy( camera.position );
 	state.skyDome.scale.setScalar( camera.far * 0.87 );
 	const moonDirection = uniforms.moonDirection.value;
-	state.moonLight.target.position.set( camera.position.x, camera.position.y - 1.6, camera.position.z );
-	state.moonLight.position.copy( state.moonLight.target.position ).addScaledVector( moonDirection, 200 );
-	state.moonLight.target.updateMatrixWorld();
+	shadowFocus.set( camera.position.x, camera.position.y - 1.6, camera.position.z );
+	followShadow( state.moonLight, shadowFocus, moonDirection, 200, state );
 
 	// 地吹雪的面片中心按 2 米网格吸附
 	uniforms.bandCenter.value.set( Math.round( camera.position.x / 2 ) * 2, Math.round( camera.position.z / 2 ) * 2 );
@@ -2006,12 +2206,31 @@ export function update( dt, time ) {
 	if ( lateral < 20 ) state.revealDistance = Math.max( state.revealDistance, along + auroraConfig.footprintRevealLead );
 	uniforms.revealDistance.value = state.revealDistance;
 
-	// ---------- 极光贴图：低档每 2 帧更新一次 ----------
+	// ---------- 极光贴图：低档每 2 帧更新一次；「极光」开关关了就不画（重新打开的那一帧整张重算，不从旧图慢慢淡过来）----------
 	const updateEvery = tier === 'lo' ? 2 : 1;
-	if ( state.frameIndex % updateEvery === 0 ) {
+	if ( uniforms.auroraToggle.value < 0.5 ) {
 
-		const blend = state.frameIndex < 4 ? 1 : 0.1;
-		state.auroraPass.render( blend );
+		state.auroraSkipped = true;
+
+	} else if ( state.frameIndex % updateEvery === 0 ) {
+
+		const blend = state.frameIndex < 4 || state.auroraSkipped ? 1 : 0.1;
+		state.auroraSkipped = false;
+		// 看得见的锥：半对角视场 + auroraViewMargin 弧度余量（这里拿的是上一帧的朝向，镜头这一帧还会再转一点；拖得再快，
+		// 露出来的视野外纹素也最多是"片数"帧以前算的，极光本身动得很慢）。perf.scenesB.auroraViewOnly 关掉时整张每帧都算
+		const perf = ctx.config.perf.scenesB;
+		if ( perf.auroraViewOnly ) {
+
+			camera.getWorldDirection( auroraView.direction );
+			const halfHeight = Math.tan( THREE.MathUtils.degToRad( camera.fov ) / 2 ) / ( camera.zoom || 1 );
+			auroraView.halfAngle = Math.atan( halfHeight * Math.hypot( 1, camera.aspect ) ) + perf.auroraViewMargin;
+			state.auroraPass.render( blend, auroraView );
+
+		} else {
+
+			state.auroraPass.render( blend );
+
+		}
 
 	}
 
@@ -2036,7 +2255,9 @@ function applyWorldSettings() {
 	uniforms.skyOpacity.value = 1 - blend;
 	ctx.backdrop.setSkyVisible( blend > 0.001 );
 	const halfSize = state.terrainSize / 2;
-	ctx.backdrop.setContentHole( { minX: - halfSize + 13, maxX: halfSize - 13, minZ: state.terrainCenterZ - halfSize + 80, maxZ: - 13, depth: auroraConfig.holeDepth } );
+	// 原点往南到崖边那条看台不挖洞（挖了崖面也没了），远景在那里往下压 2 米，雪原的雪盖在上面；崖顶跟着低 2 米，雪原的雪边伸出去像一道雪檐
+	ctx.backdrop.setContentHole( { minX: - halfSize + 13, maxX: halfSize - 13, minZ: state.terrainCenterZ - halfSize + 80, maxZ: - 13, depth: auroraConfig.holeDepth,
+		sink: { minX: - halfSize + 13, maxX: halfSize - 13, minZ: - 25, maxZ: 90, depth: 2, fade: 10 } } );
 	ctx.backdrop.setSurfaceGain( 1 + ( auroraConfig.backdropGain - 1 ) * ( 1 - veil ) );
 	state.fogColor.copy( uniforms.auroraLightColor.value ).multiplyScalar( 0.15 ).add( state.fogScatter.set( auroraConfig.fogColor ) );
 	state.fogScatter.set( auroraConfig.fogScatterColor );
@@ -2073,6 +2294,7 @@ function applyAuroraLight() {
 export function exit() {
 
 	if ( ! state.ctx ) return;
+	state.ctx.backdrop.setNarrowsHidden( 'trough', false );
 	state.ctx.debug.removeSceneToggles( key );
 	// 场景释放后 heightAt 就没数据了，镜头不能再拿它贴地
 	state.ctx.director.clearWalk();

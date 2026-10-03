@@ -21,6 +21,123 @@ function smoothStep01( u ) {
 
 }
 
+// 一个网格在不在相机的视锥里。
+// 地点的倒影用它：转身背对水面时水面不在画面里，这一帧不画倒影（原来照画，哥特背对湖时倒影里还把整片地形和树画一遍）。
+// 转回来那一帧水面一进视锥就先画倒影再画主画面，不会露出旧的倒影。
+// 整块包围盒太粗（哥特的湖是转过的椭圆，包围盒把站在岸上的镜头也框进去，怎么转都算看得见）；按三角形分块也粗
+// （湖外圈的三角形二十来米宽，一半在水里一半伸进岸下）。所以在三角形上每隔 spacing 米取一个点，
+// 传了 groundHeight（地点坐标的地面高度）时只留水面露在地面以上的点，再把点按 xz 分成 viewChunkCells × viewChunkCells 块，
+// 每块是块里点的包围盒，任何一块进视锥才算看得见。点在地点 init 时取好（prepareMeshView），不放在第一帧里
+const viewChunkCells = 16;
+const viewFrustum = new THREE.Frustum();
+const viewProjection = new THREE.Matrix4();
+const viewBox = new THREE.Box3();
+const cornerA = new THREE.Vector3();
+const cornerB = new THREE.Vector3();
+const cornerC = new THREE.Vector3();
+const samplePoint = new THREE.Vector3();
+
+export function prepareMeshView( mesh, { groundHeight = null, samples = 40000 } = {} ) {
+
+	const geometry = mesh && mesh.geometry;
+	if ( ! geometry || ! geometry.attributes.position ) return [];
+	if ( geometry.userData.viewChunks ) return geometry.userData.viewChunks;
+	const position = geometry.attributes.position;
+	const index = geometry.index;
+	const triangleCount = Math.floor( ( index ? index.count : position.count ) / 3 );
+	const corner = ( i, k, target ) => target.fromBufferAttribute( position, index ? index.getX( i * 3 + k ) : i * 3 + k );
+	// 取点间距：按总面积摊到约 samples 个点，最细 1.5 米（落日的海面好几平方公里，间距会放大到十几米）
+	let area = 0;
+	for ( let i = 0; i < triangleCount; i ++ ) {
+
+		corner( i, 0, cornerA );
+		corner( i, 1, cornerB );
+		corner( i, 2, cornerC );
+		area += cornerB.sub( cornerA ).cross( cornerC.sub( cornerA ) ).length() / 2;
+
+	}
+
+	const spacing = Math.max( 1.5, Math.sqrt( area / samples ) );
+	const points = [];
+	for ( let i = 0; i < triangleCount; i ++ ) {
+
+		corner( i, 0, cornerA );
+		corner( i, 1, cornerB );
+		corner( i, 2, cornerC );
+		const longest = Math.max( cornerA.distanceTo( cornerB ), cornerB.distanceTo( cornerC ), cornerC.distanceTo( cornerA ) );
+		const steps = Math.max( 1, Math.ceil( longest / spacing ) );
+		for ( let u = 0; u <= steps; u ++ ) {
+
+			for ( let v = 0; u + v <= steps; v ++ ) {
+
+				const weightB = u / steps;
+				const weightC = v / steps;
+				samplePoint.copy( cornerA ).multiplyScalar( 1 - weightB - weightC ).addScaledVector( cornerB, weightB ).addScaledVector( cornerC, weightC );
+				// 埋在地面以下的水面看不见（湖面网格伸进岸下）
+				if ( groundHeight && groundHeight( samplePoint.x, samplePoint.z ) > samplePoint.y + 0.3 ) continue;
+				points.push( samplePoint.x, samplePoint.y, samplePoint.z );
+
+			}
+
+		}
+
+	}
+
+	const boxes = new Map();
+	if ( points.length > 0 ) {
+
+		let minX = Infinity;
+		let maxX = - Infinity;
+		let minZ = Infinity;
+		let maxZ = - Infinity;
+		for ( let i = 0; i < points.length; i += 3 ) {
+
+			minX = Math.min( minX, points[ i ] );
+			maxX = Math.max( maxX, points[ i ] );
+			minZ = Math.min( minZ, points[ i + 2 ] );
+			maxZ = Math.max( maxZ, points[ i + 2 ] );
+
+		}
+
+		const sizeX = Math.max( maxX - minX, 1e-3 );
+		const sizeZ = Math.max( maxZ - minZ, 1e-3 );
+		for ( let i = 0; i < points.length; i += 3 ) {
+
+			const cellX = Math.min( viewChunkCells - 1, Math.floor( ( points[ i ] - minX ) / sizeX * viewChunkCells ) );
+			const cellZ = Math.min( viewChunkCells - 1, Math.floor( ( points[ i + 2 ] - minZ ) / sizeZ * viewChunkCells ) );
+			const cell = cellX * viewChunkCells + cellZ;
+			let box = boxes.get( cell );
+			if ( ! box ) boxes.set( cell, box = new THREE.Box3() );
+			box.expandByPoint( samplePoint.set( points[ i ], points[ i + 1 ], points[ i + 2 ] ) );
+
+		}
+
+	}
+
+	// 块之间留了半个取点间距的缝，往外补上
+	geometry.userData.viewChunks = [ ...boxes.values() ].map( ( box ) => box.expandByScalar( spacing * 0.5 ) );
+	return geometry.userData.viewChunks;
+
+}
+
+export function isMeshInView( camera, mesh, { margin = 0.5, groundHeight = null } = {} ) {
+
+	const geometry = mesh && mesh.geometry;
+	if ( ! geometry || ! geometry.attributes.position ) return true;
+	const chunks = prepareMeshView( mesh, { groundHeight } );
+	// 一点露出来的水面都没有（整片埋在地下）：倒影画了也看不见，但为了稳妥照画
+	if ( chunks.length === 0 ) return true;
+	mesh.updateMatrixWorld();
+	camera.updateMatrixWorld();
+	viewProjection.multiplyMatrices( camera.projectionMatrix, camera.matrixWorldInverse );
+	viewFrustum.setFromProjectionMatrix( viewProjection, camera.coordinateSystem, camera.reversedDepth );
+	// 每块往外放 margin 米：水面在顶点里上下起伏，包围盒是平的（湖、池、溪起伏很小，默认 0.5 米；海浪大，落日传 3 米）。
+	// 别放太大：哥特的出生点就站在水边，放 5 米会把镜头自己框进去，怎么转都算看得见
+	for ( const chunk of chunks ) if ( viewFrustum.intersectsBox( viewBox.copy( chunk ).applyMatrix4( mesh.matrixWorld ).expandByScalar( margin ) ) ) return true;
+	return false;
+
+}
+
 export function createDirector( ctx ) {
 
 	const camera = ctx.camera;
@@ -28,6 +145,8 @@ export function createDirector( ctx ) {
 	const domElement = ctx.renderer.domElement;
 	const flightConfig = ctx.config.world.flight;
 	const flightDrag = { yawMax: flightConfig.dragYawMax, pitchMax: flightConfig.dragPitchMax, returnDamping: flightConfig.dragReturnDamping };
+	// 到达窄处前最后几秒（规格书 5.3 阶段 12）拖动转头收紧：时间线给 [偏航, 俯仰] 上限（度），null 恢复默认
+	let flightDragLimit = null;
 
 	// 路线关键帧（预处理成 Vector3 / Quaternion）
 	let keyframes = [];
@@ -89,6 +208,9 @@ export function createDirector( ctx ) {
 		bounds: null,         // { minX, maxX, minZ, maxZ }
 		obstacles: [],        // [ { x, z, radius } ]，走不进去的圆（岩石、树干）
 		canWalk: null,        // ( x, z ) => 能不能站，可选（海边不能走进水里）
+		fov: null,            // 这个地点步行时的视场（星月夜按原画构图用 56°），null 用默认
+		speedScale: null,     // ( x, z ) => 这里的步速倍数，可选
+		snap: null,           // ( x, z ) => 走出能站的地方时挪回去的点 [x, z] 或 null，可选（哥特的石桥：顺着弯的桥面走，不卡在胸墙上）
 		groundErrorReported: false,
 		canWalkErrorReported: false,
 	};
@@ -181,7 +303,7 @@ export function createDirector( ctx ) {
 
 	}
 
-	// 步行漫游：options = { position:[x,y,z], lookAt:[x,y,z], groundHeight:( x, z ) => y, bounds?, obstacles?, canWalk? }
+	// 步行漫游：options = { position:[x,y,z], lookAt:[x,y,z], groundHeight:( x, z ) => y, bounds?, obstacles?, canWalk?, fov?（度，默认 config.camera.fov）, speedScale?( x, z ) }
 	function setWalk( options ) {
 
 		if ( ! options || ! Array.isArray( options.position ) || ! Array.isArray( options.lookAt ) || typeof options.groundHeight !== 'function' ) {
@@ -196,6 +318,9 @@ export function createDirector( ctx ) {
 		walkState.bounds = options.bounds || null;
 		walkState.obstacles = Array.isArray( options.obstacles ) ? options.obstacles : [];
 		walkState.canWalk = typeof options.canWalk === 'function' ? options.canWalk : null;
+		walkState.fov = Number.isFinite( options.fov ) ? options.fov : null;
+		walkState.speedScale = typeof options.speedScale === 'function' ? options.speedScale : null;
+		walkState.snap = typeof options.snap === 'function' ? options.snap : null;
 		walkState.groundErrorReported = false;
 		walkState.canWalkErrorReported = false;
 		keyframes = [];
@@ -224,7 +349,7 @@ export function createDirector( ctx ) {
 		walkEuler.set( walkState.pitch, walkState.yaw, 0, 'YXZ' );
 		camera.quaternion.setFromEuler( walkEuler );
 		camera.position.copy( walkState.position );
-		applyFov( cameraConfig.fov );
+		applyFov( walkState.fov || cameraConfig.fov );
 
 	}
 
@@ -252,7 +377,9 @@ export function createDirector( ctx ) {
 
 	function updateWalk( dt ) {
 
-		const speed = cameraConfig.walkSpeed * ( pressedKeys.has( 'shift' ) ? cameraConfig.runMultiplier : 1 );
+		// 有的地方走得快一点（哥特的石桥长，speedScale 给倍数）
+		const placeScale = walkState.speedScale ? walkState.speedScale( walkState.position.x, walkState.position.z ) : 1;
+		const speed = cameraConfig.walkSpeed * ( pressedKeys.has( 'shift' ) ? cameraConfig.runMultiplier : 1 ) * ( Number.isFinite( placeScale ) ? placeScale : 1 );
 
 		walkForward.set( - Math.sin( walkState.yaw ), 0, - Math.cos( walkState.yaw ) );
 		walkRight.set( Math.cos( walkState.yaw ), 0, - Math.sin( walkState.yaw ) );
@@ -295,7 +422,13 @@ export function createDirector( ctx ) {
 		}
 
 		// 走到不能站的地方（水里）：先试只沿 x 或只沿 z 走（贴着岸边滑），都不行就停在原地
-		if ( walkState.canWalk && ! safeCanWalk( walkState.position.x, walkState.position.z ) ) {
+		const snapped = walkState.canWalk && walkState.snap && ! safeCanWalk( walkState.position.x, walkState.position.z ) ? walkState.snap( walkState.position.x, walkState.position.z ) : null;
+		if ( snapped && safeCanWalk( snapped[ 0 ], snapped[ 1 ] ) ) {
+
+			walkState.position.x = snapped[ 0 ];
+			walkState.position.z = snapped[ 1 ];
+
+		} else if ( walkState.canWalk && ! safeCanWalk( walkState.position.x, walkState.position.z ) ) {
 
 			if ( safeCanWalk( walkState.position.x, previousZ ) ) {
 
@@ -542,8 +675,12 @@ export function createDirector( ctx ) {
 
 		const pressingMove = pressedKeys.has( 'w' ) || pressedKeys.has( 'a' ) || pressedKeys.has( 's' ) || pressedKeys.has( 'd' );
 		const stillWalking = walkState.enabled && Math.hypot( walkState.velocity.x, walkState.velocity.z ) > 0.05;
-		if ( pressingMove || dragging || stillWalking ) activity.idleSeconds = 0;
-		else activity.idleSeconds += dt;
+		if ( pressingMove || dragging || stillWalking ) {
+
+			activity.idleSeconds = 0;
+			activity.interacted = true;
+
+		} else activity.idleSeconds += dt;
 
 	}
 
@@ -561,6 +698,17 @@ export function createDirector( ctx ) {
 		if ( externalState.active ) {
 
 			returnDragOffsets( dt, flightDrag.returnDamping );
+			// 限制收紧时，已经拖出去的部分在半秒左右里拉回限制以内（不跳）
+			if ( flightDragLimit ) {
+
+				const pull = 1 - Math.exp( - 5 * dt );
+				const clampedYaw = Math.max( - flightDragLimit[ 0 ], Math.min( flightDragLimit[ 0 ], yawOffset ) );
+				const clampedPitch = Math.max( - flightDragLimit[ 1 ], Math.min( flightDragLimit[ 1 ], pitchOffset ) );
+				yawOffset += ( clampedYaw - yawOffset ) * pull;
+				pitchOffset += ( clampedPitch - pitchOffset ) * pull;
+
+			}
+
 			writeWithDrag( externalState.position, externalState.quaternion, externalState.fov );
 			applySway( dt, 0, 'float' );
 			return;
@@ -643,8 +791,8 @@ export function createDirector( ctx ) {
 
 		// 飞行时最多 ±30°（规格书 5.3），固定机位（星月夜）按 config.camera 的 ±60° / ±25°，全景模式按 dragOptions（转一整圈）
 		const options = dragOptions && ! externalState.active ? dragOptions : null;
-		const yawMax = externalState.active ? flightDrag.yawMax : ( options ? options.yawMax : cameraConfig.dragYawMax );
-		const pitchMax = externalState.active ? flightDrag.pitchMax : ( options ? options.pitchMax : cameraConfig.dragPitchMax );
+		const yawMax = externalState.active ? ( flightDragLimit ? flightDragLimit[ 0 ] : flightDrag.yawMax ) : ( options ? options.yawMax : cameraConfig.dragYawMax );
+		const pitchMax = externalState.active ? ( flightDragLimit ? flightDragLimit[ 1 ] : flightDrag.pitchMax ) : ( options ? options.pitchMax : cameraConfig.dragPitchMax );
 		lastDragTime = performance.now();
 		yawOffset -= deltaX * cameraConfig.dragSensitivity;
 		pitchOffset -= deltaY * cameraConfig.dragSensitivity;
@@ -820,11 +968,23 @@ export function createDirector( ctx ) {
 		},
 		setExternalPose,
 		clearExternal,
+		setFlightDragLimit: ( limit ) => {
+
+			flightDragLimit = Array.isArray( limit ) ? limit : null;
+
+		},
 		isExternal: () => externalState.active,
 		getBasePose,
 		// 她多久没动了（秒）：预加载、起飞前等她停下用
 		getIdleSeconds: () => activity.idleSeconds,
 		isMoving: () => activity.idleSeconds === 0,
+		// 换地点时清零；这个地点里她拖过、走过没有（小提示用）
+		hasInteracted: () => Boolean( activity.interacted ),
+		resetInteracted: () => {
+
+			activity.interacted = false;
+
+		},
 		// 时间线的连续时钟（换地点不归零），晃动按它走；传 null 回到按场景时间
 		setSwayClock: ( time ) => {
 

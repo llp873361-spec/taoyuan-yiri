@@ -1,0 +1,268 @@
+{
+	"version": 1,
+	"note": "由 scripts/opt.mjs 生成，不要手改。files 是内联进 HTML 的数据块（id → data-textures-<id>）；items 是每组贴图的 diff（sRGB）、nor（线性，OpenGL 朝向）、arm（线性，R=AO G=粗糙度 B=金属度）",
+	"files": [
+		{
+			"id": "aerial_grass_rock-diff",
+			"file": "aerial_grass_rock-diff.webp",
+			"mime": "image/webp",
+			"bytes": 298392
+		},
+		{
+			"id": "aerial_grass_rock-nor",
+			"file": "aerial_grass_rock-nor.webp",
+			"mime": "image/webp",
+			"bytes": 510336
+		},
+		{
+			"id": "aerial_grass_rock-arm",
+			"file": "aerial_grass_rock-arm.webp",
+			"mime": "image/webp",
+			"bytes": 321290
+		},
+		{
+			"id": "forrest_ground_01-diff",
+			"file": "forrest_ground_01-diff.webp",
+			"mime": "image/webp",
+			"bytes": 413958
+		},
+		{
+			"id": "forrest_ground_01-nor",
+			"file": "forrest_ground_01-nor.webp",
+			"mime": "image/webp",
+			"bytes": 742796
+		},
+		{
+			"id": "forrest_ground_01-arm",
+			"file": "forrest_ground_01-arm.webp",
+			"mime": "image/webp",
+			"bytes": 411550
+		},
+		{
+			"id": "rocky_terrain_02-diff",
+			"file": "rocky_terrain_02-diff.webp",
+			"mime": "image/webp",
+			"bytes": 199492
+		},
+		{
+			"id": "rocky_terrain_02-nor",
+			"file": "rocky_terrain_02-nor.webp",
+			"mime": "image/webp",
+			"bytes": 416750
+		},
+		{
+			"id": "rocky_terrain_02-arm",
+			"file": "rocky_terrain_02-arm.webp",
+			"mime": "image/webp",
+			"bytes": 79198
+		},
+		{
+			"id": "coast_sand_01-diff",
+			"file": "coast_sand_01-diff.webp",
+			"mime": "image/webp",
+			"bytes": 308484
+		},
+		{
+			"id": "coast_sand_01-nor",
+			"file": "coast_sand_01-nor.webp",
+			"mime": "image/webp",
+			"bytes": 525958
+		},
+		{
+			"id": "coast_sand_01-arm",
+			"file": "coast_sand_01-arm.webp",
+			"mime": "image/webp",
+			"bytes": 129996
+		},
+		{
+			"id": "bark_willow_02-diff",
+			"file": "bark_willow_02-diff.webp",
+			"mime": "image/webp",
+			"bytes": 312964
+		},
+		{
+			"id": "bark_willow_02-nor",
+			"file": "bark_willow_02-nor.webp",
+			"mime": "image/webp",
+			"bytes": 663502
+		},
+		{
+			"id": "bark_willow_02-arm",
+			"file": "bark_willow_02-arm.webp",
+			"mime": "image/webp",
+			"bytes": 303700
+		}
+	],
+	"items": [
+		{
+			"id": "aerial_grass_rock",
+			"recipe": "aerial_grass_rock",
+			"credit": "polyhaven/aerial_grass_rock",
+			"source": "polyhaven/aerial_grass_rock",
+			"size": 1024,
+			"maps": {
+				"diff": "aerial_grass_rock-diff",
+				"nor": "aerial_grass_rock-nor",
+				"arm": "aerial_grass_rock-arm"
+			},
+			"colorSpaces": {
+				"diff": "srgb",
+				"nor": "linear",
+				"arm": "linear"
+			},
+			"files": [
+				{
+					"id": "aerial_grass_rock-diff",
+					"file": "aerial_grass_rock-diff.webp",
+					"bytes": 298392
+				},
+				{
+					"id": "aerial_grass_rock-nor",
+					"file": "aerial_grass_rock-nor.webp",
+					"bytes": 510336
+				},
+				{
+					"id": "aerial_grass_rock-arm",
+					"file": "aerial_grass_rock-arm.webp",
+					"bytes": 321290
+				}
+			]
+		},
+		{
+			"id": "forrest_ground_01",
+			"recipe": "forrest_ground_01",
+			"credit": "polyhaven/forrest_ground_01",
+			"source": "polyhaven/forrest_ground_01",
+			"size": 1024,
+			"maps": {
+				"diff": "forrest_ground_01-diff",
+				"nor": "forrest_ground_01-nor",
+				"arm": "forrest_ground_01-arm"
+			},
+			"colorSpaces": {
+				"diff": "srgb",
+				"nor": "linear",
+				"arm": "linear"
+			},
+			"files": [
+				{
+					"id": "forrest_ground_01-diff",
+					"file": "forrest_ground_01-diff.webp",
+					"bytes": 413958
+				},
+				{
+					"id": "forrest_ground_01-nor",
+					"file": "forrest_ground_01-nor.webp",
+					"bytes": 742796
+				},
+				{
+					"id": "forrest_ground_01-arm",
+					"file": "forrest_ground_01-arm.webp",
+					"bytes": 411550
+				}
+			]
+		},
+		{
+			"id": "rocky_terrain_02",
+			"recipe": "rocky_terrain_02",
+			"credit": "polyhaven/rocky_terrain_02",
+			"source": "polyhaven/rocky_terrain_02",
+			"size": 1024,
+			"maps": {
+				"diff": "rocky_terrain_02-diff",
+				"nor": "rocky_terrain_02-nor",
+				"arm": "rocky_terrain_02-arm"
+			},
+			"colorSpaces": {
+				"diff": "srgb",
+				"nor": "linear",
+				"arm": "linear"
+			},
+			"files": [
+				{
+					"id": "rocky_terrain_02-diff",
+					"file": "rocky_terrain_02-diff.webp",
+					"bytes": 199492
+				},
+				{
+					"id": "rocky_terrain_02-nor",
+					"file": "rocky_terrain_02-nor.webp",
+					"bytes": 416750
+				},
+				{
+					"id": "rocky_terrain_02-arm",
+					"file": "rocky_terrain_02-arm.webp",
+					"bytes": 79198
+				}
+			]
+		},
+		{
+			"id": "coast_sand_01",
+			"recipe": "coast_sand_01",
+			"credit": "polyhaven/coast_sand_01",
+			"source": "polyhaven/coast_sand_01",
+			"size": 1024,
+			"maps": {
+				"diff": "coast_sand_01-diff",
+				"nor": "coast_sand_01-nor",
+				"arm": "coast_sand_01-arm"
+			},
+			"colorSpaces": {
+				"diff": "srgb",
+				"nor": "linear",
+				"arm": "linear"
+			},
+			"files": [
+				{
+					"id": "coast_sand_01-diff",
+					"file": "coast_sand_01-diff.webp",
+					"bytes": 308484
+				},
+				{
+					"id": "coast_sand_01-nor",
+					"file": "coast_sand_01-nor.webp",
+					"bytes": 525958
+				},
+				{
+					"id": "coast_sand_01-arm",
+					"file": "coast_sand_01-arm.webp",
+					"bytes": 129996
+				}
+			]
+		},
+		{
+			"id": "bark_willow_02",
+			"recipe": "bark_willow_02",
+			"credit": "polyhaven/bark_willow_02",
+			"source": "polyhaven/bark_willow_02",
+			"size": 1024,
+			"maps": {
+				"diff": "bark_willow_02-diff",
+				"nor": "bark_willow_02-nor",
+				"arm": "bark_willow_02-arm"
+			},
+			"colorSpaces": {
+				"diff": "srgb",
+				"nor": "linear",
+				"arm": "linear"
+			},
+			"files": [
+				{
+					"id": "bark_willow_02-diff",
+					"file": "bark_willow_02-diff.webp",
+					"bytes": 312964
+				},
+				{
+					"id": "bark_willow_02-nor",
+					"file": "bark_willow_02-nor.webp",
+					"bytes": 663502
+				},
+				{
+					"id": "bark_willow_02-arm",
+					"file": "bark_willow_02-arm.webp",
+					"bytes": 303700
+				}
+			]
+		}
+	]
+}

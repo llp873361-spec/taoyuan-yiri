@@ -7,6 +7,8 @@
 // 替身显隐都在这一刻换，看不出来。同一个 ctx.camera 贯穿全程，每帧由这里把世界位姿换到当前场景的坐标。
 // 编译：下一个地点在停留期间（8 秒后、她没在动时，最迟停留一半）后台 init，再按主场景真正画的上下文异步预编译，
 // 最后在小目标上热身画一帧（阴影、反射）。飞行途中不启动、不推进任何编译；没准备好就继续停留。
+// 阶段 12：引路（花瓣、光点，tsl/guide.js）每帧按阶段写路径和队形；有窄处（leg.frame）的航段不再在到达时起雾，
+// 而是在窄处里面换场景：窄处暗、曝光抬高，出口过曝，曝光约 1.4 秒落回（"豁然开朗"）。
 
 import * as THREE from 'three/webgpu';
 import { createFlight } from './flight.js';
@@ -41,6 +43,7 @@ export function createTimeline( ctx, sceneModules, panoramaModules = [] ) {
 	const timelineConfig = config.timeline;
 	const flightConfig = config.world.flight;
 	const veilConfig = flightConfig.veil;
+	const guideConfig = config.guide;
 
 	if ( ! world || ! backdrop ) throw new Error( '时间线：ctx.world 和 ctx.backdrop 要先建好' );
 	if ( ! Array.isArray( sceneModules ) || sceneModules.length !== config.scenes.length ) {
@@ -77,6 +80,7 @@ export function createTimeline( ctx, sceneModules, panoramaModules = [] ) {
 		loadWaitWarned: false,
 		flight: null,
 		jump: null,
+		storm: null,        // "再走一遍"先起的花瓣风暴 { time }
 	};
 
 	const endCallbacks = [];
@@ -382,7 +386,9 @@ export function createTimeline( ctx, sceneModules, panoramaModules = [] ) {
 		if ( ! entry.inited ) throw new Error( `时间线：场景「${ entry.config.name }」还没 init 就要进入` );
 
 		ctx.director.clearExternal();
+		ctx.director.setFlightDragLimit( null );
 		attachBackdrop( entry.scene, entry.key, ! entry.module.isPanorama );
+		if ( backdropBuilt() ) for ( const proxyKey of backdrop.getProxyKeys() ) backdrop.setProxyWindows( proxyKey, 1 );
 		ctx.pipeline.setGrading( entry.config.grading );
 		ctx.pipeline.setCanvasReveal( entry.config.arrival === 'canvas' ? 1 : 0 );
 		// 明暗适应：进洞交接时保持（花园出洞时自己落回 1），别的进场方式都从 1 开始
@@ -431,6 +437,8 @@ export function createTimeline( ctx, sceneModules, panoramaModules = [] ) {
 	async function prepareWorld() {
 
 		const started = performance.now();
+		// 烘焙的地形（main.js 启动时就在后台解压）：地点、飞行、远景都按它取高度，先等它挂上
+		ctx.terrainBake = await ctx.terrainBakePromise;
 		if ( entries.every( ( entry ) => wantsPanorama( entry ) ) ) {
 
 			// pano 档：每个地点都有烘焙好的全景，飞行是视频，常驻远景用不上（软件渲染下建它要十几秒），不建
@@ -613,8 +621,11 @@ export function createTimeline( ctx, sceneModules, panoramaModules = [] ) {
 
 		state.overtime += dt;
 		const target = entries[ next ];
-		// 档位等着在起飞时变（降到 pano、插上电以后升回去）：远景没建就不能离开 pano
-		if ( ctx.quality && ctx.quality.pendingTier !== null && ( ctx.quality.pendingTier === 'pano' || backdropBuilt() ) ) ctx.quality.onDeparture();
+		// 档位等着在起飞时变（降到 pano、插上电以后升回去）：远景没建就不能离开 pano。
+		// 这里提前换只为进出 pano（目的地要换成全景替身或实时场景再加载）；hi ↔ mid 留到 beginFlight 真起飞时换，
+		// 不然她还在地点里走着（等她停下最多十几秒）画面就先变了
+		const panoChange = ctx.quality && ctx.quality.pendingTier !== null && ( ctx.quality.pendingTier === 'pano' || ctx.quality.tier === 'pano' );
+		if ( panoChange && ( ctx.quality.pendingTier === 'pano' || backdropBuilt() ) ) ctx.quality.onDeparture();
 		// 目的地已经按另一种方式加载好了（实时 / 全景）：放掉重新加载
 		if ( target.inited && target.module !== ( wantsPanorama( target ) ? target.panoramaModule : target.realModule ) ) {
 
@@ -686,7 +697,18 @@ export function createTimeline( ctx, sceneModules, panoramaModules = [] ) {
 		const leg = findLeg( from.key, to.key );
 		const label = `${ world.locations[ from.key ].name } → ${ world.locations[ to.key ].name }`;
 		const panoramaFlight = to.module.isPanorama || ! backdropBuilt();
-		const path = panoramaFlight ? createPanoramaFlight( from.key, to.key ) : createFlight( { groundAt, flightConfig, leg, start, end, label } );
+		// 目的地自己有地形块（落日的半岛）时，离地按它和远景取高的（窄处从地点自己的山里穿过来，不能钻进山里）
+		const ownGround = typeof to.module.ownGroundAt === 'function' ? to.module.ownGroundAt : null;
+		const toOrigin = world.locations[ to.key ].origin;
+		const flightGround = ownGround ? ( x, z ) => {
+
+			const local = world.toLocal( tempTarget.set( x, 0, z ), to.key, tempPosition.clone() );
+			const own = ownGround( local.x, local.z );
+			const visible = groundAt( x, z );
+			return Number.isFinite( own ) ? Math.max( visible, own + toOrigin[ 1 ] ) : visible;
+
+		} : groundAt;
+		const path = panoramaFlight ? createPanoramaFlight( from.key, to.key ) : createFlight( { groundAt: flightGround, flightConfig, leg, start, end, label } );
 
 		state.flight = {
 			from: state.index,
@@ -701,6 +723,8 @@ export function createTimeline( ctx, sceneModules, panoramaModules = [] ) {
 		state.overtime = 0;
 		logPhase( 'flight', `${ from.key }-${ to.key }` );
 		if ( ctx.quality && typeof ctx.quality.onDeparture === 'function' ) ctx.quality.onDeparture();
+		// 画质：记下离开时的场景比例，飞行中只降不升，到达时恢复（quality.js onFlightStart / onArrival）
+		if ( ctx.quality && typeof ctx.quality.onFlightStart === 'function' ) ctx.quality.onFlightStart();
 		applyFlightPose( state.flight );
 
 	}
@@ -755,9 +779,11 @@ export function createTimeline( ctx, sceneModules, panoramaModules = [] ) {
 		const arriveInEnd = arriveOutStart - veilConfig.arriveHold;
 		const arriveInStart = arriveInEnd - veilConfig.arriveIn;
 
+		const frame = flight.path.frame;
 		let veil = 0;
 		if ( t < departOutEnd ) veil = t < departOutStart ? smoothStep( 0, departInEnd, t ) : 1 - smoothStep( departOutStart, departOutEnd, t );
-		if ( t > arriveInStart ) veil = Math.max( veil, t < arriveOutStart ? smoothStep( arriveInStart, arriveInEnd, t ) : 1 - smoothStep( arriveOutStart, arriveOutEnd, t ) );
+		// 有窄处的航段到达时不起雾（在窄处里换场景）
+		if ( t > arriveInStart && ! frame ) veil = Math.max( veil, t < arriveOutStart ? smoothStep( arriveInStart, arriveInEnd, t ) : 1 - smoothStep( arriveOutStart, arriveOutEnd, t ) );
 
 		// 出发：天空先变成统一天空，内容化进雾里；到达：内容从雾里显出来，天空最后换回地点自己的
 		let skyBlend = 1;
@@ -767,6 +793,13 @@ export function createTimeline( ctx, sceneModules, panoramaModules = [] ) {
 			skyBlend = smoothStep( 0, departInEnd * 0.75, t );
 			contentVeil = smoothStep( 0, departInEnd, t );
 
+		} else if ( flight.arrived && frame ) {
+
+			// 窄处里换的场景：地点内容 contentIn 秒从雾里显出来，天空 skyIn 秒换回地点自己的
+			const since = t - frame.switchTime;
+			skyBlend = 1 - smoothStep( 0.2, frame.settings.skyIn, since );
+			contentVeil = 1 - smoothStep( 0, frame.settings.contentIn, since );
+
 		} else if ( flight.arrived ) {
 
 			skyBlend = 1 - smoothStep( T - 2.5, T, t );
@@ -774,17 +807,47 @@ export function createTimeline( ctx, sceneModules, panoramaModules = [] ) {
 
 		}
 
-		// 画布：离开星月夜时从中间往四周退去，进星月夜时从四周往中间蔓延
+		// 画布：离开星月夜时从中间往四周退去，进星月夜时从四周往中间蔓延（有窄处时从换场景前 1 秒就开始蔓延，盖住切换）
+		// 离开星月夜：画布在起飞的薄雾底下退去，退完的时刻不晚于切出地点（原来 3.5 秒，切出时边上还有笔触，一下子没了）。
+		// 不能不起雾直接退：画外真实的夜空几乎是黑的，亮蓝的画中间开一个黑洞（2026-10-02 试过）
 		let canvas = 0;
-		if ( entries[ flight.from ].config.arrival === 'canvas' ) canvas = 1 - smoothStep( 0, flightConfig.canvasSeconds, t );
-		if ( entries[ flight.to ].config.arrival === 'canvas' ) canvas = Math.max( canvas, smoothStep( T - flightConfig.canvasSeconds, T, t ) );
+		if ( entries[ flight.from ].config.arrival === 'canvas' ) canvas = 1 - smoothStep( 0, Math.min( flightConfig.canvasSeconds, flight.path.departSwitchAt - 0.1 ), t );
 
-		// 巡航时的曝光补偿（夜里按天空亮度抬，公式同俯瞰模式）；两次切换的时刻都是 1，曝光连续
-		const cruise = smoothStep( flight.path.departSwitchAt, flight.path.departSwitchAt + 3, t ) * ( 1 - smoothStep( flight.path.arriveSwitchAt - 3, flight.path.arriveSwitchAt, t ) );
+		if ( entries[ flight.to ].config.arrival === 'canvas' ) {
+
+			const canvasStart = frame ? Math.min( T - flightConfig.canvasSeconds, frame.switchTime - 1 ) : T - flightConfig.canvasSeconds;
+			canvas = Math.max( canvas, smoothStep( canvasStart, T, t ) );
+
+		}
+
+		// 巡航时的曝光补偿（夜里按天空亮度抬，公式同俯瞰模式）；两次切换的时刻都是 1，曝光连续。
+		// 夜里（天光弱）补偿更强：有窄处时一直保留到进窄处（窄处里另有明暗适应）。原来落日 → 哥特约 20 秒近乎黑屏（2026-10-02 审查 R3）
 		const intensity = world.uniforms.skyIntensity.value;
-		const exposureScale = 1 + ( 1 / ( 0.4 + 0.6 * Math.pow( Math.max( intensity, 1e-4 ), 0.7 ) ) - 1 ) * cruise * flightConfig.autoExposure;
+		const night = 1 - smoothStep( 0.15, 0.5, intensity );
+		const cruiseLevel = 1 + ( 1 / ( 0.4 + 0.6 * Math.pow( Math.max( intensity, 1e-4 ), 0.7 ) ) - 1 ) * flightConfig.autoExposure * ( 1 + night * flightConfig.nightExposureBoost );
+		const arriveFade = frame ? Math.min( flight.path.arriveSwitchAt, frame.entryTime + 1 ) : flight.path.arriveSwitchAt;
+		// 夜里收得晚（进窄处前 0.8 秒才开始收），收掉的部分由下面窄处的适应接上
+		const fadeStart = arriveFade - 3 + ( frame ? night * 1.2 : - night * 2 );
+		const fadeOut = smoothStep( fadeStart, arriveFade, t );
+		const cruise = smoothStep( flight.path.departSwitchAt, flight.path.departSwitchAt + 3, t ) * ( 1 - fadeOut );
+		const exposureScale = 1 + ( cruiseLevel - 1 ) * cruise;
 
-		return { veil, skyBlend, contentVeil, canvas, exposureScale };
+		// 窄处里的明暗适应：进去以后曝光慢慢抬高（白天抬得多，夜里少），出口那一下过曝，再 adaptationFall 秒落回 1。
+		// 夜里窄处里的总曝光不低于巡航时的九成：巡航补偿收掉多少，适应就接上多少（原来进窄处时巡航的三四倍补偿收掉、
+		// 换成 1.7 倍的适应，冰碛岗、林间小路里反而一下黑了，审查 R4）
+		let adaptation = 1;
+		if ( frame ) {
+
+			const day = smoothStep( 0.15, 0.6, intensity );
+			const peak = frame.settings.adaptation[ 1 ] + ( frame.settings.adaptation[ 0 ] - frame.settings.adaptation[ 1 ] ) * day;
+			const fall = 1 - smoothStep( frame.exitTime, frame.exitTime + frame.settings.adaptationFall, t );
+			adaptation = 1 + ( peak - 1 ) * smoothStep( frame.entryTime - 0.3, frame.entryTime + frame.settings.adaptationRise, t ) * fall;
+			const nightLift = ( cruiseLevel * 0.9 - 1 ) * night * fadeOut * fall;
+			if ( nightLift > 0 ) adaptation = Math.max( adaptation, ( exposureScale + nightLift ) / exposureScale );
+
+		}
+
+		return { veil, skyBlend, contentVeil, canvas, exposureScale, adaptation };
 
 	}
 
@@ -812,9 +875,10 @@ export function createTimeline( ctx, sceneModules, panoramaModules = [] ) {
 		world.uniforms.locationVeil.value = 1;
 		world.uniforms.worldSkyBlend.value = 1;
 		world.setDayTime( hoursAt( entry, 0 ) );
-		entry.module.enter();
+		entry.module.enter( flight.path.frame ? { arrival: 'frame', revealIn: flight.path.frame.settings.contentIn } : {} );
 		ctx.audio.playScene( entry.key );
 		flight.arrived = true;
+		if ( ctx.quality && typeof ctx.quality.onArrival === 'function' ) ctx.quality.onArrival();
 		ctx.director.setTime( 0 );
 		entry.module.update( 0, 0 );
 		logPhase( 'arrive', entry.key );
@@ -826,6 +890,9 @@ export function createTimeline( ctx, sceneModules, panoramaModules = [] ) {
 
 		const entry = entries[ flight.to ];
 		ctx.director.clearExternal();
+		ctx.director.setFlightDragLimit( null );
+		if ( flight.path.frame ) ctx.pipeline.setAdaptation( 1 );
+		if ( backdropBuilt() ) backdrop.setProxyWindows( entry.key, 1 );
 		if ( ctx.flightVideo ) ctx.flightVideo.hide();
 		ctx.pipeline.setVeil( 0 );
 		world.uniforms.worldSkyBlend.value = 0;
@@ -833,6 +900,8 @@ export function createTimeline( ctx, sceneModules, panoramaModules = [] ) {
 		ctx.pipeline.setCanvasReveal( entry.config.arrival === 'canvas' ? 1 : 0 );
 		ctx.pipeline.setGrading( entry.config.grading );
 		state.flight = null;
+		// 画质：飞行收尾结束，之后的帧才算进 hi → mid 的判断（quality.js onFlightEnd）
+		if ( ctx.quality && typeof ctx.quality.onFlightEnd === 'function' ) ctx.quality.onFlightEnd();
 		state.phase = 'playing';
 		state.overtime = 0;
 		logPhase( 'stay', entry.key );
@@ -874,9 +943,32 @@ export function createTimeline( ctx, sceneModules, panoramaModules = [] ) {
 		}
 
 		ctx.pipeline.setVeil( envelopes.veil, state.worldTime );
+		// 夜里飞行时远景的月光补光抬高（地面、林子、小镇不至于一片死黑），按天光弱的程度；到达以后地点自己设
+		if ( backdropBuilt() && ! path.panorama && ! flight.arrived ) {
+
+			const night = 1 - smoothStep( 0.15, 0.5, world.uniforms.skyIntensity.value );
+			backdrop.setNightFill( 1 + night * ( flightConfig.nightFill - 1 ) );
+			// 月亮还没升高（19:30~21:00）时只有天光：天光环境项也抬（天越黑抬得越多），不然地面、林子一片死黑
+			const dusk = 1 - smoothStep( 0.08, 0.6, world.uniforms.skyIntensity.value );
+			backdrop.setAmbientStrength( 1 + dusk * ( flightConfig.nightAmbient - 1 ) );
+
+		}
+
 		world.uniforms.worldSkyBlend.value = envelopes.skyBlend;
 		world.uniforms.locationVeil.value = envelopes.contentVeil;
 		ctx.pipeline.setCanvasReveal( envelopes.canvas );
+		if ( path.frame ) {
+
+			ctx.pipeline.setAdaptation( envelopes.adaptation );
+			// 到达前最后几秒拖动转头收紧（规格书：最后 6 秒 ±10°），不让她在窄处里转头看到墙外面
+			const limited = flight.time > path.duration - path.frame.settings.dragLimitSeconds;
+			ctx.director.setFlightDragLimit( limited ? [ path.frame.settings.dragYawMax, path.frame.settings.dragPitchMax ] : null );
+
+		}
+
+		// 飞往哪个地点，那个地点替身的窗先不亮（哥特：穿出林间小路以后真窗灯一扇扇亮）。
+		// 星月夜的小镇不算：飞过小镇时窗是亮着的（原画里最暖的那几点，审查 R30），画布盖上来以后画里的窗接着亮
+		if ( backdropBuilt() && ! path.panorama && to.key !== 'starry' ) backdrop.setProxyWindows( to.key, 0 );
 		ctx.pipeline.setGradingBlend( from.config.grading, to.config.grading, smoothStep( path.departSwitchAt, path.arriveSwitchAt, flight.time ), envelopes.exposureScale );
 
 		// 时刻：到达之前从出发地的最后时刻走到目的地的最初时刻，两头慢中间快（正午一掠而过）；到达以后按目的地的停留走
@@ -945,6 +1037,8 @@ export function createTimeline( ctx, sceneModules, panoramaModules = [] ) {
 			// 飞行中跳：出发地如果还挂着就先离开；飞行目标不是跳转目标的话也不留
 			const flight = state.flight;
 			state.flight = null;
+			// 飞行被打断也算到达、飞行结束：画质恢复离开时的比例、不再卡在"飞行中只降不升"
+			if ( ctx.quality && typeof ctx.quality.onFlightEnd === 'function' ) ctx.quality.onFlightEnd();
 			ctx.director.clearExternal();
 			if ( ctx.flightVideo ) ctx.flightVideo.hide();
 			if ( ! flight.departed && flight.from !== target ) leaveLocation( flight.from );
@@ -1055,6 +1149,23 @@ export function createTimeline( ctx, sceneModules, panoramaModules = [] ) {
 		state.worldTime += dt;
 		ctx.director.setSwayClock( state.worldTime );
 
+		if ( state.storm ) {
+
+			// 花瓣风暴：地点照常动，风暴起完再接原来的薄雾和黑场淡入
+			state.storm.time += dt;
+			if ( state.phase === 'playing' || state.phase === 'ended' ) updateCurrentLocation( dt );
+			if ( state.storm.time >= guideConfig.stormSeconds ) {
+
+				state.storm = null;
+				const first = nextPlayableIndex( 0 );
+				if ( first >= 0 ) requestJump( first, { seconds: timelineConfig.restartVeilSeconds } );
+
+			}
+
+			return;
+
+		}
+
 		if ( state.phase === 'jump' ) updateJump( dt );
 		else if ( state.phase === 'flight' ) updateFlight( dt );
 		else if ( state.phase === 'playing' ) updateStay( dt );
@@ -1066,7 +1177,243 @@ export function createTimeline( ctx, sceneModules, panoramaModules = [] ) {
 	function lateUpdate( dt ) {
 
 		if ( state.phase === 'idle' && state.index < 0 ) return;
-		if ( backdropBuilt() ) backdrop.update( dt, state.worldTime );
+		if ( backdropBuilt() ) {
+
+			backdrop.update( dt, state.worldTime );
+			updateGuide( state.paused ? 0 : dt );
+
+		}
+
+	}
+
+	// ===== 引路（规格书 5.3 阶段 12）=====
+	// 每帧在镜头的最终位姿定下来以后（lateUpdate）算：路径点（世界坐标，从镜头往前）、队形、颜色。
+	//   停留最后 gatherSeconds 秒：花瓣在身边聚起来打旋，再朝下一段航线第一个航点的方向飘出去；
+	//   飞行：沿航线往前流，窄处里收拢，穿出窄处后散开淡出；没窄处的航段到达时随薄雾淡掉；
+	//   开场：38 秒（林尽水源）起顺着船和人的路线流，领进山洞；花园出洞时接着流出洞口，出洞后散开淡出；
+	//   再走一遍：先起一阵花瓣风暴（围着镜头越转越大），再接薄雾；方向键跳转：直接收起
+	const guidePoints = Array.from( { length: 40 }, () => ( { x: 0, y: 0, z: 0, width: 1 } ) );
+	const guideViewer = new THREE.Vector3();
+	const guideForward = new THREE.Vector3();
+	const guidePoint = new THREE.Vector3();
+	const guideTarget = new THREE.Vector3();
+	const guideColor = new THREE.Color();
+	const guideNight = new THREE.Color( guideConfig.nightMoteColor );
+	const guideDay = new THREE.Color( guideConfig.dayMoteColor );
+	const guideSnow = new THREE.Color( guideConfig.snowMoteColor );
+	const guideState = { phase: 0, amount: 0 };
+
+	// 点到山洞中线（外口 → 内口）的水平距离：洞里的花瓣收得很窄
+	function caveWidthAt( point ) {
+
+		const outer = world.config.cave.outer;
+		const inner = world.config.cave.inner;
+		const axisX = inner[ 0 ] - outer[ 0 ];
+		const axisZ = inner[ 2 ] - outer[ 2 ];
+		const along = clamp( ( ( point.x - outer[ 0 ] ) * axisX + ( point.z - outer[ 2 ] ) * axisZ ) / ( axisX * axisX + axisZ * axisZ ), - 0.2, 1.2 );
+		const inside = along > - 0.05 && along < 1.05 && Math.hypot( point.x - outer[ 0 ] - axisX * along, point.z - outer[ 2 ] - axisZ * along ) < 6;
+		return inside ? 0.28 : 1;
+
+	}
+
+	// 沿地点自己的路线（开场、花园出洞，局部坐标）写路径：从现在走到的地方往前，每 spacing 米一个点
+	function pathFromRoute( route, key, time, spacing ) {
+
+		const start = route.distanceAt( time );
+		for ( let k = 0; k < guidePoints.length; k ++ ) {
+
+			route.pointAt( start + k * spacing, guidePoint );
+			world.toWorld( guidePoint, key, guideTarget );
+			const item = guidePoints[ k ];
+			item.x = guideTarget.x;
+			item.y = guideTarget.y;
+			item.z = guideTarget.z;
+			item.width = caveWidthAt( guideTarget );
+
+		}
+
+		return spacing * ( guidePoints.length - 1 );
+
+	}
+
+	// 从镜头朝某个世界点的水平方向飘出去，慢慢抬高（停留时朝下一段航线飘）
+	function pathToward( target, spacing ) {
+
+		guideForward.set( target.x - guideViewer.x, 0, target.z - guideViewer.z );
+		if ( guideForward.lengthSq() < 1 ) guideForward.set( 0, 0, - 1 );
+		guideForward.normalize();
+		for ( let k = 0; k < guidePoints.length; k ++ ) {
+
+			// 同飞行：从身后几米开始
+			const along = k * spacing - guideConfig.behind * 0.5;
+			const item = guidePoints[ k ];
+			item.x = guideViewer.x + guideForward.x * along;
+			item.y = guideViewer.y - 0.3 + Math.max( 0, along ) * 0.12;
+			item.z = guideViewer.z + guideForward.z * along;
+			item.width = 1;
+
+		}
+
+		return spacing * ( guidePoints.length - 1 );
+
+	}
+
+	function updateGuide( dt ) {
+
+		const guide = backdrop.getGuide();
+		if ( ! guide ) return;
+		const uniforms = guide.uniforms;
+		ctx.camera.updateMatrixWorld();
+		guideViewer.setFromMatrixPosition( ctx.camera.matrixWorld ).applyMatrix4( backdrop.getSceneToWorld().value );
+
+		let amount = 0;
+		let gather = 0;
+		let scatter = 0;
+		let keep = 0;
+		let swirl = 1;
+		let flowSpeed = 0;
+		let pathLength = 0;
+		let gatherRadius = guideConfig.gatherRadius;
+		let forcePetals = false;
+		let moteScale = 1;
+		const entry = state.index >= 0 ? entries[ state.index ] : null;
+		const flight = state.flight;
+
+		if ( state.storm ) {
+
+			// 花瓣风暴：围着镜头越转越快、越转越大
+			const progress = state.storm.time / guideConfig.stormSeconds;
+			amount = smoothStep( 0, 0.25, progress );
+			gather = 1;
+			gatherRadius = guideConfig.gatherRadius * ( 0.8 + 2.4 * progress );
+			swirl = 2.5 + 3 * progress;
+			keep = 1;
+			forcePetals = true;
+			guideTarget.copy( guideViewer );
+			guideTarget.z -= 50;
+			pathLength = pathToward( guideTarget, guideConfig.staySpacing );
+
+		} else if ( state.phase === 'flight' && flight && ! flight.path.panorama ) {
+
+			const path = flight.path;
+			const t = flight.time;
+			const T = path.duration;
+			const distance = path.distanceAt( t );
+			const frame = path.frame;
+			const narrowWidth = frame ? clamp( frame.settings.width / 12, 0.3, 1 ) : 1;
+			// 路径从镜头身后 guideBehind 米开始：粒子取模换位发生在身后看不见的地方，再从身后涌上来、超过镜头往前流。
+			// 剩下的航线不够 40 个点时按剩下的距离排（不然点都挤在终点，花瓣在出生点堆成一团）
+			const behind = guideConfig.behind;
+			const spacing = clamp( ( path.length - distance + behind ) / ( guidePoints.length - 1 ), 0.5, guideConfig.flightSpacing );
+			for ( let k = 0; k < guidePoints.length; k ++ ) {
+
+				const along = distance - behind + k * spacing;
+				path.pointAtDistance( along, guidePoint );
+				const item = guidePoints[ k ];
+				item.x = guidePoint.x;
+				item.y = guidePoint.y;
+				item.z = guidePoint.z;
+				// 窄处里（入口前 30 米到出口后 10 米）收拢
+				const inside = frame ? smoothStep( frame.entryDistance - 30, frame.entryDistance, along ) * ( 1 - smoothStep( frame.exitDistance, frame.exitDistance + 10, along ) ) : 0;
+				item.width = 1 + ( narrowWidth - 1 ) * inside;
+
+			}
+
+			pathLength = spacing * ( guidePoints.length - 1 );
+			flowSpeed = guideConfig.flightFlowSpeed;
+			keep = 1;
+			// 起飞：停留时聚着的那团在薄雾里还围着镜头（离得近，不被雾吞），雾散的时候慢慢松开、被航线带走
+			gather = 0.6 * ( 1 - smoothStep( 1.5, 5, t ) );
+			gatherRadius = guideConfig.gatherRadius;
+			if ( frame ) {
+
+				scatter = smoothStep( frame.exitTime, frame.exitTime + guideConfig.scatterSeconds, t );
+				amount = 1 - smoothStep( frame.exitTime + 0.5, Math.max( frame.exitTime + 1, T - 0.5 ), t );
+
+			} else {
+
+				amount = 1 - smoothStep( path.arriveSwitchAt - 2.5, path.arriveSwitchAt, t );
+
+			}
+
+		} else if ( ( state.phase === 'playing' || state.phase === 'ended' ) && entry && entry.inited && ! entry.module.isPanorama ) {
+
+			const time = state.sceneTime;
+			const duration = entry.config.duration;
+			const next = nextPlayableIndex( state.index + 1 );
+			const route = typeof entry.module.getGuideRoute === 'function' ? entry.module.getGuideRoute() : null;
+			if ( entry.key === 'overture' && route ) {
+
+				// 开场：林尽水源起顺着路线流，领进山洞（洞里收得很窄，也少一些，不然 1 米多宽的洞里满眼都是光点）
+				pathLength = pathFromRoute( route, entry.key, time, 2 );
+				// 洞里只留一成多（原来三成半，1 米多宽的洞里还是满屏花瓣光点，把洞壁和出口的光全挡住，2026-10-02 自查）：洞里领路的是出口的光
+				amount = smoothStep( guideConfig.overtureFrom, guideConfig.overtureFrom + 4, time ) * ( caveWidthAt( guideViewer ) < 1 ? 0.12 : 1 );
+				flowSpeed = guideConfig.stayFlowSpeed * 1.5;
+				keep = 1;
+				// 开场领路的是花瓣（"落英缤纷"），光点只留四成（审查 R38：崖前满屏光点像雪、像灰尘）
+				moteScale = 0.4;
+
+			} else if ( route && route.exitTime !== undefined && time < guideConfig.gardenIntroUntil ) {
+
+				// 花园出洞：接着开场的花瓣流出洞口，出洞以后散开淡出（豁然开朗）
+				amount = ( 1 - smoothStep( guideConfig.gardenIntroUntil - 4, guideConfig.gardenIntroUntil, time ) ) * ( caveWidthAt( guideViewer ) < 1 ? 0.12 : 1 );
+				scatter = smoothStep( route.exitTime, route.exitTime + guideConfig.scatterSeconds, time );
+				pathLength = pathFromRoute( route, entry.key, time, 2 );
+				flowSpeed = guideConfig.stayFlowSpeed * 1.5;
+				moteScale = 0.4;
+
+			} else if ( next >= 0 && entries[ next ].config.arrival !== 'cave' && time > duration - guideConfig.gatherSeconds ) {
+
+				// 停留最后几秒：聚到身边打旋，然后朝下一段航线的第一个航点飘
+				const since = time - ( duration - guideConfig.gatherSeconds );
+				amount = smoothStep( 0, 2.5, since );
+				gather = since < 4 ? 1 : 1 - 0.65 * smoothStep( 4, guideConfig.gatherSeconds, since );
+				gatherRadius = guideConfig.gatherRadius * ( 1.6 - 0.6 * smoothStep( 0, 3, since ) );
+				const leg = findLeg( entry.key, entries[ next ].key );
+				const firstWaypoint = leg && leg.waypoints && leg.waypoints.length ? leg.waypoints[ 0 ] : world.locations[ entries[ next ].key ].origin;
+				pathLength = pathToward( guideTarget.fromArray( firstWaypoint ), guideConfig.staySpacing );
+				flowSpeed = guideConfig.stayFlowSpeed * smoothStep( 3, 6, since );
+
+			}
+
+		} else if ( state.phase === 'jump' && state.jump ) {
+
+			// 跳转：已经出来的跟着薄雾收起（再走一遍的风暴起完以后也是这里，离镜头近的还看得见）
+			amount = guideState.amount * Math.exp( - dt * 2.5 );
+			gather = uniforms.gather.value;
+			gatherRadius = uniforms.gatherRadius.value;
+			swirl = uniforms.swirl.value;
+			keep = 1;
+			forcePetals = uniforms.petalAmount.value > 0.5;
+			pathLength = 0;
+
+		}
+
+		if ( pathLength > 0 ) guide.setPath( guidePoints );
+		if ( pathLength > 0 && dt > 0 ) guideState.phase = ( guideState.phase + dt * flowSpeed / pathLength ) % 1;
+		guideState.amount = amount;
+
+		uniforms.time.value = state.worldTime;
+		uniforms.flowPhase.value = guideState.phase;
+		uniforms.amount.value = amount;
+		uniforms.gather.value = gather;
+		uniforms.gatherRadius.value = gatherRadius;
+		uniforms.swirl.value = swirl;
+		uniforms.scatter.value = scatter;
+		ctx.camera.getWorldDirection( guideForward );
+		uniforms.gatherCenter.value.copy( guideViewer ).addScaledVector( guideForward.transformDirection( backdrop.getSceneToWorld().value ), 1.2 );
+		uniforms.gatherCenter.value.y -= 0.2;
+
+		// 颜色：白天暖白的花瓣和光点；入夜花瓣收起来，光点换萤火虫；雪原附近（海拔高）换蓝白的雪光
+		const day = smoothStep( 0.12, 0.45, world.uniforms.skyIntensity.value );
+		const snow = smoothStep( guideConfig.snowAltitude[ 0 ], guideConfig.snowAltitude[ 1 ], guideViewer.y ) * ( 1 - day );
+		uniforms.petalAmount.value = forcePetals ? 1 : day;
+		// 白天光点少一些（花瓣是主角），夜里光点是主角；聚在身边打旋时光点减半（几百只萤火虫贴脸，满屏都是点）
+		uniforms.moteAmount.value = ( 1 - 0.45 * day ) * ( 1 - 0.5 * gather ) * moteScale;
+		guideColor.copy( guideNight ).lerp( guideDay, day ).lerp( guideSnow, snow );
+		uniforms.moteColor.value.copy( guideColor );
+		uniforms.moteIntensity.value = guideConfig.moteIntensity * ( 0.75 + 0.25 * day );
+		ctx.pipeline.setGuideKeep( amount > 0 ? keep : 0 );
 
 	}
 
@@ -1080,6 +1427,7 @@ export function createTimeline( ctx, sceneModules, panoramaModules = [] ) {
 		if ( target.failed && ! target.inited ) console.warn( `时间线：场景「${ target.config.name }」之前初始化失败，再试一次` );
 
 		state.jump = null;
+		state.storm = null;
 		jumpTargetHold = index;
 		let ok = false;
 		try {
@@ -1104,6 +1452,7 @@ export function createTimeline( ctx, sceneModules, panoramaModules = [] ) {
 
 			const flight = state.flight;
 			state.flight = null;
+			if ( ctx.quality && typeof ctx.quality.onFlightEnd === 'function' ) ctx.quality.onFlightEnd();
 			if ( ctx.flightVideo ) ctx.flightVideo.hide();
 			if ( ! flight.departed && flight.from !== index ) leaveLocation( flight.from );
 			if ( flight.to !== index && entries[ flight.to ].inited ) leaveLocation( flight.to );
@@ -1201,6 +1550,15 @@ export function createTimeline( ctx, sceneModules, panoramaModules = [] ) {
 		if ( first < 0 ) return false;
 		for ( const entry of entries ) entry.failed = false;
 		state.paused = false;
+		// 先起一阵花瓣风暴（stormSeconds 秒），再接原来的薄雾和黑场淡入；没有远景（全景模式）就直接薄雾
+		if ( backdropBuilt() && backdrop.getGuide() && state.phase !== 'jump' && state.phase !== 'flight' ) {
+
+			if ( ! state.storm ) state.storm = { time: 0 };
+			ensureInit( first );
+			return true;
+
+		}
+
 		return requestJump( first, { seconds: timelineConfig.restartVeilSeconds } );
 
 	}
@@ -1249,6 +1607,7 @@ export function createTimeline( ctx, sceneModules, panoramaModules = [] ) {
 			cruiseSpeed: flight.path.cruiseSpeed,
 			stage,
 			panorama: Boolean( flight.path.panorama ),
+			frame: flight.path.frame ? { name: flight.path.frame.settings.name, entryTime: flight.path.frame.entryTime, exitTime: flight.path.frame.exitTime, switchTime: flight.path.frame.switchTime } : null,
 		};
 
 	}
@@ -1287,6 +1646,7 @@ export function createTimeline( ctx, sceneModules, panoramaModules = [] ) {
 		getPhase: () => state.phase,
 		getFlightInfo,
 		getPhaseLog: () => phaseLog.slice(),
+		isStorming: () => Boolean( state.storm ),
 		getSceneKey: () => ( getCurrentEntry() ? getCurrentEntry().config.key : '' ),
 		// 飞行巡航时没有当前地点（只画远景）
 		getCurrentModule: () => {

@@ -3,370 +3,370 @@
 	"note": "scripts/bake-pano.mjs 生成；没烘焙时为空，pano 档退回最低分辨率的实时画面",
 	"files": [
 		{
-			"id": "sunset-0-full",
-			"file": "sunset-0-full.webp",
-			"mime": "image/webp",
-			"bytes": 379322
-		},
-		{
-			"id": "sunset-0",
-			"file": "sunset-0.webp",
-			"mime": "image/webp",
-			"bytes": 792994
-		},
-		{
-			"id": "sunset-0-mask",
-			"file": "sunset-0-mask.webp",
-			"mime": "image/webp",
-			"bytes": 59420
-		},
-		{
-			"id": "sunset-0-sky",
-			"file": "sunset-0-sky.bin.gz",
-			"mime": "application/gzip",
-			"bytes": 484567
-		},
-		{
-			"id": "sunset-1-full",
-			"file": "sunset-1-full.webp",
-			"mime": "image/webp",
-			"bytes": 310050
-		},
-		{
-			"id": "sunset-1",
-			"file": "sunset-1.webp",
-			"mime": "image/webp",
-			"bytes": 645474
-		},
-		{
-			"id": "sunset-1-mask",
-			"file": "sunset-1-mask.webp",
-			"mime": "image/webp",
-			"bytes": 38830
-		},
-		{
-			"id": "sunset-1-sky",
-			"file": "sunset-1-sky.bin.gz",
-			"mime": "application/gzip",
-			"bytes": 488001
-		},
-		{
-			"id": "sunset-2-full",
-			"file": "sunset-2-full.webp",
-			"mime": "image/webp",
-			"bytes": 249942
-		},
-		{
-			"id": "sunset-2",
-			"file": "sunset-2.webp",
-			"mime": "image/webp",
-			"bytes": 503696
-		},
-		{
-			"id": "sunset-2-mask",
-			"file": "sunset-2-mask.webp",
-			"mime": "image/webp",
-			"bytes": 23088
-		},
-		{
-			"id": "sunset-2-sky",
-			"file": "sunset-2-sky.bin.gz",
-			"mime": "application/gzip",
-			"bytes": 511907
-		},
-		{
-			"id": "aurora-0-full",
-			"file": "aurora-0-full.webp",
-			"mime": "image/webp",
-			"bytes": 879662
-		},
-		{
-			"id": "aurora-0",
-			"file": "aurora-0.webp",
-			"mime": "image/webp",
-			"bytes": 1706750
-		},
-		{
-			"id": "aurora-0-mask",
-			"file": "aurora-0-mask.webp",
-			"mime": "image/webp",
-			"bytes": 97444
-		},
-		{
-			"id": "aurora-0-sky",
-			"file": "aurora-0-sky.bin.gz",
-			"mime": "application/gzip",
-			"bytes": 518815
-		},
-		{
-			"id": "aurora-1-full",
-			"file": "aurora-1-full.webp",
-			"mime": "image/webp",
-			"bytes": 1005160
-		},
-		{
-			"id": "aurora-1",
-			"file": "aurora-1.webp",
-			"mime": "image/webp",
-			"bytes": 2062548
-		},
-		{
-			"id": "aurora-1-mask",
-			"file": "aurora-1-mask.webp",
-			"mime": "image/webp",
-			"bytes": 220106
-		},
-		{
-			"id": "aurora-1-sky",
-			"file": "aurora-1-sky.bin.gz",
-			"mime": "application/gzip",
-			"bytes": 505737
-		},
-		{
-			"id": "aurora-2-full",
-			"file": "aurora-2-full.webp",
-			"mime": "image/webp",
-			"bytes": 893526
-		},
-		{
-			"id": "aurora-2",
-			"file": "aurora-2.webp",
-			"mime": "image/webp",
-			"bytes": 1829280
-		},
-		{
-			"id": "aurora-2-mask",
-			"file": "aurora-2-mask.webp",
-			"mime": "image/webp",
-			"bytes": 70642
-		},
-		{
-			"id": "aurora-2-sky",
-			"file": "aurora-2-sky.bin.gz",
-			"mime": "application/gzip",
-			"bytes": 506340
-		},
-		{
-			"id": "flight-garden-sunset",
-			"file": "flight-garden-sunset.mp4",
-			"mime": "video/mp4",
-			"bytes": 7879699
-		},
-		{
 			"id": "overture-0",
 			"file": "overture-0.webp",
 			"mime": "image/webp",
-			"bytes": 1454066
+			"bytes": 1618154
 		},
 		{
 			"id": "overture-0-mask",
 			"file": "overture-0-mask.webp",
 			"mime": "image/webp",
-			"bytes": 5746
+			"bytes": 7698
 		},
 		{
 			"id": "overture-0-sky",
 			"file": "overture-0-sky.bin.gz",
 			"mime": "application/gzip",
-			"bytes": 609235
+			"bytes": 576275
 		},
 		{
 			"id": "overture-1",
 			"file": "overture-1.webp",
 			"mime": "image/webp",
-			"bytes": 1433046
+			"bytes": 1651078
 		},
 		{
 			"id": "overture-1-mask",
 			"file": "overture-1-mask.webp",
 			"mime": "image/webp",
-			"bytes": 9748
+			"bytes": 11432
 		},
 		{
 			"id": "overture-1-sky",
 			"file": "overture-1-sky.bin.gz",
 			"mime": "application/gzip",
-			"bytes": 514651
+			"bytes": 507594
 		},
 		{
 			"id": "overture-2",
 			"file": "overture-2.webp",
 			"mime": "image/webp",
-			"bytes": 1350662
+			"bytes": 1847956
 		},
 		{
 			"id": "overture-2-mask",
 			"file": "overture-2-mask.webp",
 			"mime": "image/webp",
-			"bytes": 6326
+			"bytes": 11834
 		},
 		{
 			"id": "overture-2-sky",
 			"file": "overture-2-sky.bin.gz",
 			"mime": "application/gzip",
-			"bytes": 435048
+			"bytes": 459030
 		},
 		{
 			"id": "overture-3",
 			"file": "overture-3.webp",
 			"mime": "image/webp",
-			"bytes": 1379906
+			"bytes": 1808744
 		},
 		{
 			"id": "overture-3-mask",
 			"file": "overture-3-mask.webp",
 			"mime": "image/webp",
-			"bytes": 4880
+			"bytes": 10624
 		},
 		{
 			"id": "overture-3-sky",
 			"file": "overture-3-sky.bin.gz",
 			"mime": "application/gzip",
-			"bytes": 426197
+			"bytes": 437029
 		},
 		{
 			"id": "garden-0",
 			"file": "garden-0.webp",
 			"mime": "image/webp",
-			"bytes": 878824
+			"bytes": 1203148
 		},
 		{
 			"id": "garden-0-mask",
 			"file": "garden-0-mask.webp",
 			"mime": "image/webp",
-			"bytes": 6944
+			"bytes": 8430
 		},
 		{
 			"id": "garden-0-sky",
 			"file": "garden-0-sky.bin.gz",
 			"mime": "application/gzip",
-			"bytes": 404431
+			"bytes": 417791
 		},
 		{
 			"id": "garden-1",
 			"file": "garden-1.webp",
 			"mime": "image/webp",
-			"bytes": 795382
+			"bytes": 965810
 		},
 		{
 			"id": "garden-1-mask",
 			"file": "garden-1-mask.webp",
 			"mime": "image/webp",
-			"bytes": 6840
+			"bytes": 8684
 		},
 		{
 			"id": "garden-1-sky",
 			"file": "garden-1-sky.bin.gz",
 			"mime": "application/gzip",
-			"bytes": 387858
+			"bytes": 371059
 		},
 		{
 			"id": "garden-2",
 			"file": "garden-2.webp",
 			"mime": "image/webp",
-			"bytes": 745044
+			"bytes": 881636
 		},
 		{
 			"id": "garden-2-mask",
 			"file": "garden-2-mask.webp",
 			"mime": "image/webp",
-			"bytes": 6916
+			"bytes": 7272
 		},
 		{
 			"id": "garden-2-sky",
 			"file": "garden-2-sky.bin.gz",
 			"mime": "application/gzip",
-			"bytes": 366963
+			"bytes": 355897
 		},
 		{
-			"id": "gothic-0",
-			"file": "gothic-0.webp",
+			"id": "sunset-0-full",
+			"file": "sunset-0-full.webp",
 			"mime": "image/webp",
-			"bytes": 786196
+			"bytes": 661802
 		},
 		{
-			"id": "gothic-0-mask",
-			"file": "gothic-0-mask.webp",
+			"id": "sunset-0",
+			"file": "sunset-0.webp",
 			"mime": "image/webp",
-			"bytes": 3232
+			"bytes": 1371434
 		},
 		{
-			"id": "gothic-0-sky",
-			"file": "gothic-0-sky.bin.gz",
+			"id": "sunset-0-mask",
+			"file": "sunset-0-mask.webp",
+			"mime": "image/webp",
+			"bytes": 60186
+		},
+		{
+			"id": "sunset-0-sky",
+			"file": "sunset-0-sky.bin.gz",
 			"mime": "application/gzip",
-			"bytes": 596397
+			"bytes": 452849
 		},
 		{
-			"id": "gothic-1",
-			"file": "gothic-1.webp",
+			"id": "sunset-1-full",
+			"file": "sunset-1-full.webp",
 			"mime": "image/webp",
-			"bytes": 1450730
+			"bytes": 860124
 		},
 		{
-			"id": "gothic-1-mask",
-			"file": "gothic-1-mask.webp",
+			"id": "sunset-1",
+			"file": "sunset-1.webp",
 			"mime": "image/webp",
-			"bytes": 3204
+			"bytes": 1845316
 		},
 		{
-			"id": "gothic-1-sky",
-			"file": "gothic-1-sky.bin.gz",
+			"id": "sunset-1-mask",
+			"file": "sunset-1-mask.webp",
+			"mime": "image/webp",
+			"bytes": 26518
+		},
+		{
+			"id": "sunset-1-sky",
+			"file": "sunset-1-sky.bin.gz",
 			"mime": "application/gzip",
-			"bytes": 610091
+			"bytes": 521001
 		},
 		{
-			"id": "gothic-2",
-			"file": "gothic-2.webp",
+			"id": "sunset-2-full",
+			"file": "sunset-2-full.webp",
 			"mime": "image/webp",
-			"bytes": 1173998
+			"bytes": 417528
 		},
 		{
-			"id": "gothic-2-mask",
-			"file": "gothic-2-mask.webp",
+			"id": "sunset-2",
+			"file": "sunset-2.webp",
 			"mime": "image/webp",
-			"bytes": 3130
+			"bytes": 972786
 		},
 		{
-			"id": "gothic-2-sky",
-			"file": "gothic-2-sky.bin.gz",
+			"id": "sunset-2-mask",
+			"file": "sunset-2-mask.webp",
+			"mime": "image/webp",
+			"bytes": 25076
+		},
+		{
+			"id": "sunset-2-sky",
+			"file": "sunset-2-sky.bin.gz",
 			"mime": "application/gzip",
-			"bytes": 586618
-		},
-		{
-			"id": "flight-sunset-gothic",
-			"file": "flight-sunset-gothic.mp4",
-			"mime": "video/mp4",
-			"bytes": 4715591
-		},
-		{
-			"id": "flight-gothic-starry",
-			"file": "flight-gothic-starry.mp4",
-			"mime": "video/mp4",
-			"bytes": 8356512
-		},
-		{
-			"id": "flight-starry-aurora",
-			"file": "flight-starry-aurora.mp4",
-			"mime": "video/mp4",
-			"bytes": 5486209
+			"bytes": 401892
 		},
 		{
 			"id": "starry-0",
 			"file": "starry-0.webp",
 			"mime": "image/webp",
-			"bytes": 2883218
+			"bytes": 3922998
 		},
 		{
 			"id": "starry-0-mask",
 			"file": "starry-0-mask.webp",
 			"mime": "image/webp",
-			"bytes": 3008
+			"bytes": 130
 		},
 		{
 			"id": "starry-0-sky",
 			"file": "starry-0-sky.bin.gz",
 			"mime": "application/gzip",
-			"bytes": 567951
+			"bytes": 542848
+		},
+		{
+			"id": "aurora-0-full",
+			"file": "aurora-0-full.webp",
+			"mime": "image/webp",
+			"bytes": 914640
+		},
+		{
+			"id": "aurora-0",
+			"file": "aurora-0.webp",
+			"mime": "image/webp",
+			"bytes": 1631112
+		},
+		{
+			"id": "aurora-0-mask",
+			"file": "aurora-0-mask.webp",
+			"mime": "image/webp",
+			"bytes": 103978
+		},
+		{
+			"id": "aurora-0-sky",
+			"file": "aurora-0-sky.bin.gz",
+			"mime": "application/gzip",
+			"bytes": 470343
+		},
+		{
+			"id": "aurora-1-full",
+			"file": "aurora-1-full.webp",
+			"mime": "image/webp",
+			"bytes": 1001862
+		},
+		{
+			"id": "aurora-1",
+			"file": "aurora-1.webp",
+			"mime": "image/webp",
+			"bytes": 2042618
+		},
+		{
+			"id": "aurora-1-mask",
+			"file": "aurora-1-mask.webp",
+			"mime": "image/webp",
+			"bytes": 221120
+		},
+		{
+			"id": "aurora-1-sky",
+			"file": "aurora-1-sky.bin.gz",
+			"mime": "application/gzip",
+			"bytes": 462157
+		},
+		{
+			"id": "aurora-2-full",
+			"file": "aurora-2-full.webp",
+			"mime": "image/webp",
+			"bytes": 893174
+		},
+		{
+			"id": "aurora-2",
+			"file": "aurora-2.webp",
+			"mime": "image/webp",
+			"bytes": 1815952
+		},
+		{
+			"id": "aurora-2-mask",
+			"file": "aurora-2-mask.webp",
+			"mime": "image/webp",
+			"bytes": 71080
+		},
+		{
+			"id": "aurora-2-sky",
+			"file": "aurora-2-sky.bin.gz",
+			"mime": "application/gzip",
+			"bytes": 463376
+		},
+		{
+			"id": "flight-garden-sunset",
+			"file": "flight-garden-sunset.mp4",
+			"mime": "video/mp4",
+			"bytes": 45228070
+		},
+		{
+			"id": "flight-starry-aurora",
+			"file": "flight-starry-aurora.mp4",
+			"mime": "video/mp4",
+			"bytes": 24190227
+		},
+		{
+			"id": "gothic-0",
+			"file": "gothic-0.webp",
+			"mime": "image/webp",
+			"bytes": 878560
+		},
+		{
+			"id": "gothic-0-mask",
+			"file": "gothic-0-mask.webp",
+			"mime": "image/webp",
+			"bytes": 6354
+		},
+		{
+			"id": "gothic-0-sky",
+			"file": "gothic-0-sky.bin.gz",
+			"mime": "application/gzip",
+			"bytes": 459008
+		},
+		{
+			"id": "gothic-1",
+			"file": "gothic-1.webp",
+			"mime": "image/webp",
+			"bytes": 1527224
+		},
+		{
+			"id": "gothic-1-mask",
+			"file": "gothic-1-mask.webp",
+			"mime": "image/webp",
+			"bytes": 6482
+		},
+		{
+			"id": "gothic-1-sky",
+			"file": "gothic-1-sky.bin.gz",
+			"mime": "application/gzip",
+			"bytes": 528702
+		},
+		{
+			"id": "gothic-2",
+			"file": "gothic-2.webp",
+			"mime": "image/webp",
+			"bytes": 993780
+		},
+		{
+			"id": "gothic-2-mask",
+			"file": "gothic-2-mask.webp",
+			"mime": "image/webp",
+			"bytes": 14518
+		},
+		{
+			"id": "gothic-2-sky",
+			"file": "gothic-2-sky.bin.gz",
+			"mime": "application/gzip",
+			"bytes": 414971
+		},
+		{
+			"id": "flight-sunset-gothic",
+			"file": "flight-sunset-gothic.mp4",
+			"mime": "video/mp4",
+			"bytes": 39563431
+		},
+		{
+			"id": "flight-gothic-starry",
+			"file": "flight-gothic-starry.mp4",
+			"mime": "video/mp4",
+			"bytes": 46557151
 		}
 	],
 	"locations": {
@@ -381,7 +381,7 @@
 					"skyHeight": 256,
 					"position": [
 						0.5,
-						3.692924694840295,
+						3.6651155884694226,
 						-2.0733491971919595
 					],
 					"time": 5
@@ -395,7 +395,7 @@
 					"skyHeight": 256,
 					"position": [
 						-3,
-						10.398725042343145,
+						5.117589738368988,
 						34
 					],
 					"time": 35
@@ -409,7 +409,7 @@
 					"skyHeight": 256,
 					"position": [
 						-9,
-						4.952690165638922,
+						4.815144599676129,
 						3
 					],
 					"time": 60
@@ -427,7 +427,7 @@
 					"skyHeight": 256,
 					"position": [
 						1.8458747133075746,
-						1.9967596320362135,
+						1.039235290420422,
 						2
 					],
 					"time": 5
@@ -501,7 +501,7 @@
 					"skyHeight": 256,
 					"position": [
 						-30,
-						-0.20670046011606868,
+						-0.22083106570773658,
 						26
 					],
 					"time": 70
@@ -625,7 +625,7 @@
 					"skyHeight": 256,
 					"position": [
 						0,
-						0.12473144531250568,
+						0.15000000000000568,
 						0
 					],
 					"time": 35
@@ -636,19 +636,19 @@
 	"flights": {
 		"sunset-gothic": {
 			"video": "flight-sunset-gothic",
-			"duration": 22.033333333333335
+			"duration": 39.6
 		},
 		"garden-sunset": {
 			"video": "flight-garden-sunset",
-			"duration": 28.033333333333335
+			"duration": 39.333333333333336
 		},
 		"gothic-starry": {
 			"video": "flight-gothic-starry",
-			"duration": 24.033333333333335
+			"duration": 35.63333333333333
 		},
 		"starry-aurora": {
 			"video": "flight-starry-aurora",
-			"duration": 20.033333333333335
+			"duration": 27.8
 		}
 	}
 }

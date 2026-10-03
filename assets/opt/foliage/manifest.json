@@ -1,0 +1,131 @@
+{
+	"note": "远处树的替身图集（scripts/bake-foliage.mjs 生成）",
+	"hash": "debb1675",
+	"tile": 128,
+	"views": 8,
+	"elevation": 15,
+	"templates": [
+		{
+			"species": "broadleaf",
+			"variant": 0,
+			"size": 20.07800229119508,
+			"root": 0.15925990939712786
+		},
+		{
+			"species": "broadleaf",
+			"variant": 1,
+			"size": 15.979632866717676,
+			"root": 0.16768263123328492
+		},
+		{
+			"species": "broadleaf",
+			"variant": 2,
+			"size": 16.935114514197586,
+			"root": 0.18276147887488814
+		},
+		{
+			"species": "pine",
+			"variant": 0,
+			"size": 21.58514956728756,
+			"root": 0.129171926871483
+		},
+		{
+			"species": "pine",
+			"variant": 1,
+			"size": 23.140543926545526,
+			"root": 0.14104338121833948
+		},
+		{
+			"species": "pine",
+			"variant": 2,
+			"size": 21.93856131940314,
+			"root": 0.14119656637419928
+		},
+		{
+			"species": "fir",
+			"variant": 0,
+			"size": 21.127116816530723,
+			"root": 0.1349811644011283
+		},
+		{
+			"species": "fir",
+			"variant": 1,
+			"size": 20.319651993191677,
+			"root": 0.13121340169238938
+		},
+		{
+			"species": "fir",
+			"variant": 2,
+			"size": 20.550206707064707,
+			"root": 0.1294246637215304
+		},
+		{
+			"species": "peach",
+			"variant": 0,
+			"size": 9.348119084800917,
+			"root": 0.22217481119764965
+		},
+		{
+			"species": "peach",
+			"variant": 1,
+			"size": 10.580698617816685,
+			"root": 0.25933513949778414
+		},
+		{
+			"species": "peach",
+			"variant": 2,
+			"size": 9.42748257199052,
+			"root": 0.23755017658385003
+		},
+		{
+			"species": "blossom",
+			"variant": 0,
+			"size": 15.897678840974404,
+			"root": 0.24302973549901583
+		},
+		{
+			"species": "blossom",
+			"variant": 1,
+			"size": 20.877169014804927,
+			"root": 0.2873276086005113
+		},
+		{
+			"species": "blossom",
+			"variant": 2,
+			"size": 15.317769709763692,
+			"root": 0.2329956133607025
+		},
+		{
+			"species": "blossom",
+			"variant": 3,
+			"size": 20.704600962174425,
+			"root": 0.2889042864987507
+		},
+		{
+			"species": "blossom",
+			"variant": 4,
+			"size": 16.44489705584739,
+			"root": 0.2651390838041009
+		},
+		{
+			"species": "blossom",
+			"variant": 5,
+			"size": 21.55454472190905,
+			"root": 0.30151162938105286
+		}
+	],
+	"files": [
+		{
+			"id": "impostor-color",
+			"file": "impostor-color.webp",
+			"mime": "image/webp",
+			"bytes": 580772
+		},
+		{
+			"id": "impostor-normal",
+			"file": "impostor-normal.webp",
+			"mime": "image/webp",
+			"bytes": 850004
+		}
+	]
+}

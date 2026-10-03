@@ -217,6 +217,26 @@ body.cursorHidden {
 	opacity: 1;
 }
 
+/* 小提示：屏幕下方一行淡淡的字，比结尾文字小、淡 */
+#hint {
+	position: absolute;
+	left: 0;
+	right: 0;
+	bottom: 7vh;
+	text-align: center;
+	font-size: clamp(13px, 1.3vw, 17px);
+	letter-spacing: 0.3em;
+	color: rgba(240, 236, 228, 0.78);
+	text-shadow: 0 1px 12px rgba(0, 0, 0, 0.7);
+	opacity: 0;
+	transition: opacity 1.6s ease;
+	pointer-events: none;
+}
+
+#hint.visible {
+	opacity: 1;
+}
+
 #creditsButton,
 #replayButton {
 	position: absolute;

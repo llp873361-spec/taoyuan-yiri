@@ -1,0 +1,1743 @@
+{
+	"version": 1,
+	"note": "由 scripts/opt.mjs 生成，不要手改。files 是内联进 HTML 的数据块（id → data-models-<id>）；items 是每个模型的来源、三角数、包围盒（米，归位后）",
+	"files": [
+		{
+			"id": "rock_09",
+			"file": "rock_09.glb",
+			"mime": "model/gltf-binary",
+			"bytes": 456396
+		},
+		{
+			"id": "boulder_01",
+			"file": "boulder_01.glb",
+			"mime": "model/gltf-binary",
+			"bytes": 951400
+		},
+		{
+			"id": "boulder_01-lod1",
+			"file": "boulder_01-lod1.glb",
+			"mime": "model/gltf-binary",
+			"bytes": 268468
+		},
+		{
+			"id": "namaqualand_boulder_02",
+			"file": "namaqualand_boulder_02.glb",
+			"mime": "model/gltf-binary",
+			"bytes": 868044
+		},
+		{
+			"id": "namaqualand_boulder_02-lod1",
+			"file": "namaqualand_boulder_02-lod1.glb",
+			"mime": "model/gltf-binary",
+			"bytes": 252456
+		},
+		{
+			"id": "coast_rocks_05",
+			"file": "coast_rocks_05.glb",
+			"mime": "model/gltf-binary",
+			"bytes": 1171672
+		},
+		{
+			"id": "rock_face_02",
+			"file": "rock_face_02.glb",
+			"mime": "model/gltf-binary",
+			"bytes": 860160
+		},
+		{
+			"id": "mountainside",
+			"file": "mountainside.glb",
+			"mime": "model/gltf-binary",
+			"bytes": 1201804
+		},
+		{
+			"id": "mountainside-lod1",
+			"file": "mountainside-lod1.glb",
+			"mime": "model/gltf-binary",
+			"bytes": 334156
+		},
+		{
+			"id": "rock_moss_set_01-rock01",
+			"file": "rock_moss_set_01-rock01.glb",
+			"mime": "model/gltf-binary",
+			"bytes": 444356
+		},
+		{
+			"id": "rock_moss_set_01-rock02",
+			"file": "rock_moss_set_01-rock02.glb",
+			"mime": "model/gltf-binary",
+			"bytes": 445160
+		},
+		{
+			"id": "rock_moss_set_01-rock03",
+			"file": "rock_moss_set_01-rock03.glb",
+			"mime": "model/gltf-binary",
+			"bytes": 446512
+		},
+		{
+			"id": "rock_moss_set_01-rock04",
+			"file": "rock_moss_set_01-rock04.glb",
+			"mime": "model/gltf-binary",
+			"bytes": 443296
+		},
+		{
+			"id": "rock_moss_set_01-rock05",
+			"file": "rock_moss_set_01-rock05.glb",
+			"mime": "model/gltf-binary",
+			"bytes": 441008
+		},
+		{
+			"id": "rock_moss_set_01-rock06",
+			"file": "rock_moss_set_01-rock06.glb",
+			"mime": "model/gltf-binary",
+			"bytes": 441672
+		},
+		{
+			"id": "gothic-castle",
+			"file": "gothic-castle.glb",
+			"mime": "model/gltf-binary",
+			"bytes": 4554008
+		},
+		{
+			"id": "gothic-castle-lod1",
+			"file": "gothic-castle-lod1.glb",
+			"mime": "model/gltf-binary",
+			"bytes": 2394172
+		},
+		{
+			"id": "gothic-castle-lod2",
+			"file": "gothic-castle-lod2.glb",
+			"mime": "model/gltf-binary",
+			"bytes": 236844
+		},
+		{
+			"id": "taj-castle",
+			"file": "taj-castle.glb",
+			"mime": "model/gltf-binary",
+			"bytes": 2505860
+		},
+		{
+			"id": "taj-castle-lod1",
+			"file": "taj-castle-lod1.glb",
+			"mime": "model/gltf-binary",
+			"bytes": 900452
+		},
+		{
+			"id": "taj-castle-lod2",
+			"file": "taj-castle-lod2.glb",
+			"mime": "model/gltf-binary",
+			"bytes": 185892
+		},
+		{
+			"id": "sakura-focal-a",
+			"file": "sakura-focal-a.glb",
+			"mime": "model/gltf-binary",
+			"bytes": 462748
+		},
+		{
+			"id": "sakura-focal-b",
+			"file": "sakura-focal-b.glb",
+			"mime": "model/gltf-binary",
+			"bytes": 314420
+		},
+		{
+			"id": "sakura-forest-a",
+			"file": "sakura-forest-a.glb",
+			"mime": "model/gltf-binary",
+			"bytes": 322908
+		},
+		{
+			"id": "sakura-forest-b",
+			"file": "sakura-forest-b.glb",
+			"mime": "model/gltf-binary",
+			"bytes": 158544
+		},
+		{
+			"id": "bush_common",
+			"file": "bush_common.glb",
+			"mime": "model/gltf-binary",
+			"bytes": 65816
+		},
+		{
+			"id": "bush_common_flowers",
+			"file": "bush_common_flowers.glb",
+			"mime": "model/gltf-binary",
+			"bytes": 187796
+		},
+		{
+			"id": "fern_1",
+			"file": "fern_1.glb",
+			"mime": "model/gltf-binary",
+			"bytes": 143304
+		},
+		{
+			"id": "flower_3_group",
+			"file": "flower_3_group.glb",
+			"mime": "model/gltf-binary",
+			"bytes": 215644
+		},
+		{
+			"id": "flower_4_group",
+			"file": "flower_4_group.glb",
+			"mime": "model/gltf-binary",
+			"bytes": 229256
+		},
+		{
+			"id": "grass_common_tall",
+			"file": "grass_common_tall.glb",
+			"mime": "model/gltf-binary",
+			"bytes": 8284
+		},
+		{
+			"id": "grass_wispy_tall",
+			"file": "grass_wispy_tall.glb",
+			"mime": "model/gltf-binary",
+			"bytes": 11516
+		},
+		{
+			"id": "clover_1",
+			"file": "clover_1.glb",
+			"mime": "model/gltf-binary",
+			"bytes": 142804
+		},
+		{
+			"id": "plant_1",
+			"file": "plant_1.glb",
+			"mime": "model/gltf-binary",
+			"bytes": 140716
+		},
+		{
+			"id": "plant_7",
+			"file": "plant_7.glb",
+			"mime": "model/gltf-binary",
+			"bytes": 139004
+		},
+		{
+			"id": "pebble_round_1",
+			"file": "pebble_round_1.glb",
+			"mime": "model/gltf-binary",
+			"bytes": 67912
+		},
+		{
+			"id": "pebble_round_2",
+			"file": "pebble_round_2.glb",
+			"mime": "model/gltf-binary",
+			"bytes": 66868
+		},
+		{
+			"id": "pebble_round_3",
+			"file": "pebble_round_3.glb",
+			"mime": "model/gltf-binary",
+			"bytes": 67216
+		},
+		{
+			"id": "rock_medium_1",
+			"file": "rock_medium_1.glb",
+			"mime": "model/gltf-binary",
+			"bytes": 75576
+		},
+		{
+			"id": "rock_medium_2",
+			"file": "rock_medium_2.glb",
+			"mime": "model/gltf-binary",
+			"bytes": 73980
+		},
+		{
+			"id": "rock_medium_3",
+			"file": "rock_medium_3.glb",
+			"mime": "model/gltf-binary",
+			"bytes": 78552
+		},
+		{
+			"id": "rockpath_round_wide",
+			"file": "rockpath_round_wide.glb",
+			"mime": "model/gltf-binary",
+			"bytes": 145524
+		},
+		{
+			"id": "mushroom_common",
+			"file": "mushroom_common.glb",
+			"mime": "model/gltf-binary",
+			"bytes": 126528
+		}
+	],
+	"items": [
+		{
+			"id": "rock_09",
+			"file": "rock_09.glb",
+			"recipe": "rock_09",
+			"credit": "polyhaven/rock_09",
+			"source": "polyhaven/rock_09/rock_09_2k.gltf",
+			"node": null,
+			"lod": 0,
+			"lodOf": null,
+			"triangles": 6000,
+			"sourceTriangles": 12416,
+			"simplifyError": 0.002,
+			"bounds": {
+				"min": [
+					-0.037,
+					0,
+					-0.072
+				],
+				"max": [
+					0.037,
+					0.033,
+					0.072
+				],
+				"size": [
+					0.074,
+					0.033,
+					0.145
+				]
+			},
+			"maps": [
+				"normal 1024×1024",
+				"baseColor 1024×1024"
+			],
+			"bytes": 456396
+		},
+		{
+			"id": "boulder_01",
+			"file": "boulder_01.glb",
+			"recipe": "boulder_01",
+			"credit": "polyhaven/boulder_01",
+			"source": "polyhaven/boulder_01/boulder_01_2k.gltf",
+			"node": null,
+			"lod": 0,
+			"lodOf": null,
+			"triangles": 10000,
+			"sourceTriangles": 66122,
+			"simplifyError": 0.006,
+			"bounds": {
+				"min": [
+					-0.636,
+					0,
+					-0.911
+				],
+				"max": [
+					0.636,
+					1.004,
+					0.911
+				],
+				"size": [
+					1.272,
+					1.004,
+					1.822
+				]
+			},
+			"maps": [
+				"normal 1024×1024",
+				"baseColor 1024×1024"
+			],
+			"bytes": 951400
+		},
+		{
+			"id": "boulder_01-lod1",
+			"file": "boulder_01-lod1.glb",
+			"recipe": "boulder_01",
+			"credit": "polyhaven/boulder_01",
+			"source": "polyhaven/boulder_01/boulder_01_2k.gltf",
+			"node": null,
+			"lod": 1,
+			"lodOf": "boulder_01",
+			"triangles": 3000,
+			"sourceTriangles": 66122,
+			"simplifyError": 0.018000000000000002,
+			"bounds": {
+				"min": [
+					-0.636,
+					0.001,
+					-0.911
+				],
+				"max": [
+					0.635,
+					1.004,
+					0.911
+				],
+				"size": [
+					1.271,
+					1.003,
+					1.822
+				]
+			},
+			"maps": [
+				"normal 512×512",
+				"baseColor 512×512"
+			],
+			"bytes": 268468
+		},
+		{
+			"id": "namaqualand_boulder_02",
+			"file": "namaqualand_boulder_02.glb",
+			"recipe": "namaqualand_boulder_02",
+			"credit": "polyhaven/namaqualand_boulder_02",
+			"source": "polyhaven/namaqualand_boulder_02/namaqualand_boulder_02_2k.gltf",
+			"node": null,
+			"lod": 0,
+			"lodOf": null,
+			"triangles": 10000,
+			"sourceTriangles": 97964,
+			"simplifyError": 0.006,
+			"bounds": {
+				"min": [
+					-1.266,
+					0,
+					-0.616
+				],
+				"max": [
+					1.266,
+					0.88,
+					0.614
+				],
+				"size": [
+					2.532,
+					0.88,
+					1.23
+				]
+			},
+			"maps": [
+				"normal 1024×1024",
+				"baseColor 1024×1024"
+			],
+			"bytes": 868044
+		},
+		{
+			"id": "namaqualand_boulder_02-lod1",
+			"file": "namaqualand_boulder_02-lod1.glb",
+			"recipe": "namaqualand_boulder_02",
+			"credit": "polyhaven/namaqualand_boulder_02",
+			"source": "polyhaven/namaqualand_boulder_02/namaqualand_boulder_02_2k.gltf",
+			"node": null,
+			"lod": 1,
+			"lodOf": "namaqualand_boulder_02",
+			"triangles": 3000,
+			"sourceTriangles": 97964,
+			"simplifyError": 0.006,
+			"bounds": {
+				"min": [
+					-1.266,
+					0,
+					-0.616
+				],
+				"max": [
+					1.266,
+					0.88,
+					0.614
+				],
+				"size": [
+					2.532,
+					0.88,
+					1.23
+				]
+			},
+			"maps": [
+				"normal 512×512",
+				"baseColor 512×512"
+			],
+			"bytes": 252456
+		},
+		{
+			"id": "coast_rocks_05",
+			"file": "coast_rocks_05.glb",
+			"recipe": "coast_rocks_05",
+			"credit": "polyhaven/coast_rocks_05",
+			"source": "polyhaven/coast_rocks_05/coast_rocks_05_2k.gltf",
+			"node": null,
+			"lod": 0,
+			"lodOf": null,
+			"triangles": 24992,
+			"sourceTriangles": 771724,
+			"simplifyError": 0.006,
+			"bounds": {
+				"min": [
+					-2.017,
+					0.003,
+					-1.873
+				],
+				"max": [
+					2.018,
+					1.329,
+					1.873
+				],
+				"size": [
+					4.035,
+					1.327,
+					3.746
+				]
+			},
+			"maps": [
+				"normal 1024×1024",
+				"baseColor 1024×1024"
+			],
+			"bytes": 1171672
+		},
+		{
+			"id": "rock_face_02",
+			"file": "rock_face_02.glb",
+			"recipe": "rock_face_02",
+			"credit": "polyhaven/rock_face_02",
+			"source": "polyhaven/rock_face_02/rock_face_02_2k.gltf",
+			"node": null,
+			"lod": 0,
+			"lodOf": null,
+			"triangles": 11998,
+			"sourceTriangles": 29566,
+			"simplifyError": 0.006,
+			"bounds": {
+				"min": [
+					-1.356,
+					0,
+					-1.063
+				],
+				"max": [
+					1.355,
+					2.472,
+					1.063
+				],
+				"size": [
+					2.711,
+					2.472,
+					2.127
+				]
+			},
+			"maps": [
+				"normal 1024×1024",
+				"baseColor 1024×1024"
+			],
+			"bytes": 860160
+		},
+		{
+			"id": "mountainside",
+			"file": "mountainside.glb",
+			"recipe": "mountainside",
+			"credit": "polyhaven/mountainside",
+			"source": "polyhaven/mountainside/mountainside_2k.gltf",
+			"node": null,
+			"lod": 0,
+			"lodOf": null,
+			"triangles": 40000,
+			"sourceTriangles": 153472,
+			"simplifyError": 0.002,
+			"bounds": {
+				"min": [
+					-5.105,
+					0,
+					-2.617
+				],
+				"max": [
+					5.105,
+					10.52,
+					2.623
+				],
+				"size": [
+					10.209,
+					10.52,
+					5.241
+				]
+			},
+			"maps": [
+				"normal 1024×1024",
+				"baseColor 1024×1024"
+			],
+			"bytes": 1201804
+		},
+		{
+			"id": "mountainside-lod1",
+			"file": "mountainside-lod1.glb",
+			"recipe": "mountainside",
+			"credit": "polyhaven/mountainside",
+			"source": "polyhaven/mountainside/mountainside_2k.gltf",
+			"node": null,
+			"lod": 1,
+			"lodOf": "mountainside",
+			"triangles": 9999,
+			"sourceTriangles": 153472,
+			"simplifyError": 0.006,
+			"bounds": {
+				"min": [
+					-5.105,
+					0,
+					-2.617
+				],
+				"max": [
+					5.105,
+					10.52,
+					2.623
+				],
+				"size": [
+					10.209,
+					10.52,
+					5.241
+				]
+			},
+			"maps": [
+				"normal 512×512",
+				"baseColor 512×512"
+			],
+			"bytes": 334156
+		},
+		{
+			"id": "rock_moss_set_01-rock01",
+			"file": "rock_moss_set_01-rock01.glb",
+			"recipe": "rock_moss_set_01",
+			"credit": "polyhaven/rock_moss_set_01",
+			"source": "polyhaven/rock_moss_set_01/rock_moss_set_01_2k.gltf",
+			"node": "rock_moss_set_01_rock01",
+			"lod": 0,
+			"lodOf": null,
+			"triangles": 3000,
+			"sourceTriangles": 11000,
+			"simplifyError": 0.006,
+			"bounds": {
+				"min": [
+					-1.119,
+					0,
+					-1.68
+				],
+				"max": [
+					1.119,
+					1.473,
+					1.684
+				],
+				"size": [
+					2.238,
+					1.473,
+					3.364
+				]
+			},
+			"maps": [
+				"normal 1024×1024",
+				"baseColor 1024×1024"
+			],
+			"bytes": 444356
+		},
+		{
+			"id": "rock_moss_set_01-rock02",
+			"file": "rock_moss_set_01-rock02.glb",
+			"recipe": "rock_moss_set_01",
+			"credit": "polyhaven/rock_moss_set_01",
+			"source": "polyhaven/rock_moss_set_01/rock_moss_set_01_2k.gltf",
+			"node": "rock_moss_set_01_rock02",
+			"lod": 0,
+			"lodOf": null,
+			"triangles": 2994,
+			"sourceTriangles": 10996,
+			"simplifyError": 0.006,
+			"bounds": {
+				"min": [
+					-1.328,
+					0,
+					-1.632
+				],
+				"max": [
+					1.328,
+					1.262,
+					1.632
+				],
+				"size": [
+					2.655,
+					1.262,
+					3.264
+				]
+			},
+			"maps": [
+				"normal 1024×1024",
+				"baseColor 1024×1024"
+			],
+			"bytes": 445160
+		},
+		{
+			"id": "rock_moss_set_01-rock03",
+			"file": "rock_moss_set_01-rock03.glb",
+			"recipe": "rock_moss_set_01",
+			"credit": "polyhaven/rock_moss_set_01",
+			"source": "polyhaven/rock_moss_set_01/rock_moss_set_01_2k.gltf",
+			"node": "rock_moss_set_01_rock03",
+			"lod": 0,
+			"lodOf": null,
+			"triangles": 3000,
+			"sourceTriangles": 5000,
+			"simplifyError": 0.006,
+			"bounds": {
+				"min": [
+					-1.054,
+					0,
+					-1.04
+				],
+				"max": [
+					1.054,
+					1.1,
+					1.04
+				],
+				"size": [
+					2.108,
+					1.1,
+					2.08
+				]
+			},
+			"maps": [
+				"normal 1024×1024",
+				"baseColor 1024×1024"
+			],
+			"bytes": 446512
+		},
+		{
+			"id": "rock_moss_set_01-rock04",
+			"file": "rock_moss_set_01-rock04.glb",
+			"recipe": "rock_moss_set_01",
+			"credit": "polyhaven/rock_moss_set_01",
+			"source": "polyhaven/rock_moss_set_01/rock_moss_set_01_2k.gltf",
+			"node": "rock_moss_set_01_rock04",
+			"lod": 0,
+			"lodOf": null,
+			"triangles": 3000,
+			"sourceTriangles": 10589,
+			"simplifyError": 0.006,
+			"bounds": {
+				"min": [
+					-1.064,
+					0.005,
+					-0.982
+				],
+				"max": [
+					1.064,
+					1.768,
+					0.982
+				],
+				"size": [
+					2.128,
+					1.763,
+					1.964
+				]
+			},
+			"maps": [
+				"normal 1024×1024",
+				"baseColor 1024×1024"
+			],
+			"bytes": 443296
+		},
+		{
+			"id": "rock_moss_set_01-rock05",
+			"file": "rock_moss_set_01-rock05.glb",
+			"recipe": "rock_moss_set_01",
+			"credit": "polyhaven/rock_moss_set_01",
+			"source": "polyhaven/rock_moss_set_01/rock_moss_set_01_2k.gltf",
+			"node": "rock_moss_set_01_rock05",
+			"lod": 0,
+			"lodOf": null,
+			"triangles": 3000,
+			"sourceTriangles": 16548,
+			"simplifyError": 0.006,
+			"bounds": {
+				"min": [
+					-0.906,
+					0,
+					-1.498
+				],
+				"max": [
+					0.908,
+					1.205,
+					1.499
+				],
+				"size": [
+					1.814,
+					1.205,
+					2.998
+				]
+			},
+			"maps": [
+				"normal 1024×1024",
+				"baseColor 1024×1024"
+			],
+			"bytes": 441008
+		},
+		{
+			"id": "rock_moss_set_01-rock06",
+			"file": "rock_moss_set_01-rock06.glb",
+			"recipe": "rock_moss_set_01",
+			"credit": "polyhaven/rock_moss_set_01",
+			"source": "polyhaven/rock_moss_set_01/rock_moss_set_01_2k.gltf",
+			"node": "rock_moss_set_01_rock06",
+			"lod": 0,
+			"lodOf": null,
+			"triangles": 3000,
+			"sourceTriangles": 8994,
+			"simplifyError": 0.006,
+			"bounds": {
+				"min": [
+					-1.063,
+					0,
+					-1.378
+				],
+				"max": [
+					1.063,
+					1.259,
+					1.379
+				],
+				"size": [
+					2.126,
+					1.259,
+					2.757
+				]
+			},
+			"maps": [
+				"normal 1024×1024",
+				"baseColor 1024×1024"
+			],
+			"bytes": 441672
+		},
+		{
+			"id": "gothic-castle",
+			"file": "gothic-castle.glb",
+			"recipe": "gothic-castle",
+			"credit": "sketchfab/gothic-aria-kit",
+			"source": "built/gothic-castle.glb",
+			"node": null,
+			"lod": 0,
+			"lodOf": null,
+			"triangles": 113103,
+			"sourceTriangles": 113103,
+			"simplifyError": 0,
+			"bounds": {
+				"min": [
+					-43.704,
+					-0.067,
+					-35.006
+				],
+				"max": [
+					48.033,
+					83.831,
+					34.092
+				],
+				"size": [
+					91.736,
+					83.899,
+					69.098
+				]
+			},
+			"maps": [
+				"normal 1024×1024",
+				"baseColor 1024×1024"
+			],
+			"bytes": 4554008
+		},
+		{
+			"id": "gothic-castle-lod1",
+			"file": "gothic-castle-lod1.glb",
+			"recipe": "gothic-castle-lod1",
+			"credit": "sketchfab/gothic-aria-kit",
+			"source": "built/gothic-castle-lod1.glb",
+			"node": null,
+			"lod": 0,
+			"lodOf": null,
+			"triangles": 66459,
+			"sourceTriangles": 66459,
+			"simplifyError": 0,
+			"bounds": {
+				"min": [
+					-43.558,
+					-0.099,
+					-34.737
+				],
+				"max": [
+					47.809,
+					82.851,
+					33.88
+				],
+				"size": [
+					91.368,
+					82.949,
+					68.617
+				]
+			},
+			"maps": [
+				"normal 1024×1024",
+				"baseColor 1024×1024"
+			],
+			"bytes": 2394172
+		},
+		{
+			"id": "gothic-castle-lod2",
+			"file": "gothic-castle-lod2.glb",
+			"recipe": "gothic-castle-lod2",
+			"credit": "sketchfab/gothic-aria-kit",
+			"source": "built/gothic-castle-lod2.glb",
+			"node": null,
+			"lod": 0,
+			"lodOf": null,
+			"triangles": 6220,
+			"sourceTriangles": 6220,
+			"simplifyError": 0,
+			"bounds": {
+				"min": [
+					-43.431,
+					-0.195,
+					-34.843
+				],
+				"max": [
+					47.953,
+					78.779,
+					33.688
+				],
+				"size": [
+					91.384,
+					78.974,
+					68.531
+				]
+			},
+			"maps": [
+				"normal 256×256",
+				"baseColor 256×256"
+			],
+			"bytes": 236844
+		},
+		{
+			"id": "taj-castle",
+			"file": "taj-castle.glb",
+			"recipe": "taj-castle",
+			"credit": "sketchfab/taj-gokul",
+			"source": "built/taj-castle.glb",
+			"node": null,
+			"lod": 0,
+			"lodOf": null,
+			"triangles": 249998,
+			"sourceTriangles": 249998,
+			"simplifyError": 0,
+			"bounds": {
+				"min": [
+					-58.296,
+					0,
+					-58.595
+				],
+				"max": [
+					58.296,
+					79.766,
+					58.595
+				],
+				"size": [
+					116.593,
+					79.766,
+					117.189
+				]
+			},
+			"maps": [],
+			"bytes": 2505860
+		},
+		{
+			"id": "taj-castle-lod1",
+			"file": "taj-castle-lod1.glb",
+			"recipe": "taj-castle-lod1",
+			"credit": "sketchfab/taj-gokul",
+			"source": "built/taj-castle-lod1.glb",
+			"node": null,
+			"lod": 0,
+			"lodOf": null,
+			"triangles": 59947,
+			"sourceTriangles": 59947,
+			"simplifyError": 0,
+			"bounds": {
+				"min": [
+					-58.256,
+					0,
+					-58.582
+				],
+				"max": [
+					58.256,
+					79.767,
+					58.582
+				],
+				"size": [
+					116.511,
+					79.767,
+					117.163
+				]
+			},
+			"maps": [],
+			"bytes": 900452
+		},
+		{
+			"id": "taj-castle-lod2",
+			"file": "taj-castle-lod2.glb",
+			"recipe": "taj-castle-lod2",
+			"credit": "sketchfab/taj-gokul",
+			"source": "built/taj-castle-lod2.glb",
+			"node": null,
+			"lod": 0,
+			"lodOf": null,
+			"triangles": 10839,
+			"sourceTriangles": 10839,
+			"simplifyError": 0,
+			"bounds": {
+				"min": [
+					-58.228,
+					0,
+					-58.541
+				],
+				"max": [
+					58.228,
+					79.633,
+					58.558
+				],
+				"size": [
+					116.456,
+					79.633,
+					117.098
+				]
+			},
+			"maps": [],
+			"bytes": 185892
+		},
+		{
+			"id": "sakura-focal-a",
+			"file": "sakura-focal-a.glb",
+			"recipe": "sakura-focal-a",
+			"credit": "sketchfab/sakura-rostic-tree",
+			"source": "built/sakura-focal-a.glb",
+			"node": null,
+			"lod": 0,
+			"lodOf": null,
+			"triangles": 13939,
+			"sourceTriangles": 13939,
+			"simplifyError": 0,
+			"bounds": {
+				"min": [
+					-5.018,
+					-0.291,
+					-5.098
+				],
+				"max": [
+					2.93,
+					8.209,
+					5.601
+				],
+				"size": [
+					7.948,
+					8.5,
+					10.699
+				]
+			},
+			"maps": [
+				"baseColor 512×1024"
+			],
+			"bytes": 462748
+		},
+		{
+			"id": "sakura-focal-b",
+			"file": "sakura-focal-b.glb",
+			"recipe": "sakura-focal-b",
+			"credit": "sketchfab/sakura-rostic",
+			"source": "built/sakura-focal-b.glb",
+			"node": null,
+			"lod": 0,
+			"lodOf": null,
+			"triangles": 17146,
+			"sourceTriangles": 17146,
+			"simplifyError": 0,
+			"bounds": {
+				"min": [
+					-6.013,
+					-0.144,
+					-8.219
+				],
+				"max": [
+					4.729,
+					9.356,
+					2.65
+				],
+				"size": [
+					10.742,
+					9.501,
+					10.869
+				]
+			},
+			"maps": [
+				"baseColor 256×512"
+			],
+			"bytes": 314420
+		},
+		{
+			"id": "sakura-forest-a",
+			"file": "sakura-forest-a.glb",
+			"recipe": "sakura-forest-a",
+			"credit": "sketchfab/sakura-rostic-tree",
+			"source": "built/sakura-forest-a.glb",
+			"node": null,
+			"lod": 0,
+			"lodOf": null,
+			"triangles": 5788,
+			"sourceTriangles": 5788,
+			"simplifyError": 0,
+			"bounds": {
+				"min": [
+					-5.018,
+					-0.291,
+					-5.098
+				],
+				"max": [
+					2.93,
+					8.209,
+					5.601
+				],
+				"size": [
+					7.948,
+					8.5,
+					10.699
+				]
+			},
+			"maps": [
+				"baseColor 512×1024"
+			],
+			"bytes": 322908
+		},
+		{
+			"id": "sakura-forest-b",
+			"file": "sakura-forest-b.glb",
+			"recipe": "sakura-forest-b",
+			"credit": "sketchfab/sakura-rostic",
+			"source": "built/sakura-forest-b.glb",
+			"node": null,
+			"lod": 0,
+			"lodOf": null,
+			"triangles": 7202,
+			"sourceTriangles": 7202,
+			"simplifyError": 0,
+			"bounds": {
+				"min": [
+					-6.013,
+					-0.144,
+					-8.219
+				],
+				"max": [
+					4.729,
+					9.356,
+					2.65
+				],
+				"size": [
+					10.742,
+					9.501,
+					10.869
+				]
+			},
+			"maps": [
+				"baseColor 256×512"
+			],
+			"bytes": 158544
+		},
+		{
+			"id": "bush_common",
+			"file": "bush_common.glb",
+			"recipe": "bush_common",
+			"credit": "quaternius/stylized-nature-megakit",
+			"source": "quaternius/nature-megakit/glTF/Bush_Common.gltf",
+			"node": null,
+			"lod": 0,
+			"lodOf": null,
+			"triangles": 900,
+			"sourceTriangles": 900,
+			"simplifyError": 0,
+			"bounds": {
+				"min": [
+					-0.923,
+					-0.235,
+					-0.974
+				],
+				"max": [
+					0.991,
+					1.347,
+					0.991
+				],
+				"size": [
+					1.915,
+					1.582,
+					1.965
+				]
+			},
+			"maps": [
+				"baseColor 1024×1024"
+			],
+			"bytes": 65816
+		},
+		{
+			"id": "bush_common_flowers",
+			"file": "bush_common_flowers.glb",
+			"recipe": "bush_common_flowers",
+			"credit": "quaternius/stylized-nature-megakit",
+			"source": "quaternius/nature-megakit/glTF/Bush_Common_Flowers.gltf",
+			"node": null,
+			"lod": 0,
+			"lodOf": null,
+			"triangles": 1368,
+			"sourceTriangles": 1368,
+			"simplifyError": 0,
+			"bounds": {
+				"min": [
+					-0.923,
+					-0.235,
+					-0.974
+				],
+				"max": [
+					0.991,
+					1.347,
+					0.991
+				],
+				"size": [
+					1.915,
+					1.582,
+					1.965
+				]
+			},
+			"maps": [
+				"baseColor 1024×1024",
+				"baseColor 1008×981"
+			],
+			"bytes": 187796
+		},
+		{
+			"id": "fern_1",
+			"file": "fern_1.glb",
+			"recipe": "fern_1",
+			"credit": "quaternius/stylized-nature-megakit",
+			"source": "quaternius/nature-megakit/glTF/Fern_1.gltf",
+			"node": null,
+			"lod": 0,
+			"lodOf": null,
+			"triangles": 288,
+			"sourceTriangles": 288,
+			"simplifyError": 0,
+			"bounds": {
+				"min": [
+					-1.381,
+					-0.077,
+					-1.279
+				],
+				"max": [
+					1.446,
+					0.763,
+					1.374
+				],
+				"size": [
+					2.827,
+					0.84,
+					2.652
+				]
+			},
+			"maps": [
+				"baseColor 1024×1024"
+			],
+			"bytes": 143304
+		},
+		{
+			"id": "flower_3_group",
+			"file": "flower_3_group.glb",
+			"recipe": "flower_3_group",
+			"credit": "quaternius/stylized-nature-megakit",
+			"source": "quaternius/nature-megakit/glTF/Flower_3_Group.gltf",
+			"node": null,
+			"lod": 0,
+			"lodOf": null,
+			"triangles": 755,
+			"sourceTriangles": 755,
+			"simplifyError": 0,
+			"bounds": {
+				"min": [
+					-0.614,
+					-0.035,
+					-0.802
+				],
+				"max": [
+					0.875,
+					2.02,
+					0.789
+				],
+				"size": [
+					1.488,
+					2.055,
+					1.591
+				]
+			},
+			"maps": [
+				"baseColor 1024×1024",
+				"baseColor 1008×981"
+			],
+			"bytes": 215644
+		},
+		{
+			"id": "flower_4_group",
+			"file": "flower_4_group.glb",
+			"recipe": "flower_4_group",
+			"credit": "quaternius/stylized-nature-megakit",
+			"source": "quaternius/nature-megakit/glTF/Flower_4_Group.gltf",
+			"node": null,
+			"lod": 0,
+			"lodOf": null,
+			"triangles": 1690,
+			"sourceTriangles": 1690,
+			"simplifyError": 0,
+			"bounds": {
+				"min": [
+					-0.931,
+					-0.057,
+					-0.636
+				],
+				"max": [
+					0.849,
+					2.43,
+					0.731
+				],
+				"size": [
+					1.781,
+					2.487,
+					1.368
+				]
+			},
+			"maps": [
+				"baseColor 1024×1024",
+				"baseColor 1008×981"
+			],
+			"bytes": 229256
+		},
+		{
+			"id": "grass_common_tall",
+			"file": "grass_common_tall.glb",
+			"recipe": "grass_common_tall",
+			"credit": "quaternius/stylized-nature-megakit",
+			"source": "quaternius/nature-megakit/glTF/Grass_Common_Tall.gltf",
+			"node": null,
+			"lod": 0,
+			"lodOf": null,
+			"triangles": 326,
+			"sourceTriangles": 326,
+			"simplifyError": 0,
+			"bounds": {
+				"min": [
+					-0.404,
+					-0.031,
+					-0.479
+				],
+				"max": [
+					0.492,
+					1.841,
+					0.514
+				],
+				"size": [
+					0.895,
+					1.873,
+					0.993
+				]
+			},
+			"maps": [
+				"baseColor 512×512"
+			],
+			"bytes": 8284
+		},
+		{
+			"id": "grass_wispy_tall",
+			"file": "grass_wispy_tall.glb",
+			"recipe": "grass_wispy_tall",
+			"credit": "quaternius/stylized-nature-megakit",
+			"source": "quaternius/nature-megakit/glTF/Grass_Wispy_Tall.gltf",
+			"node": null,
+			"lod": 0,
+			"lodOf": null,
+			"triangles": 622,
+			"sourceTriangles": 622,
+			"simplifyError": 0,
+			"bounds": {
+				"min": [
+					-0.739,
+					-0.036,
+					-0.819
+				],
+				"max": [
+					0.801,
+					1.636,
+					0.775
+				],
+				"size": [
+					1.54,
+					1.672,
+					1.594
+				]
+			},
+			"maps": [
+				"baseColor 512×512"
+			],
+			"bytes": 11516
+		},
+		{
+			"id": "clover_1",
+			"file": "clover_1.glb",
+			"recipe": "clover_1",
+			"credit": "quaternius/stylized-nature-megakit",
+			"source": "quaternius/nature-megakit/glTF/Clover_1.gltf",
+			"node": null,
+			"lod": 0,
+			"lodOf": null,
+			"triangles": 379,
+			"sourceTriangles": 379,
+			"simplifyError": 0,
+			"bounds": {
+				"min": [
+					-0.502,
+					-0.013,
+					-0.4
+				],
+				"max": [
+					0.294,
+					1.132,
+					0.364
+				],
+				"size": [
+					0.796,
+					1.145,
+					0.764
+				]
+			},
+			"maps": [
+				"baseColor 1024×1024"
+			],
+			"bytes": 142804
+		},
+		{
+			"id": "plant_1",
+			"file": "plant_1.glb",
+			"recipe": "plant_1",
+			"credit": "quaternius/stylized-nature-megakit",
+			"source": "quaternius/nature-megakit/glTF/Plant_1.gltf",
+			"node": null,
+			"lod": 0,
+			"lodOf": null,
+			"triangles": 120,
+			"sourceTriangles": 120,
+			"simplifyError": 0,
+			"bounds": {
+				"min": [
+					-0.711,
+					-0.035,
+					-0.764
+				],
+				"max": [
+					0.563,
+					0.979,
+					0.622
+				],
+				"size": [
+					1.273,
+					1.014,
+					1.386
+				]
+			},
+			"maps": [
+				"baseColor 1024×1024"
+			],
+			"bytes": 140716
+		},
+		{
+			"id": "plant_7",
+			"file": "plant_7.glb",
+			"recipe": "plant_7",
+			"credit": "quaternius/stylized-nature-megakit",
+			"source": "quaternius/nature-megakit/glTF/Plant_7.gltf",
+			"node": null,
+			"lod": 0,
+			"lodOf": null,
+			"triangles": 48,
+			"sourceTriangles": 48,
+			"simplifyError": 0,
+			"bounds": {
+				"min": [
+					-0.448,
+					0.079,
+					-0.464
+				],
+				"max": [
+					0.6,
+					0.329,
+					0.498
+				],
+				"size": [
+					1.048,
+					0.25,
+					0.962
+				]
+			},
+			"maps": [
+				"baseColor 1024×1024"
+			],
+			"bytes": 139004
+		},
+		{
+			"id": "pebble_round_1",
+			"file": "pebble_round_1.glb",
+			"recipe": "pebble_round_1",
+			"credit": "quaternius/stylized-nature-megakit",
+			"source": "quaternius/nature-megakit/glTF/Pebble_Round_1.gltf",
+			"node": null,
+			"lod": 0,
+			"lodOf": null,
+			"triangles": 136,
+			"sourceTriangles": 136,
+			"simplifyError": 0,
+			"bounds": {
+				"min": [
+					-0.22,
+					-0.008,
+					-0.16
+				],
+				"max": [
+					0.28,
+					0.088,
+					0.207
+				],
+				"size": [
+					0.5,
+					0.095,
+					0.367
+				]
+			},
+			"maps": [
+				"baseColor 1024×1024"
+			],
+			"bytes": 67912
+		},
+		{
+			"id": "pebble_round_2",
+			"file": "pebble_round_2.glb",
+			"recipe": "pebble_round_2",
+			"credit": "quaternius/stylized-nature-megakit",
+			"source": "quaternius/nature-megakit/glTF/Pebble_Round_2.gltf",
+			"node": null,
+			"lod": 0,
+			"lodOf": null,
+			"triangles": 114,
+			"sourceTriangles": 114,
+			"simplifyError": 0,
+			"bounds": {
+				"min": [
+					-0.215,
+					-0.003,
+					-0.222
+				],
+				"max": [
+					0.234,
+					0.091,
+					0.189
+				],
+				"size": [
+					0.449,
+					0.094,
+					0.411
+				]
+			},
+			"maps": [
+				"baseColor 1024×1024"
+			],
+			"bytes": 66868
+		},
+		{
+			"id": "pebble_round_3",
+			"file": "pebble_round_3.glb",
+			"recipe": "pebble_round_3",
+			"credit": "quaternius/stylized-nature-megakit",
+			"source": "quaternius/nature-megakit/glTF/Pebble_Round_3.gltf",
+			"node": null,
+			"lod": 0,
+			"lodOf": null,
+			"triangles": 128,
+			"sourceTriangles": 128,
+			"simplifyError": 0,
+			"bounds": {
+				"min": [
+					-0.227,
+					-0.002,
+					-0.221
+				],
+				"max": [
+					0.223,
+					0.097,
+					0.263
+				],
+				"size": [
+					0.45,
+					0.099,
+					0.485
+				]
+			},
+			"maps": [
+				"baseColor 1024×1024"
+			],
+			"bytes": 67216
+		},
+		{
+			"id": "rock_medium_1",
+			"file": "rock_medium_1.glb",
+			"recipe": "rock_medium_1",
+			"credit": "quaternius/stylized-nature-megakit",
+			"source": "quaternius/nature-megakit/glTF/Rock_Medium_1.gltf",
+			"node": null,
+			"lod": 0,
+			"lodOf": null,
+			"triangles": 342,
+			"sourceTriangles": 342,
+			"simplifyError": 0,
+			"bounds": {
+				"min": [
+					-1.727,
+					-0.271,
+					-1.15
+				],
+				"max": [
+					1.498,
+					1.989,
+					1.839
+				],
+				"size": [
+					3.225,
+					2.26,
+					2.989
+				]
+			},
+			"maps": [
+				"baseColor 1024×1024"
+			],
+			"bytes": 75576
+		},
+		{
+			"id": "rock_medium_2",
+			"file": "rock_medium_2.glb",
+			"recipe": "rock_medium_2",
+			"credit": "quaternius/stylized-nature-megakit",
+			"source": "quaternius/nature-megakit/glTF/Rock_Medium_2.gltf",
+			"node": null,
+			"lod": 0,
+			"lodOf": null,
+			"triangles": 244,
+			"sourceTriangles": 244,
+			"simplifyError": 0,
+			"bounds": {
+				"min": [
+					-1.714,
+					-0.051,
+					-1.159
+				],
+				"max": [
+					1.335,
+					1.848,
+					1.32
+				],
+				"size": [
+					3.049,
+					1.899,
+					2.479
+				]
+			},
+			"maps": [
+				"baseColor 1024×1024"
+			],
+			"bytes": 73980
+		},
+		{
+			"id": "rock_medium_3",
+			"file": "rock_medium_3.glb",
+			"recipe": "rock_medium_3",
+			"credit": "quaternius/stylized-nature-megakit",
+			"source": "quaternius/nature-megakit/glTF/Rock_Medium_3.gltf",
+			"node": null,
+			"lod": 0,
+			"lodOf": null,
+			"triangles": 522,
+			"sourceTriangles": 522,
+			"simplifyError": 0,
+			"bounds": {
+				"min": [
+					-1.824,
+					-0.316,
+					-0.89
+				],
+				"max": [
+					1.596,
+					2.001,
+					2.586
+				],
+				"size": [
+					3.42,
+					2.316,
+					3.476
+				]
+			},
+			"maps": [
+				"baseColor 1024×1024"
+			],
+			"bytes": 78552
+		},
+		{
+			"id": "rockpath_round_wide",
+			"file": "rockpath_round_wide.glb",
+			"recipe": "rockpath_round_wide",
+			"credit": "quaternius/stylized-nature-megakit",
+			"source": "quaternius/nature-megakit/glTF/RockPath_Round_Wide.gltf",
+			"node": null,
+			"lod": 0,
+			"lodOf": null,
+			"triangles": 3500,
+			"sourceTriangles": 3500,
+			"simplifyError": 0,
+			"bounds": {
+				"min": [
+					-1.048,
+					-0.009,
+					-1.126
+				],
+				"max": [
+					1.063,
+					0.104,
+					1.003
+				],
+				"size": [
+					2.111,
+					0.113,
+					2.129
+				]
+			},
+			"maps": [
+				"baseColor 1024×1024"
+			],
+			"bytes": 145524
+		},
+		{
+			"id": "mushroom_common",
+			"file": "mushroom_common.glb",
+			"recipe": "mushroom_common",
+			"credit": "quaternius/stylized-nature-megakit",
+			"source": "quaternius/nature-megakit/glTF/Mushroom_Common.gltf",
+			"node": null,
+			"lod": 0,
+			"lodOf": null,
+			"triangles": 880,
+			"sourceTriangles": 880,
+			"simplifyError": 0,
+			"bounds": {
+				"min": [
+					-0.333,
+					-0.017,
+					-0.445
+				],
+				"max": [
+					0.23,
+					0.446,
+					0.334
+				],
+				"size": [
+					0.564,
+					0.463,
+					0.779
+				]
+			},
+			"maps": [
+				"baseColor 1024×1024"
+			],
+			"bytes": 126528
+		}
+	]
+}

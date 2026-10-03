@@ -1,7 +1,7 @@
 // 高度指数雾：密度随高度指数衰减 density(y) = d0 · exp(-y / H)，沿视线解析积分（不用步进）。
 // 用法：scene.fogNode = heightFog( { ... } )，所有节点材质自动带上；不想要雾的材质设 material.fog = false。
 
-import { Fn, float, vec3, exp, abs, max, dot, normalize, length, pow, mix, smoothstep, fog, positionWorld, cameraPosition } from 'three/tsl';
+import { Fn, If, float, vec3, exp, abs, max, dot, normalize, length, pow, mix, smoothstep, fog, positionWorld, cameraPosition } from 'three/tsl';
 import { dayAerialColor } from './sky.js';
 
 // 沿相机到片元的线段积分光学厚度，返回雾的不透明度 0~1
@@ -90,10 +90,23 @@ export function heightFog( { density, falloff, baseColor, scatterColor, lightDir
 
 	if ( ! veil ) return fog( fogColor, factor );
 
-	const veilFactor = veilAmountAt( veil, positionWorld, cameraPosition );
-	const combined = float( 1 ).sub( float( 1 ).sub( factor ).mul( float( 1 ).sub( veilFactor ) ) );
-	const combinedColor = mix( fogColor, veilColorAt( veil, positionWorld, cameraPosition ), veilFactor.div( max( combined, 1e-4 ) ).clamp( 0, 1 ) );
-	return fog( combinedColor, combined );
+	// 交接薄雾只在交接那一两秒有（veil.amount > 0）：平时每个吃雾的片元都白算一遍统一天空的大气色和 pow，
+	// 包进整帧一致的 uniform 分支；amount 为 0 时薄雾的量是 0，结果和只有高度雾时一样
+	return Fn( () => {
+
+		const mixedColor = vec3( fogColor ).toVar();
+		const mixedFactor = float( factor ).toVar();
+		If( veil.amount.greaterThan( 0.001 ), () => {
+
+			const veilFactor = veilAmountAt( veil, positionWorld, cameraPosition );
+			const combined = float( 1 ).sub( float( 1 ).sub( mixedFactor ).mul( float( 1 ).sub( veilFactor ) ) ).toVar();
+			mixedColor.assign( mix( mixedColor, veilColorAt( veil, positionWorld, cameraPosition ), veilFactor.div( max( combined, 1e-4 ) ).clamp( 0, 1 ) ) );
+			mixedFactor.assign( combined );
+
+		} );
+		return fog( mixedColor, mixedFactor );
+
+	} )();
 
 }
 

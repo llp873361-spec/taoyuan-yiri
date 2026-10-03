@@ -9,7 +9,7 @@ import fs from 'node:fs';
 import process from 'node:process';
 
 const projectRoot = path.resolve( path.dirname( fileURLToPath( import.meta.url ) ), '..' );
-const distPath = path.join( projectRoot, 'dist', 'index.html' );
+const distPath = process.env.DIST ? path.resolve( process.env.DIST ) : path.join( projectRoot, 'dist', 'index.html' );
 
 // 每一步 evaluate 的超时（毫秒）
 const stepTimeoutMs = 60000;
@@ -157,6 +157,13 @@ async function shootBackend( requested, options ) {
 
 			const startedAt = Date.now();
 			for ( let frame = 0; frame < frames; frame ++ ) await callGift( page, 'step', [ 1 / 60 ], '__gift.step' );
+			// 全景档的飞行视频：截图时是跳到某个进度的，要等 <video> 跳完、解出这一帧再截（真实播放是从头连着播的，不会停在没解出来的帧上）；
+			// 解出来以后再推一帧，让视频按飞行时间盖上去
+			if ( meta.flight ) {
+				const decoded = await page.waitForFunction( () => [ ...document.querySelectorAll( 'video.panoramaFlight' ) ].every( ( video ) => ! video.currentSrc || ( video.readyState >= 2 && ! video.seeking ) ), null, { timeout: 20000 } ).then( () => true, () => false );
+				if ( ! decoded ) result.warnings.push( fileName + '：飞行视频 20 秒内没解出这一帧' );
+				await callGift( page, 'step', [ 1 / 60 ], '__gift.step' );
+			}
 			const filePath = path.join( outDir, fileName );
 			await page.screenshot( { path: filePath, type: 'png' } );
 			const jpegBuffer = await page.screenshot( { type: 'jpeg', quality: 50 } );

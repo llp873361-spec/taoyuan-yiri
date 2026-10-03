@@ -6,6 +6,9 @@
 // 速度：起步、降落用 S(x) = x³ − x⁴/2（速度是 smoothstep，加速度两头都是 0），中间匀速；最快超过 maxSpeed 就自动拉长时间。
 // 朝向：巡航时看航线前方、略低头；起飞后几秒从她原来的朝向转过来，降落前几秒转到出生点的朝向；转弯按协调转弯侧倾（不超过 maxBank）。
 // 所有结果只由时间决定（没有逐帧积累的状态），截图时跳到任意进度都能复现。
+// 先窄后豁然开朗（阶段 12，leg.frame）：航线接在航点后面穿过窄处的中线；入口前 approachRelax 米起不再强制巡航离地；
+// 速度分五段：起步加速 → 巡航 → 入口前 slowLead 米减到 frame.speed → 匀速穿过窄处、滑向出生点 → 最后 decelTime 秒停稳；
+// 场景在窄处里面（switchAt）切换。窄处对不上（航线不经过、离终点太近）时中文警告，这一段退回原来的薄雾到达。
 
 import * as THREE from 'three/webgpu';
 
@@ -126,7 +129,12 @@ export function createFlight( { groundAt, flightConfig, leg, start, end, label }
 	towardFirst.normalize();
 	const liftPoint = start.position.clone().addScaledVector( towardFirst, settings.liftDrift ).add( new THREE.Vector3( 0, settings.liftHeight, 0 ) );
 
-	const controlPoints = [ start.position.clone(), liftPoint, ...waypoints, end.position.clone() ];
+	// 窄处：中线接在航点后面
+	let frame = leg && leg.frame && Array.isArray( leg.frame.path ) && leg.frame.path.length >= 2 ? { ...flightConfig.frameDefaults, ...leg.frame } : null;
+	const framePoints = frame ? frame.path.map( ( point ) => new THREE.Vector3().fromArray( point ) ) : [];
+	// 出了窄处到出生点之间的滑翔点（可选；落日：顺着小溪滑下草甸，不从沙丘上翻过去）
+	const glidePoints = frame && Array.isArray( frame.glide ) ? frame.glide.map( ( point ) => new THREE.Vector3().fromArray( point ) ) : [];
+	const controlPoints = [ start.position.clone(), liftPoint, ...waypoints, ...framePoints, ...glidePoints, end.position.clone() ];
 	for ( const point of controlPoints ) {
 
 		if ( ! Number.isFinite( point.x ) || ! Number.isFinite( point.y ) || ! Number.isFinite( point.z ) ) {
@@ -149,12 +157,34 @@ export function createFlight( { groundAt, flightConfig, leg, start, end, label }
 	const probePoint = new THREE.Vector3();
 	const rampStart = settings.rampDistance;
 	const rampEnd = settings.rampEndDistance || settings.rampDistance;
+	// 窄处入口在曲线上的大概位置（还没抬升的曲线，2 米一步找离入口最近的点）
+	let rawFrameEntry = Infinity;
+	if ( frame ) {
+
+		let best = Infinity;
+		for ( let distance = 0; distance <= curveLength; distance += 2 ) {
+
+			curve.getPointAt( Math.min( 1, distance / curveLength ), probePoint );
+			const gap = probePoint.distanceTo( framePoints[ 0 ] );
+			if ( gap < best ) {
+
+				best = gap;
+				rawFrameEntry = distance;
+
+			}
+
+		}
+
+	}
+
 	for ( let i = 0; i < probeCount; i ++ ) {
 
 		const distance = Math.min( curveLength, i * probeStep );
 		curve.getPointAt( Math.min( 1, distance / curveLength ), probePoint );
-		const weight = smoothStep( 0, rampStart, distance ) * smoothStep( 0, rampEnd, curveLength - distance );
-		const required = groundAt( probePoint.x, probePoint.z ) + settings.minClearance * weight;
+		// 窄处入口前 approachRelax 米起慢慢不再要求巡航高度（只要求离地 2 米以上）
+		const relax = frame ? smoothStep( rawFrameEntry - frame.approachRelax, rawFrameEntry - frame.approachRelax * 0.35, distance ) : 0;
+		const weight = smoothStep( 0, rampStart, distance ) * smoothStep( 0, rampEnd, curveLength - distance ) * ( 1 - relax );
+		const required = groundAt( probePoint.x, probePoint.z ) + settings.minClearance * weight + 2 * relax;
 		deficits[ i ] = Math.max( 0, required - probePoint.y );
 
 	}
@@ -215,35 +245,148 @@ export function createFlight( { groundAt, flightConfig, leg, start, end, label }
 
 	}
 
+	// ---------- 窄处在航线上的位置（抬升以后的折线，按距离）----------
+	function nearestDistance( target ) {
+
+		let best = Infinity;
+		let bestDistance = 0;
+		for ( let i = 0; i < denseCount; i ++ ) {
+
+			const gap = Math.hypot( densePoints[ i * 3 ] - target.x, densePoints[ i * 3 + 1 ] - target.y, densePoints[ i * 3 + 2 ] - target.z );
+			if ( gap < best ) {
+
+				best = gap;
+				bestDistance = cumulative[ i ];
+
+			}
+
+		}
+
+		return { distance: bestDistance, gap: best };
+
+	}
+
+	let frameInfo = null;
+	if ( frame ) {
+
+		const entry = nearestDistance( framePoints[ 0 ] );
+		const exit = nearestDistance( framePoints[ framePoints.length - 1 ] );
+		const holdStart = entry.distance - frame.slowLead;
+		const tail = length - exit.distance;
+		let problem = null;
+		if ( entry.gap > 3 || exit.gap > 3 ) problem = `航线离窄处中线太远（入口差 ${ entry.gap.toFixed( 1 )} 米、出口差 ${ exit.gap.toFixed( 1 ) } 米，多半是被离地抬升推开了）`;
+		else if ( exit.distance <= entry.distance + 5 ) problem = '窄处的入口不在出口前面';
+		else if ( tail < frame.speed * settings.decelTime / 2 ) problem = `出口离出生点只有 ${ tail.toFixed( 0 ) } 米，停不稳`;
+		else if ( holdStart < 200 ) problem = `入口离起点只有 ${ entry.distance.toFixed( 0 ) } 米，来不及减速`;
+		if ( problem ) {
+
+			console.warn( `飞行：${ label } 的窄处「${ frame.name || frame.kind }」对不上：${ problem }；这一段退回原来的薄雾到达` );
+			frame = null;
+
+		} else {
+
+			frameInfo = { entryDistance: entry.distance, exitDistance: exit.distance, switchDistance: entry.distance + ( exit.distance - entry.distance ) * frame.switchAt, holdStart };
+
+		}
+
+	}
+
 	// ---------- 速度和时长 ----------
+	// 五段（时间域）：加速（0 → 巡航 v）、巡航、减速（v → 窄处速度 w）、匀速（w）、停稳（w → 0）。
+	// 加减速的速度曲线是 smoothstep，走过的距离用 easedDistance 解析算。没有窄处时 w = v、减速段为 0，就是原来的三段
 	const accelTime = settings.accelTime;
 	const decelTime = settings.decelTime;
 	let duration = Math.max( settings.duration || 0, accelTime + decelTime + 1 );
-	let cruiseSpeed = length / ( duration - ( accelTime + decelTime ) / 2 );
-	if ( cruiseSpeed > settings.maxSpeed ) {
+	let cruiseSpeed = 0;
+	let slowTime = 0;
+	let holdTime = 0;
+	let holdSpeed = 0;
+	let cruiseTime = 0;
+	if ( frameInfo ) {
 
-		duration = length / settings.maxSpeed + ( accelTime + decelTime ) / 2;
-		cruiseSpeed = settings.maxSpeed;
-		console.log( `飞行：${ label } 航线 ${ length.toFixed( 0 ) } 米，按 ${ settings.maxSpeed } 米/秒的上限，飞行时间拉长到 ${ duration.toFixed( 1 )} 秒` );
+		holdSpeed = frame.speed;
+		slowTime = frame.slowTime;
+		// 匀速段从 holdStart 一直到停稳段开始（停稳段走 w·decel/2 米）
+		holdTime = ( length - frameInfo.holdStart - holdSpeed * decelTime / 2 ) / holdSpeed;
+		const before = frameInfo.holdStart;
+		cruiseTime = duration - accelTime - slowTime - holdTime - decelTime;
+		cruiseSpeed = cruiseTime > 0 ? ( before - holdSpeed * slowTime / 2 ) / ( accelTime / 2 + cruiseTime + slowTime / 2 ) : Infinity;
+		if ( cruiseSpeed > settings.maxSpeed || cruiseTime <= 0 ) {
+
+			cruiseSpeed = settings.maxSpeed;
+			cruiseTime = Math.max( 0, ( before - holdSpeed * slowTime / 2 ) / cruiseSpeed - accelTime / 2 - slowTime / 2 );
+			duration = accelTime + cruiseTime + slowTime + holdTime + decelTime;
+			console.log( `飞行：${ label } 航线 ${ length.toFixed( 0 ) } 米，按 ${ settings.maxSpeed } 米/秒的上限，飞行时间拉长到 ${ duration.toFixed( 1 ) } 秒` );
+
+		}
+
+	} else {
+
+		cruiseSpeed = length / ( duration - ( accelTime + decelTime ) / 2 );
+		if ( cruiseSpeed > settings.maxSpeed ) {
+
+			duration = length / settings.maxSpeed + ( accelTime + decelTime ) / 2;
+			cruiseSpeed = settings.maxSpeed;
+			console.log( `飞行：${ label } 航线 ${ length.toFixed( 0 ) } 米，按 ${ settings.maxSpeed } 米/秒的上限，飞行时间拉长到 ${ duration.toFixed( 1 ) } 秒` );
+
+		}
+
+		holdSpeed = cruiseSpeed;
+		cruiseTime = duration - accelTime - decelTime;
 
 	}
+
+	const accelEnd = accelTime;
+	const cruiseEnd = accelEnd + cruiseTime;
+	const slowEnd = cruiseEnd + slowTime;
+	const holdEnd = slowEnd + holdTime;
+	const accelDistance = cruiseSpeed * accelTime / 2;
+	const cruiseDistance = accelDistance + cruiseSpeed * cruiseTime;
+	const slowDistance = cruiseDistance + ( cruiseSpeed + holdSpeed ) * slowTime / 2;
 
 	function distanceAt( time ) {
 
 		if ( time <= 0 ) return 0;
 		if ( time >= duration ) return length;
-		if ( time < accelTime ) return cruiseSpeed * accelTime * easedDistance( time / accelTime );
-		if ( time > duration - decelTime ) return length - cruiseSpeed * decelTime * easedDistance( ( duration - time ) / decelTime );
-		return cruiseSpeed * accelTime * 0.5 + cruiseSpeed * ( time - accelTime );
+		if ( time < accelEnd ) return cruiseSpeed * accelTime * easedDistance( time / accelTime );
+		if ( time < cruiseEnd ) return accelDistance + cruiseSpeed * ( time - accelEnd );
+		if ( time < slowEnd ) {
+
+			const elapsed = time - cruiseEnd;
+			return cruiseDistance + cruiseSpeed * elapsed + ( holdSpeed - cruiseSpeed ) * slowTime * easedDistance( elapsed / slowTime );
+
+		}
+
+		if ( time < holdEnd ) return slowDistance + holdSpeed * ( time - slowEnd );
+		return length - holdSpeed * decelTime * easedDistance( ( duration - time ) / decelTime );
 
 	}
 
 	function speedAt( time ) {
 
 		if ( time <= 0 || time >= duration ) return 0;
-		if ( time < accelTime ) return cruiseSpeed * smoothStep( 0, 1, time / accelTime );
-		if ( time > duration - decelTime ) return cruiseSpeed * smoothStep( 0, 1, ( duration - time ) / decelTime );
-		return cruiseSpeed;
+		if ( time < accelEnd ) return cruiseSpeed * smoothStep( 0, 1, time / accelTime );
+		if ( time < cruiseEnd ) return cruiseSpeed;
+		if ( time < slowEnd ) return cruiseSpeed + ( holdSpeed - cruiseSpeed ) * smoothStep( 0, 1, ( time - cruiseEnd ) / slowTime );
+		if ( time < holdEnd ) return holdSpeed;
+		return holdSpeed * smoothStep( 0, 1, ( duration - time ) / decelTime );
+
+	}
+
+	// 走到某个距离是第几秒（distanceAt 单调递增，二分）
+	function timeAtDistance( distance ) {
+
+		let low = 0;
+		let high = duration;
+		for ( let i = 0; i < 40; i ++ ) {
+
+			const middle = ( low + high ) / 2;
+			if ( distanceAt( middle ) < distance ) low = middle;
+			else high = middle;
+
+		}
+
+		return ( low + high ) / 2;
 
 	}
 
@@ -267,7 +410,8 @@ export function createFlight( { groundAt, flightConfig, leg, start, end, label }
 	// ---------- 报一下这条航线 ----------
 	let lowest = Infinity;
 	let highest = - Infinity;
-	for ( let distance = rampStart; distance <= length - rampEnd; distance += 10 ) {
+	const reportEnd = frameInfo ? Math.min( length - rampEnd, frameInfo.entryDistance - frame.approachRelax ) : length - rampEnd;
+	for ( let distance = rampStart; distance <= reportEnd; distance += 10 ) {
 
 		pointAtDistance( distance, probePoint );
 		const clearance = probePoint.y - groundAt( probePoint.x, probePoint.z );
@@ -277,12 +421,23 @@ export function createFlight( { groundAt, flightConfig, leg, start, end, label }
 	}
 
 	const clearanceText = Number.isFinite( lowest ) ? `，巡航离地 ${ lowest.toFixed( 0 ) }~${ highest.toFixed( 0 ) } 米` : '';
-	console.log( `飞行：${ label } 航线 ${ length.toFixed( 0 ) } 米，${ duration.toFixed( 1 ) } 秒，最快 ${ cruiseSpeed.toFixed( 0 ) } 米/秒${ clearanceText }` );
 
 	// ---------- 交接时刻 ----------
 	const veil = settings.veil;
 	const departSwitchAt = veil.departIn + veil.departHold / 2;
-	const arriveSwitchAt = duration - veil.clearBeforeEnd - veil.arriveOut - veil.arriveHold / 2;
+	let arriveSwitchAt = duration - veil.clearBeforeEnd - veil.arriveOut - veil.arriveHold / 2;
+	if ( frameInfo ) {
+
+		frameInfo.entryTime = timeAtDistance( frameInfo.entryDistance );
+		frameInfo.exitTime = timeAtDistance( frameInfo.exitDistance );
+		frameInfo.switchTime = timeAtDistance( frameInfo.switchDistance );
+		frameInfo.settings = frame;
+		arriveSwitchAt = frameInfo.switchTime;
+
+	}
+
+	const frameText = frameInfo ? `；窄处「${ frame.name }」在第 ${ frameInfo.entryTime.toFixed( 1 ) }~${ frameInfo.exitTime.toFixed( 1 ) } 秒，第 ${ frameInfo.switchTime.toFixed( 1 ) } 秒在里面换场景` : '';
+	console.log( `飞行：${ label } 航线 ${ length.toFixed( 0 ) } 米，${ duration.toFixed( 1 ) } 秒，最快 ${ cruiseSpeed.toFixed( 0 ) } 米/秒${ clearanceText }${ frameText }` );
 
 	// ---------- 按时间取位姿 ----------
 	const departTurn = settings.departTurn;
@@ -351,8 +506,11 @@ export function createFlight( { groundAt, flightConfig, leg, start, end, label }
 		cruiseSpeed,
 		departSwitchAt,
 		arriveSwitchAt,
+		frame: frameInfo,
 		sample,
 		pointAtDistance,
+		distanceAt,
+		timeAtDistance,
 	};
 
 }

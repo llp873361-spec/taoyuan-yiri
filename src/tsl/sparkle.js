@@ -4,7 +4,7 @@
 // 所以远近都不会糊成噪点。雪地不传 time，闪点静止，闪烁只来自镜头移动；
 // 海面传 time，每个格子按自己的节奏生灭（水面的小晶面一直在换），输出 HDR 颜色，交给 bloom 出星芒。
 
-import { float, vec2, vec3, floor, fract, length, dFdx, dFdy, log2, exp2, max, min, mix, smoothstep, dot, normalize, cross, cos, sin, sqrt, pow, cameraPosition } from 'three/tsl';
+import { Fn, If, float, vec2, vec3, floor, fract, length, dFdx, dFdy, log2, exp2, max, min, mix, smoothstep, dot, normalize, cross, cos, sin, sqrt, pow, cameraPosition } from 'three/tsl';
 import { hash33 } from './noise.js';
 
 // 一层闪光在某一级网格上的结果
@@ -82,52 +82,78 @@ function evaluateLevel( settings, level, marginFootprint, pixelDx, pixelDy ) {
 //   time / twinkleRate：可选，传了就让闪点随时间生灭（每秒换几轮），海面用
 //   footprintMode：'max'（默认，按像素足迹的长边选网格，雪地用，最稳）或 'mean'（长短边的几何平均）。
 //     掠射角下像素在纵深方向拉得很长，按长边选格子会大到横向几十个像素才一个闪点；海面几乎全是掠射角，用 'mean'
+//   active：可选的布尔节点，false 的像素不算单颗闪点、只留远处的统计补偿（调用方保证那里的闪点本来就看不出来，比如海面光路外）
+//   lean：省算（默认开，config.perf.scenesB.sparkleSkip）。2026-10-02 加，结果逐像素不变：超过 fadeEnd 的像素 fade 正好是 0，
+//     单颗闪点乘 0，只算统计补偿；两级网格混合时小数部分正好是 0（近处 levelFloat 被夹在 0）就不算第二级（mix( a, b, 0 ) 就是 a）。
+//     关掉时 active 也不起作用，和原来一样每个像素都算两级
 export function sparkleLayer( settings ) {
 
 	const {
 		position, normal, viewDirection, lightDirection, lightColor,
 		density = float( 1 ), cellSize = 0.05, existProbability = 0.2, coneDegrees = 20, sharpness = 400,
 		intensity = 10, cellPixels = 6, radiusPixels = 0.8, levels = 2, seed = 1, fadeStart = 60, fadeEnd = 250,
-		time = null, twinkleRate = 2, footprintMode = 'max',
+		time = null, twinkleRate = 2, footprintMode = 'max', active = null, lean = true,
 	} = settings;
 
-	const prepared = {
-		position, normal, viewDirection, lightDirection, density, existProbability, sharpness, radiusPixels, seed, time, twinkleRate,
-		cellSize: float( cellSize ),
-		coneRadians: typeof coneDegrees === 'number' ? coneDegrees * Math.PI / 180 : coneDegrees.mul( Math.PI / 180 ),
-	};
+	// 包一层 Fn：里面要用 If（调用方在不在 Fn 里都行）
+	return Fn( () => {
 
-	// 像素足迹：这个像素在世界里覆盖多大。'max' 取长边（最稳，不走样）；'mean' 取长短边的几何平均（掠射角下格子不会大到横向几十个像素）
-	const pixelDx = dFdx( position );
-	const pixelDy = dFdy( position );
-	const footprint = max( max( length( pixelDx ), length( pixelDy ) ), 1e-5 );
-	const levelFootprint = footprintMode === 'mean' ? max( sqrt( length( pixelDx ).mul( length( pixelDy ) ) ), 1e-5 ) : footprint;
-	// 希望格子 ≈ cellPixels 个像素；近处不小于最细一级
-	const levelFloat = max( log2( levelFootprint.mul( cellPixels ).div( cellSize ) ), 0 );
+		// 像素足迹：这个像素在世界里覆盖多大。'max' 取长边（最稳，不走样）；'mean' 取长短边的几何平均（掠射角下格子不会大到横向几十个像素）。
+		// 屏幕导数在分支外先存成变量（分支里求导结果未定义）
+		const pixelDx = dFdx( position ).toVar();
+		const pixelDy = dFdy( position ).toVar();
+		const footprint = max( max( length( pixelDx ), length( pixelDy ) ), 1e-5 );
+		const levelFootprint = ( footprintMode === 'mean' ? max( sqrt( length( pixelDx ).mul( length( pixelDy ) ) ), 1e-5 ) : footprint ).toVar();
+		// 希望格子 ≈ cellPixels 个像素；近处不小于最细一级
+		const levelFloat = max( log2( levelFootprint.mul( cellPixels ).div( cellSize ) ), 0 ).toVar();
 
-	let sparkle;
-	if ( levels >= 2 ) {
+		const prepared = {
+			position, normal, viewDirection, lightDirection, density, existProbability, sharpness, radiusPixels, seed, time, twinkleRate,
+			cellSize: float( cellSize ),
+			coneRadians: typeof coneDegrees === 'number' ? coneDegrees * Math.PI / 180 : coneDegrees.mul( Math.PI / 180 ),
+		};
 
-		// 两级网格按小数部分混合，过渡时不会整片跳变
-		const levelLow = floor( levelFloat );
-		const blend = fract( levelFloat );
-		sparkle = mix( evaluateLevel( prepared, levelLow, levelFootprint, pixelDx, pixelDy ), evaluateLevel( prepared, levelLow.add( 1 ), levelFootprint, pixelDx, pixelDy ), blend );
+		// 60~250 米淡出；远处用"存在概率 × 密度 × 平均高光"的统计值补上，能量连续
+		const distance = length( position.sub( cameraPosition ) ).toVar();
+		const fade = float( 1 ).sub( smoothstep( fadeStart, fadeEnd, distance ) );
 
-	} else {
+		const sparkle = float( 0 ).toVar();
+		const evaluate = () => {
 
-		sparkle = evaluateLevel( prepared, floor( levelFloat.add( 0.5 ) ), levelFootprint, pixelDx, pixelDy );
+			if ( levels >= 2 ) {
 
-	}
+				// 两级网格按小数部分混合，过渡时不会整片跳变
+				const levelLow = floor( levelFloat );
+				const blend = fract( levelFloat );
+				const levelHigh = () => evaluateLevel( prepared, levelLow.add( 1 ), levelFootprint, pixelDx, pixelDy );
+				sparkle.assign( evaluateLevel( prepared, levelLow, levelFootprint, pixelDx, pixelDy ) );
+				const addHigh = () => {
 
-	// 60~250 米淡出；远处用"存在概率 × 密度 × 平均高光"的统计值补上，能量连续
-	const distance = length( position.sub( cameraPosition ) );
-	const fade = float( 1 ).sub( smoothstep( fadeStart, fadeEnd, distance ) );
-	const halfVector = normalize( lightDirection.add( viewDirection ) );
-	// 统计补偿：宽一点的高光瓣（指数 12）× 存在概率 × 密度；0.03 是"一格里闪点面积占比 × 平均闪亮程度"的经验值，
-	// 让 250 米处淡出后整片雪的平均亮度和近处闪点平均下来差不多
-	const averageGlint = pow( max( dot( normal, halfVector ), 0 ), 12 ).mul( max( dot( normal, lightDirection ), 0 ) )
-		.mul( density ).mul( existProbability ).mul( 0.03 );
+					sparkle.assign( mix( sparkle, levelHigh(), blend ) );
 
-	return vec3( lightColor ).mul( sparkle.mul( fade ).add( averageGlint.mul( fade.oneMinus() ) ) ).mul( intensity );
+				};
+				if ( lean ) If( blend.greaterThan( 0 ), addHigh );
+				else addHigh();
+
+			} else {
+
+				sparkle.assign( evaluateLevel( prepared, floor( levelFloat.add( 0.5 ) ), levelFootprint, pixelDx, pixelDy ) );
+
+			}
+
+		};
+
+		if ( lean ) If( active ? distance.lessThan( fadeEnd ).and( active ) : distance.lessThan( fadeEnd ), evaluate );
+		else evaluate();
+
+		const halfVector = normalize( lightDirection.add( viewDirection ) );
+		// 统计补偿：宽一点的高光瓣（指数 12）× 存在概率 × 密度；0.03 是"一格里闪点面积占比 × 平均闪亮程度"的经验值，
+		// 让 250 米处淡出后整片雪的平均亮度和近处闪点平均下来差不多
+		const averageGlint = pow( max( dot( normal, halfVector ), 0 ), 12 ).mul( max( dot( normal, lightDirection ), 0 ) )
+			.mul( density ).mul( existProbability ).mul( 0.03 );
+
+		return vec3( lightColor ).mul( sparkle.mul( fade ).add( averageGlint.mul( fade.oneMinus() ) ) ).mul( intensity );
+
+	} )();
 
 }

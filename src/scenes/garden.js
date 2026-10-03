@@ -12,16 +12,19 @@ import * as THREE from 'three/webgpu';
 import {
 	Fn, float, vec2, vec3, vec4, uniform, attribute, texture, color, select,
 	positionWorld, positionGeometry, normalGeometry, normalWorld, cameraPosition,
-	normalize, length, dot, max, min, mix, smoothstep, pow, abs, sin, cos, atan, floor, fract, reflect, fwidth, mod, Discard,
+	normalize, length, dot, max, min, mix, smoothstep, pow, abs, sin, cos, atan, floor, fract, reflect, fwidth, mod, Discard, If,
 } from 'three/tsl';
 import { reflector } from 'three/tsl';
 import { NodeUpdateType } from 'three/webgpu';
 import { monotoneCurve, resampleCurve, pointOnCurve } from '../core/route.js';
 import { createPetals } from '../tsl/petals.js';
-import { createGrass } from '../tsl/grass.js';
+import { createGrassField, buildGroundField, resolveRings, blendGround } from '../tsl/grass.js';
 import { blossomTemplate, instanceTrunks, blossomCards, createBlossomMaterial, createBarkMaterial } from '../tsl/blossom.js';
 import { hash33, jsFbm2D, createNoiseTextureData } from '../tsl/noise.js';
 import { daySkyColor } from '../tsl/sky.js';
+import { groundDetailInScene } from '../tsl/terrain.js';
+import { loadModel, disposeModel } from '../core/assets.js';
+import { isMeshInView, prepareMeshView } from '../core/camera.js';
 
 export const key = 'garden';
 
@@ -37,7 +40,10 @@ const state = {
 	layers: {},
 	reflectorNode: null,
 	reflectionPass: null,
+	reflectionCastle: null, // 倒影里换上的 lod1 城堡 { near: [大理石, 银顶], low: [大理石, 银顶] }（perf.scenesA.reflectionLod.garden）
+	flowers: null,          // 花圃（倒影里不画）
 	grass: null,
+	grassField: null,       // 草地图（高度、密度、法线，grass.js 的 buildGroundField）
 	petals: null,
 	trunks: null,
 	pool: null,
@@ -244,7 +250,13 @@ function updateIntro( time ) {
 // 城堡中心（地标）在局部 −z 约 331 米，水池从原点前 30 米伸到台基脚下；水池中轴在城堡中心的 x 上
 function buildLayout() {
 
-	const ctx = state.ctx;
+	return gardenLayout( state.ctx );
+
+}
+
+// 花园的布局（纯函数，不用等花园初始化：远景种树时要知道正式园林在哪、地面多高）
+export function gardenLayout( ctx ) {
+
 	const world = ctx.world;
 	const gardenConfig = ctx.config.garden;
 	const castle = world.toLocal( new THREE.Vector3().fromArray( world.locations[ key ].landmark ), key, new THREE.Vector3() );
@@ -277,7 +289,8 @@ function zoneAt( x, z ) {
 	if ( alongPool && across < layout.poolHalf ) return 'pool';
 	if ( alongPool && across < layout.poolHalf + layout.coping ) return 'coping';
 	if ( across < layout.plinthHalf && Math.abs( z - layout.castle.z ) < layout.plinthHalf ) return 'plinth';
-	if ( z > layout.poolStart && z < layout.poolStart + 12 && across < 26 ) return 'plaza';
+	// 出生点那块广场：±16 米（原来 ±26 米，出生点画面下三分之一全是灰色铺地，2026-10-02 审查 R21）
+	if ( z > layout.poolStart && z < layout.poolStart + 12 && across < 16 ) return 'plaza';
 	if ( alongPool && across < layout.pathOuter ) return 'path';
 	if ( alongPool && across > layout.bedInner && across < layout.bedOuter ) return 'bed';
 	return 'lawn';
@@ -288,7 +301,15 @@ function zoneAt( x, z ) {
 // 花园里是平的（局部 y = 0，草地有几厘米的起伏）；块的边上 30 米内接回远景画的高度
 function terrainHeightLocal( x, z ) {
 
-	const layout = state.layout;
+	return gardenGroundLocal( state.ctx, state.layout, x, z );
+
+}
+
+const groundPoint = new THREE.Vector3();
+
+// 花园地面高度（本地坐标、纯函数）：远景种在花园块里的树按它定树根（远景在块里被挖掉，画的是花园自己的地面）
+export function gardenGroundLocal( ctx, layout, x, z ) {
+
 	const rect = layout.rect;
 	const edge = Math.min( x - rect.minX, rect.maxX - x, z - rect.minZ, rect.maxZ - z );
 	let height = ( jsFbm2D( x / 13 + 2.1, z / 13 - 0.7, 3 ) - 0.5 ) * 0.12;
@@ -298,13 +319,47 @@ function terrainHeightLocal( x, z ) {
 	height += Math.max( 0, across - layout.gardenHalf ) * 0.02 * ( jsFbm2D( x / 40, z / 40, 2 ) );
 	if ( edge < 30 ) {
 
-		const [ worldX, worldZ ] = toWorldXZ( x, z );
-		const drawn = state.ctx.backdrop.getTerrainHeight( worldX, worldZ ) - originY();
+		const world = ctx.world;
+		const point = world.toWorld( groundPoint.set( x, 0, z ), key, groundPoint );
+		const drawn = ctx.backdrop.getTerrainHeight( point.x, point.z ) - world.locations[ key ].origin[ 1 ];
 		if ( Number.isFinite( drawn ) ) height += ( drawn - height ) * smoothJs( 30, 3, edge );
 
 	}
 
 	return height;
+
+}
+
+// 草地图（阶段 12 CP3 返工；grass.js 的 buildGroundField）：只有草地长草，步道、花圃、水池、池边、广场、台基不长，
+// 它们边上再让出 0.35 米（地图 0.5 米一格，双线性插值后草不会伸到石板上）
+async function buildGrassField() {
+
+	const layout = state.layout;
+	const lawnAt = ( x, z ) => zoneAt( x, z ) === 'lawn';
+	const margin = 0.35;
+	state.grassField = await buildGroundField( {
+		rect: layout.rect,
+		spacing: 0.5,
+		heightAt: terrainHeightLocal,
+		densityAt: ( x, z, slope ) => ( lawnAt( x, z ) && lawnAt( x + margin, z ) && lawnAt( x - margin, z ) && lawnAt( x, z + margin ) && lawnAt( x, z - margin ) ? 1 : 0 ) * smoothJs( 0.2, 0.07, slope ),
+		name: '花园草地图',
+		yieldToBrowser,
+	} );
+	state.disposables.push( ...state.grassField.textures );
+
+}
+
+// 草落地：块里用花园自己的草地图，块外用远景的（grass.js 的 blendGround）。
+// 正式花园（gardenHalf 以内）是修剪过的短草坪，往外渐渐变成长草甸
+function grassGroundAt( xz ) {
+
+	const layout = state.layout;
+	const across = abs( xz.x.sub( layout.axisX ) );
+	const lawnLength = state.ctx.config.garden.grass.lawnLength;
+	const ground = blendGround( state.grassField, state.ctx.backdrop, xz, mix( float( lawnLength ), float( 1 ), smoothstep( layout.gardenHalf - 12, layout.gardenHalf + 12, across ) ) );
+	// 出洞那几米（洞的内口往外 14 米以内）不长草：镜头贴着地面出洞，近处的草叶塞满洞口（2026-10-02 审查 R28）
+	if ( state.caveMouthLocal ) ground.density = ground.density.mul( smoothstep( 8, 16, length( xz.sub( vec2( state.caveMouthLocal.x, state.caveMouthLocal.z ) ) ) ) );
+	return ground;
 
 }
 
@@ -478,16 +533,60 @@ function createTerrainMaterial( noiseTexture ) {
 		const stone = mix( color( '#e4dccd' ), color( '#d6ccbb' ), texture( noiseTexture, point.xz.div( 3.3 ) ).r ).mul( float( 1 ).sub( joint.mul( 0.25 ) ) );
 		const isPath = alongPool.and( across.lessThan( layout.pathOuter ) );
 		const isBed = alongPool.and( across.greaterThan( layout.bedInner ) ).and( across.lessThan( layout.bedOuter ) );
-		const isPlaza = point.z.greaterThan( layout.poolStart ).and( point.z.lessThan( layout.poolStart + 12 ) ).and( across.lessThan( 26 ) );
-		const albedo = select( isPath.or( isPlaza ), stone, select( isBed, bedGround, lawn ) ).toVar();
+		const isPlaza = point.z.greaterThan( layout.poolStart ).and( point.z.lessThan( layout.poolStart + 12 ) ).and( across.lessThan( 16 ) );
+		// 广场：嵌花地面（审查 R21：出生点画面下三分之一是一大块平整的灰色铺地）。淡粉的砂岩底上嵌白大理石的八角星
+		// （两个正方形叠一起，和拱门四周墙上的八角星纹样同一个形），星外一圈细的深色描边，格角一个小菱形；1.8 米一格，从池头往外排
+		const inlayTile = vec2( point.x.sub( layout.axisX ), point.z.sub( layout.poolStart ) ).div( 1.8 );
+		const inlayLocal = fract( inlayTile ).sub( 0.5 );
+		const starDistance = min( max( abs( inlayLocal.x ), abs( inlayLocal.y ) ), max( abs( inlayLocal.x.add( inlayLocal.y ) ), abs( inlayLocal.x.sub( inlayLocal.y ) ) ).mul( 0.7071 ) );
+		const cornerLocal = fract( inlayTile.add( 0.5 ) ).sub( 0.5 );
+		const cornerDistance = abs( cornerLocal.x ).add( abs( cornerLocal.y ) );
+		// 按屏幕导数软边（远处线条细于一个像素时淡掉，不闪）
+		const inlayBlur = max( fwidth( starDistance ), 0.004 );
+		const starFill = smoothstep( inlayBlur, inlayBlur.negate(), starDistance.sub( 0.27 ) );
+		const starLine = smoothstep( inlayBlur.add( 0.012 ), float( 0.012 ).sub( inlayBlur ), abs( starDistance.sub( 0.27 ) ) );
+		const diamond = smoothstep( inlayBlur, inlayBlur.negate(), cornerDistance.sub( 0.11 ) );
+		const sandstone = mix( color( '#e2c3b3' ), color( '#d6b09f' ), texture( noiseTexture, point.xz.div( 4.1 ) ).r );
+		const inlayMarble = mix( color( '#f8f1e4' ), color( '#efe5d4' ), fine );
+		const inlay = mix( mix( sandstone, inlayMarble, max( starFill, diamond ) ), color( '#b07e6e' ), starLine.mul( smoothstep( 0.05, 0.02, inlayBlur ) ).mul( 0.6 ) );
+		const albedo = select( isPlaza, inlay, select( isPath, stone, select( isBed, bedGround, lawn ) ) ).toVar();
 		// 地上的落花（草地、花圃上）
 		const petalSpot = smoothstep( 0.74, 0.8, texture( noiseTexture, point.xz.div( 0.8 ) ).r ).mul( select( isPath.or( isPlaza ), float( 0.35 ), float( 1 ) ) ).mul( uniforms.groundPetals );
 		albedo.assign( mix( albedo, color( '#fbe9ef' ), petalSpot.mul( 0.75 ) ) );
 		// 石板地面带一点天空的反光（清晨潮湿）
 		const toViewer = normalize( cameraPosition.sub( point ) );
 		const fresnel = pow( float( 1 ).sub( max( dot( normal, toViewer ), 0 ) ), 5 );
-		const wet = select( isPath.or( isPlaza ), skyReflection( reflect( toViewer.negate(), normal ) ).mul( fresnel.mul( 0.35 ) ), vec3( 0 ) );
-		const lit = state.ctx.backdrop.worldLighting( albedo, normal, point, { skyView: float( 0.95 ), wrap: 0.2 } );
+		// 广场的反光淡一点（原来整块被天空映成冷灰蓝）
+		const wet = select( isPath.or( isPlaza ), skyReflection( reflect( toViewer.negate(), normal ) ).mul( fresnel.mul( select( isPlaza, float( 0.15 ), float( 0.35 ) ) ) ), vec3( 0 ) );
+		let lightingNormal = normal;
+		// 近处的真贴图（和远景同一套，阶段 12 CP3）：草坪按草甸、花圃底下按林地，石板路和广场不加
+		const ground = state.ctx.backdrop.getGround();
+		if ( ground ) {
+
+			const soil = select( isPath.or( isPlaza ), float( 0 ), float( 1 ) );
+			const bed = select( isBed, float( 1 ), float( 0 ) );
+			const detail = groundDetailInScene( ground, state.ctx.backdrop.getSceneToWorld(), {
+				point, normal, weights: vec4( float( 1 ).sub( bed ), bed, 0, 0 ), near: state.ctx.backdrop.getGroundNear(), cameraPoint: cameraPosition,
+			} );
+			albedo.assign( albedo.mul( mix( vec3( 1 ), detail.shade, soil ) ) );
+			lightingNormal = normalize( mix( normal, detail.normal, soil ) );
+
+		}
+
+		// 正式花园外面的草地和远景接上（原来块边上一条直线：块里亮绿，块外是远景的花海和山谷里的天光遮蔽）：
+		// 天光遮蔽取远景同一张地表图；远景画花海的地方这里也撒一层白、粉、淡紫的碎点（离中轴越远越接近远景）
+		const biome = state.ctx.backdrop.groundBiomeAt( point );
+		const blockEdge = min( min( point.x.sub( layout.rect.minX ), float( layout.rect.maxX ).sub( point.x ) ), min( point.z.sub( layout.rect.minZ ), float( layout.rect.maxZ ).sub( point.z ) ) );
+		const outerLawn = max( smoothstep( layout.gardenHalf - 10, layout.gardenHalf + 30, across ), smoothstep( 120, 30, blockEdge ) ).mul( select( isPath.or( isPlaza ).or( isBed ), float( 0 ), float( 1 ) ) );
+		const flowerHue = texture( noiseTexture, point.xz.div( 1.7 ) ).g;
+		const flowerTint = mix( mix( color( '#f5c6d6' ), color( '#d9c8f0' ), smoothstep( 0.35, 0.65, flowerHue ) ), color( '#fbf6f0' ), smoothstep( 0.62, 0.85, flowerHue ) );
+		const flowerField = biome.b.mul( smoothstep( 0.35, 0.7, patch.mul( 0.7 ).add( fine.mul( 0.3 ) ) ) ).mul( 0.3 ).mul( outerLawn );
+		albedo.assign( mix( albedo, flowerTint, flowerField ) );
+		const groundSkyView = mix( float( 0.95 ), biome.a, outerLawn );
+		// 草根融合（阶段 12 CP3 返工）：草的近环里草坪往草根色压，草缝里是暗的草根
+		// 密度用回调传：草的半径外不取（省两张草地图的取样）
+		if ( state.grass && state.grassField ) albedo.assign( state.grass.underlay( albedo, point.xz, () => grassGroundAt( point.xz ).density ) );
+		const lit = state.ctx.backdrop.worldLighting( albedo, lightingNormal, point, { skyView: groundSkyView, wrap: 0.2 } );
 		return state.ctx.backdrop.worldAtmosphere( lit.add( wet ), point );
 
 	} )();
@@ -667,7 +766,9 @@ function buildCastleGeometry() {
 
 // 大理石：白里带一点暖，灰蓝色的细脉（规格书的 1 − |sin(x·f + fbm·6)|^0.2）；包裹光照 + 背光时暖色透光 + 一点天空反光；
 // 饰带和拱门框上是八角星的嵌花（θ 按 2π/8 折叠，规格书 10.2），拱龛暗、门洞深
-function createMarbleMaterial( noiseTexture ) {
+// fromModel：城堡是 Taj mahal 模型（scripts/blender/taj-castle.py）。模型带烘好的 AO（顶点色 r）：凹进去的拱门、檐下、塔脚
+// 暗一些、往冷里染（拱门内部偏冷，规格书 10.2）；部件号 part 5 是台基（偏暖）。程序化兜底的城堡没有 AO，按原来的做法
+function createMarbleMaterial( noiseTexture, fromModel = false ) {
 
 	const uniforms = state.uniforms;
 	const castle = state.layout.castle;
@@ -714,8 +815,19 @@ function createMarbleMaterial( noiseTexture ) {
 		albedo.assign( select( inlay, mix( albedo, color( '#b9c2cf' ), inlayLine.mul( 0.7 ) ), albedo ) );
 		// 拱龛：暗一档、冷一点（凹进去的地方天光少）；门洞：深，里面有一点暖光
 		albedo.assign( select( part.greaterThan( 1.5 ).and( part.lessThan( 2.5 ) ), albedo.mul( vec3( 0.7, 0.72, 0.78 ) ), albedo ) );
-		const door = part.greaterThan( 3.5 );
+		// 门洞是 4（模型的台基是 5，不是门）
+		const door = part.greaterThan( 3.5 ).and( part.lessThan( 4.5 ) );
 		albedo.assign( select( door, color( '#2b2623' ), albedo ) );
+		// 台基（part 5）的 AO 减半：台基外墙一排排浅拱龛烘出来整面偏暗，背光时成了一堵棕墙
+		const occlusion = fromModel ? mix( attribute( 'color', 'vec4' ).r, float( 1 ), select( part.greaterThan( 4.5 ), float( 0.55 ), float( 0 ) ) ) : float( 1 );
+		if ( fromModel ) {
+
+			// 台基偏暖；上暖下冷的绘本渐变（顶上被晨光染暖、脚下带一点天的灰蓝）；凹处偏冷偏暗
+			albedo.assign( select( part.greaterThan( 4.5 ), albedo.mul( vec3( 1.02, 0.99, 0.95 ) ), albedo ) );
+			albedo.mulAssign( mix( vec3( 0.95, 0.97, 1.02 ), vec3( 1.02, 1.0, 0.97 ), smoothstep( 4, 60, local.y ) ) );
+			albedo.assign( mix( albedo.mul( vec3( 0.74, 0.8, 0.93 ) ), albedo, smoothstep( 0.25, 0.9, occlusion ) ) );
+
+		}
 
 		// 光照：包裹光照（同雪的做法，大理石的温润感）+ 天空反光（光滑，菲涅尔）+ 背光透出来的暖色（太阳在城堡背后）
 		// 天光按方向分：清晨朝太阳那边的天是暖亮的（sunHorizon），背着太阳的是地影的灰蓝（earthShadow），头顶是天顶色；
@@ -727,7 +839,8 @@ function createMarbleMaterial( noiseTexture ) {
 		const up = max( normalSky.y, 0 );
 		const skyLight = mix( sideSky, sky.zenithColor.mul( 1.1 ), up ).mul( sky.skyIntensity ).mul( float( 1 ).sub( max( normalSky.y.negate(), 0 ).mul( 0.6 ) ) ).mul( 0.95 );
 		const direct = state.ctx.backdrop.worldLighting( albedo, normal, point, { skyView: float( 0 ), wrap: 0.4 } );
-		const lit = albedo.mul( skyLight ).add( direct ).toVar();
+		// AO 只压天光（直射光有地形阴影管）；凹处也不是死黑，留四成
+		const lit = albedo.mul( skyLight ).mul( occlusion.mul( 0.6 ).add( 0.4 ) ).add( direct.mul( occlusion.mul( 0.35 ).add( 0.65 ) ) ).toVar();
 		const fresnel = float( 0.03 ).add( pow( float( 1 ).sub( max( dot( normal, toViewer ), 0 ) ), 5 ).mul( 0.3 ) );
 		const glossy = skyReflection( reflect( toViewer.negate(), normal ) ).mul( fresnel ).mul( select( door, float( 0 ), float( 1 ) ) );
 		const viewWorld = state.ctx.backdrop.sceneDirectionToWorld( toViewer.negate() );
@@ -744,7 +857,7 @@ function createMarbleMaterial( noiseTexture ) {
 }
 
 // 银顶：金属，颜色就是反射方向上的天空（带太阳圆盘，太阳升到山口上面时顶上一点亮光），粗糙度 0.2 左右用往天空平均色混一点代替
-function createSilverMaterial() {
+function createSilverMaterial( fromModel = false ) {
 
 	const sky = state.ctx.world.uniforms;
 	const material = new THREE.MeshBasicNodeMaterial();
@@ -762,11 +875,79 @@ function createSilverMaterial() {
 		const facing = max( dot( normal, toViewer ), 0 );
 		// 金属的菲涅尔：正对时是本色（银 0.95），掠射时接近白
 		const tint = mix( color( '#dfe6ef' ), color( '#ffffff' ), pow( float( 1 ).sub( facing ), 5 ) );
-		const surface = mix( mirror, average, 0.22 ).mul( tint ).mul( state.uniforms.silverAmount ).add( state.ctx.backdrop.worldLighting( color( '#9aa3b0' ), normal, point, { wrap: 0.3 } ).mul( float( 1 ).sub( state.uniforms.silverAmount ) ) );
+		// 模型带 AO：凉亭小穹顶的根部、塔顶凉亭里面暗一些
+		const occlusion = fromModel ? attribute( 'color', 'vec4' ).r.mul( 0.55 ).add( 0.45 ) : float( 1 );
+		const surface = mix( mirror, average, 0.22 ).mul( tint ).mul( state.uniforms.silverAmount ).add( state.ctx.backdrop.worldLighting( color( '#9aa3b0' ), normal, point, { wrap: 0.3 } ).mul( float( 1 ).sub( state.uniforms.silverAmount ) ) ).mul( occlusion );
 		return state.ctx.backdrop.worldAtmosphere( surface, point );
 
 	} )();
 	return material;
+
+}
+
+// ===================== 城堡模型（阶段 12 CP3 返工）=====================
+// Taj mahal（Gokul.Saravanappriyan，CC BY 4.0）：hi 档用近处那一级（约 25 万三角），其余档用中档（约 6 万）。
+// 模型里两个网格：大理石（部件号 _part：0 主体、1 台基、2 宣礼塔）、银顶。没读到返回 null，用程序化的城堡兜底
+async function loadTajCastle( content ) {
+
+	const id = content === 'hi' ? 'taj-castle' : 'taj-castle-lod1';
+	const model = await loadModel( 'models', id );
+	if ( ! model ) {
+
+		console.warn( `花园：城堡模型 ${ id } 没读到，用程序化的城堡兜底` );
+		return null;
+
+	}
+
+	model.updateMatrixWorld( true );
+	let marble = null;
+	let silver = null;
+	model.traverse( ( child ) => {
+
+		if ( ! child.isMesh ) return;
+		// 模型是 meshopt 量化过的（KHR_mesh_quantization：位置、法线、顶点色是归一化的整数，反量化的缩放在节点矩阵里），
+		// 直接 applyMatrix4 会被夹回 ±1（整座城堡缩成 2 米的盒子）：先全部转成 32 位浮点再变换
+		const geometry = new THREE.BufferGeometry();
+		for ( const [ name, source ] of Object.entries( child.geometry.attributes ) ) {
+
+			const values = new Float32Array( source.count * source.itemSize );
+			for ( let i = 0; i < source.count; i ++ ) for ( let k = 0; k < source.itemSize; k ++ ) values[ i * source.itemSize + k ] = source.getComponent( i, k );
+			geometry.setAttribute( name, new THREE.BufferAttribute( values, source.itemSize ) );
+
+		}
+
+		if ( child.geometry.index ) geometry.setIndex( new THREE.BufferAttribute( new Uint32Array( child.geometry.index.array ), 1 ) );
+		geometry.applyMatrix4( child.matrixWorld );
+		if ( ! geometry.getAttribute( 'color' ) ) {
+
+			console.warn( `花园：城堡模型 ${ id } 的网格「${ child.name }」没有 AO 顶点色，按 1 算` );
+			geometry.setAttribute( 'color', new THREE.BufferAttribute( new Float32Array( geometry.attributes.position.count * 4 ).fill( 1 ), 4 ) );
+
+		}
+
+		// 部件号：模型里 1 台基 → 着色器的 5（偏暖），主体、宣礼塔 → 0（着色器里 2~4 是程序化城堡的拱龛、嵌花、门洞）
+		const source = geometry.getAttribute( '_part' );
+		const part = new Float32Array( geometry.attributes.position.count );
+		if ( source ) for ( let i = 0; i < part.length; i ++ ) part[ i ] = Math.round( source.getX( i ) ) === 1 ? 5 : 0;
+		geometry.setAttribute( 'part', new THREE.BufferAttribute( part, 1 ) );
+		if ( /银/.test( child.material && child.material.name || '' ) ) silver = geometry;
+		else marble = geometry;
+
+	} );
+	disposeModel( model );
+	if ( ! marble || ! silver ) {
+
+		console.warn( `花园：城堡模型 ${ id } 里没有分开的大理石和银顶，用程序化的城堡兜底` );
+		if ( marble ) marble.dispose();
+		if ( silver ) silver.dispose();
+		return null;
+
+	}
+
+	marble.computeBoundingBox();
+	const size = marble.boundingBox.getSize( new THREE.Vector3() );
+	console.log( `花园：城堡模型 ${ id }，台基 ${ size.x.toFixed( 0 ) } × ${ size.z.toFixed( 0 ) } 米，${ ( ( marble.index ? marble.index.count : marble.attributes.position.count ) / 3 + ( silver.index ? silver.index.count : silver.attributes.position.count ) / 3 ).toFixed( 0 ) } 三角` );
+	return { marble, silver };
 
 }
 
@@ -827,15 +1008,27 @@ function createWaterMaterial( noiseTexture, useReflector ) {
 	material.colorNode = Fn( () => {
 
 		const point = positionGeometry;
-		const toViewer = normalize( cameraPosition.sub( point ) );
+		const skipHidden = state.ctx.config.perf.scenesA.skipHiddenShading;
+		// 分支前后都要用的量先落成变量（TSL 按第一次用到的位置生成代码，不落地的话会生成进 If 里面，If 外读到的是 0）
+		const toViewer = normalize( cameraPosition.sub( point ) ).toVar();
 		// 很轻的微波（无风的清晨）：两层噪声梯度慢慢漂；像素比波纹大时淡掉，远处是镜面
 		const footprint = max( length( fwidth( point ) ), 0.001 );
 		const drift = vec2( uniforms.time.mul( 0.021 ), uniforms.time.mul( - 0.013 ) );
 		const coarse = texture( noiseTexture, point.xz.div( 7 ).add( drift ) ).ba.sub( 0.5 ).mul( float( 1 ).sub( smoothstep( 0.3, 1.5, footprint ) ) );
 		const fine = texture( noiseTexture, point.xz.div( 1.9 ).sub( drift.mul( 2 ) ) ).ba.sub( 0.5 ).mul( float( 1 ).sub( smoothstep( 0.05, 0.25, footprint ) ) );
-		const gradient = coarse.mul( 0.035 ).add( fine.mul( 0.018 ) ).mul( uniforms.rippleAmount );
-		const normal = normalize( vec3( gradient.x.negate(), 1, gradient.y.negate() ) );
-		const reflection = skyReflection( reflect( toViewer.negate(), normal ), { sunDisc: true } ).toVar();
+		const gradient = coarse.mul( 0.035 ).add( fine.mul( 0.018 ) ).mul( uniforms.rippleAmount ).toVar();
+		const normal = normalize( vec3( gradient.x.negate(), 1, gradient.y.negate() ) ).toVar();
+		const reflected = reflect( toViewer.negate(), normal ).toVar();
+		const reflection = vec3( 0 ).toVar();
+		// If 的回调不能有返回值（TSL 会当成 return 语句），写成块
+		const skyPart = () => {
+
+			reflection.assign( skyReflection( reflected, { sunDisc: true } ) );
+
+		};
+		// 平面倒影开着（mirrorAmount = 1）时天空色乘 0 被盖掉，整段不算（perf.scenesA.skipHiddenShading；条件只看 uniform，整帧一致）
+		if ( mirror && skipHidden ) If( uniforms.mirrorAmount.lessThan( 0.999 ), skyPart );
+		else skyPart();
 		if ( mirror ) {
 
 			const mirrored = mirror.sample( mirror.uvNode.add( vec2( gradient.x, gradient.y ).mul( 0.35 ) ) ).rgb;
@@ -852,8 +1045,15 @@ function createWaterMaterial( noiseTexture, useReflector ) {
 		const cell = floor( point.xz.div( 0.45 ) );
 		const local = fract( point.xz.div( 0.45 ) ).sub( 0.5 );
 		const random = hash33( vec3( cell, 9 ) );
-		const petal = float( 1 ).sub( smoothstep( 0.7, 1, length( local.sub( random.xy.sub( 0.5 ).mul( 0.5 ) ).div( vec2( 0.16, 0.1 ) ) ) ) ).mul( select( random.z.lessThan( 0.05 ), float( 1 ), float( 0 ) ) ).mul( uniforms.floatingPetals );
-		surface.assign( mix( surface, shadeThin( color( '#fbeaf0' ), vec3( 0, 1, 0 ), point ), petal ) );
+		const petal = float( 1 ).sub( smoothstep( 0.7, 1, length( local.sub( random.xy.sub( 0.5 ).mul( 0.5 ) ).div( vec2( 0.16, 0.1 ) ) ) ) ).mul( select( random.z.lessThan( 0.05 ), float( 1 ), float( 0 ) ) ).mul( uniforms.floatingPetals ).toVar();
+		// 没花瓣的像素（95% 以上）不算花瓣的光照（mix 系数是 0，算了也被盖掉）；光照里只有 .level(0) 的采样，放进分支没问题
+		const petalPart = () => {
+
+			surface.assign( mix( surface, shadeThin( color( '#fbeaf0' ), vec3( 0, 1, 0 ), point ), petal ) );
+
+		};
+		if ( skipHidden ) If( petal.greaterThan( 0 ), petalPart );
+		else petalPart();
 		return state.ctx.backdrop.worldAtmosphere( surface, point );
 
 	} )();
@@ -875,14 +1075,17 @@ function cypressGeometry( random, height, radius ) {
 	for ( let row = 0; row <= rows; row ++ ) {
 
 		const along = row / rows;
-		// 柏树的剪影：底下 6% 是收进去的树干，往上是柱形，最后三成收成尖
-		const profile = along < 0.035 ? 0.14 : Math.pow( Math.min( 1, ( along - 0.035 ) / 0.07 ), 0.45 ) * Math.pow( Math.max( 0, 1 - Math.pow( along, 2.4 ) ), 0.75 );
+		// 柏树的剪影：意大利柏的叶子一直长到地面，底下是一圈圆鼓鼓的根部叶丛（六成粗、往上 15% 里长到全粗），往上是柱形，最后三成收成尖。
+		// 原来底下 3.5% 是细树干、再往上 7% 才长满，远看两头尖、悬在地上（2026-10-02 自查）
+		const base = Math.min( 1, along / 0.15 );
+		const profile = ( 0.62 + 0.38 * base * base * ( 3 - 2 * base ) ) * Math.pow( Math.max( 0, 1 - Math.pow( along, 2.4 ) ), 0.75 );
 		for ( let k = 0; k <= around; k ++ ) {
 
 			const angle = k / around * Math.PI * 2;
 			const lump = 0.78 + 0.44 * jsFbm2D( Math.cos( angle ) * 2.1 + seed, along * 11 + Math.sin( angle ) * 2.1, 3 );
 			const r = radius * profile * lump;
-			positions.push( Math.cos( angle ) * r, along * height + 0.4, Math.sin( angle ) * r );
+			// 底圈埋进地面 0.3 米（草地有几厘米的起伏，不能露缝）
+			positions.push( Math.cos( angle ) * r, along * height - 0.3, Math.sin( angle ) * r );
 			shades.push( 0.55 + 0.45 * along * lump );
 
 		}
@@ -919,7 +1122,9 @@ function buildCypressRows( random ) {
 
 		for ( const side of [ - 1, 1 ] ) {
 
-			const geometry = cypressGeometry( random, 12.5 + random() * 3, 1.15 + random() * 0.2 );
+			// 越往城堡越矮（近处 12.5~15.5 米，到池尾七成）：远处的柏树不把四座宣礼塔挡住（审查 R22），透视上池子也显得更长
+			const towardCastle = ( layout.poolStart - 4 - z ) / Math.max( 1, layout.poolStart - layout.poolEnd );
+			const geometry = cypressGeometry( random, ( 12.5 + random() * 3 ) * ( 1 - 0.3 * towardCastle ), 1.15 + random() * 0.2 );
 			geometry.translate( layout.axisX + side * gardenConfig.cypressOffset, groundHeight( layout.axisX + side * gardenConfig.cypressOffset, z ), z );
 			parts.push( geometry );
 
@@ -977,14 +1182,20 @@ function createCypressMaterial( noiseTexture ) {
 		const normal = normalize( normalGeometry ).toVar();
 		// 叶簇：法线按噪声梯度抖一抖，一团一团的；颜色深绿，往上、往外亮一点
 		const clump = texture( noiseTexture, vec2( atan( normal.z, normal.x ).mul( 1.3 ), point.y.div( 1.1 ) ) );
-		normal.assign( normalize( normal.add( vec3( clump.b.sub( 0.5 ), clump.a.sub( 0.5 ), clump.b.sub( clump.a ) ).mul( 0.9 ) ) ) );
+		// 再叠一层细的叶簇（约 0.35 米一簇）：原来只有大团，近处一整面光滑的绿像纸板（审查 R25）
+		const sprig = texture( noiseTexture, vec2( atan( normal.z, normal.x ).mul( 4.2 ), point.y.div( 0.35 ) ) );
+		normal.assign( normalize( normal.add( vec3( clump.b.sub( 0.5 ), clump.a.sub( 0.5 ), clump.b.sub( clump.a ) ).mul( 0.9 ) ).add( vec3( sprig.b.sub( 0.5 ), sprig.a.sub( 0.5 ), sprig.a.sub( sprig.b ) ).mul( 0.6 ) ) ) );
 		const shadeValue = attribute( 'foliageShade', 'float' );
-		const albedo = mix( color( '#1d3220' ), color( '#3b5f35' ), clump.r.mul( 0.5 ).add( shadeValue.mul( 0.5 ) ) ).mul( shadeValue.mul( 0.5 ).add( 0.6 ) );
-		const lit = state.ctx.backdrop.worldLighting( albedo, normal, point, { skyView: shadeValue, wrap: 0.5 } );
+		const albedo = mix( color( '#1d3220' ), color( '#3b5f35' ), clump.r.mul( 0.5 ).add( shadeValue.mul( 0.5 ) ) ).mul( shadeValue.mul( 0.5 ).add( 0.6 ) )
+			.mul( sprig.r.mul( 0.5 ).add( 0.75 ) );
+		// 天光多给一点（skyView 不低于 0.55）：清晨逆光时近处柏树原来几乎是纯黑的剪影（2026-10-02 审查 R25）
+		const lit = state.ctx.backdrop.worldLighting( albedo, normal, point, { skyView: max( shadeValue, 0.55 ), wrap: 0.5 } );
 		// 逆光时边缘透一点绿光
 		const toViewer = normalize( cameraPosition.sub( point ) );
 		const rim = pow( float( 1 ).sub( max( dot( normal, toViewer ), 0 ) ), 3 ).mul( pow( max( dot( state.ctx.backdrop.sceneDirectionToWorld( toViewer.negate() ), sky.sunDirection ), 0 ), 3 ) );
-		return state.ctx.backdrop.worldAtmosphere( lit.add( sky.sunLightColor.add( sky.glowColor.mul( sky.glowAmount.mul( sky.skyIntensity ) ) ).mul( color( '#9fcf7a' ) ).mul( rim.mul( 0.25 ) ) ), point );
+		// 叶子透光：整棵树朝太阳那半边都透一点黄绿（不只是边缘），逆光的柏树是发亮的一圈、里面透绿
+		const throughLeaves = pow( max( dot( state.ctx.backdrop.sceneDirectionToWorld( toViewer.negate() ), sky.sunDirection ), 0 ), 2 ).mul( shadeValue.mul( 0.5 ).add( 0.3 ) );
+		return state.ctx.backdrop.worldAtmosphere( lit.add( sky.sunLightColor.add( sky.glowColor.mul( sky.glowAmount.mul( sky.skyIntensity ) ) ).mul( color( '#86c272' ) ).mul( rim.mul( 0.25 ).add( throughLeaves.mul( 0.07 ) ) ) ), point );
 
 	} )();
 	return material;
@@ -1023,6 +1234,50 @@ function buildFlowerGeometry( random, density ) {
 		const first = positions.length / 3;
 		// kind：0~1 是花的颜色，2 是叶丛
 		const kind = leaf ? 2 : random();
+		for ( const [ cornerX, cornerY ] of corners ) {
+
+			positions.push( x + ( tangent.x * cornerX + bitangent.x * cornerY ) * size, y + ( tangent.y * cornerX + bitangent.y * cornerY ) * size, z + ( tangent.z * cornerX + bitangent.z * cornerY ) * size );
+			normals.push( normal.x, normal.y, normal.z );
+			flowerData.push( cornerX + 0.5, cornerY + 0.5, seed, kind );
+
+		}
+
+		indices.push( first, first + 1, first + 2, first, first + 2, first + 3 );
+		seed ++;
+
+	}
+
+	// 草坪上的花海（审查 R21："周围很多花和树"，原来花只有池边一窄条）：池边花圃外面到 95 米、出生点前后 60 米到台基，
+	// 按两层噪声成团（约三成的草坪），一团里一种主色；每平方米约 density × 0.16 朵（hi 约 2.6 朵），不长在步道、广场、台基上
+	const lawnCount = Math.round( 2 * 72 * ( length + 60 ) * 0.3 * density * 0.16 );
+	for ( let n = 0; n < lawnCount; n ++ ) {
+
+		let x = 0;
+		let z = 0;
+		let found = false;
+		let patchTone = 0;
+		for ( let attempt = 0; attempt < 6 && ! found; attempt ++ ) {
+
+			const side = random() < 0.5 ? - 1 : 1;
+			const across = layout.bedOuter + 2 + random() * ( 95 - layout.bedOuter - 2 );
+			z = layout.poolEnd + random() * ( length + 60 );
+			x = layout.axisX + side * across;
+			const patch = jsFbm2D( x / 32 + 4.2, z / 32 - 1.7, 3 ) * 0.7 + jsFbm2D( x / 9 - 3.1, z / 9 + 6.6, 2 ) * 0.3;
+			patchTone = jsFbm2D( x / 60 - 8.8, z / 60 + 2.4, 2 );
+			found = patch > 0.55 && zoneAt( x, z ) === 'lawn';
+
+		}
+
+		if ( ! found ) continue;
+		const leaf = random() < 0.3;
+		const y = groundHeight( x, z ) + ( leaf ? 0.08 + random() * 0.18 : 0.2 + random() * 0.35 );
+		normal.set( ( random() - 0.5 ) * ( leaf ? 2.2 : 1.2 ), 1, ( random() - 0.5 ) * ( leaf ? 2.2 : 1.2 ) ).normalize();
+		tangent.set( 1, 0, 0 ).cross( normal ).normalize();
+		bitangent.crossVectors( normal, tangent );
+		const size = leaf ? 0.2 + random() * 0.12 : 0.14 + random() * 0.12;
+		const first = positions.length / 3;
+		// 一团一种主色（花色 0~1 按大块噪声取，团里再抖一点）
+		const kind = leaf ? 2 : Math.min( 0.999, Math.max( 0, patchTone * 1.4 - 0.2 + ( random() - 0.5 ) * 0.15 ) );
 		for ( const [ cornerX, cornerY ] of corners ) {
 
 			positions.push( x + ( tangent.x * cornerX + bitangent.x * cornerY ) * size, y + ( tangent.y * cornerX + bitangent.y * cornerY ) * size, z + ( tangent.z * cornerX + bitangent.z * cornerY ) * size );
@@ -1186,19 +1441,52 @@ async function build( ctx ) {
 	state.disposables.push( terrainGeometry, terrainMaterial );
 
 	// 城堡
-	const castleGeometry = buildCastleGeometry();
-	const marbleMaterial = createMarbleMaterial( noiseTexture );
-	const silverMaterial = createSilverMaterial();
+	// 城堡：先读 Taj mahal 模型（已经是米、原点在台基底面中心），读不到用程序化的（按 castleScale 放大）
+	const tajModel = await loadTajCastle( content );
+	const castleGeometry = tajModel || buildCastleGeometry();
+	const marbleMaterial = createMarbleMaterial( noiseTexture, Boolean( tajModel ) );
+	const silverMaterial = createSilverMaterial( Boolean( tajModel ) );
+	const castleScale = tajModel ? 1 : gardenConfig.castleScale;
 	const castleMarble = new THREE.Mesh( castleGeometry.marble, marbleMaterial );
 	castleMarble.name = '城堡';
 	castleMarble.position.set( state.layout.castle.x, groundHeight( state.layout.castle.x, state.layout.castle.z ), state.layout.castle.z );
-	castleMarble.scale.setScalar( gardenConfig.castleScale );
+	castleMarble.scale.setScalar( castleScale );
+	castleMarble.frustumCulled = false;
 	const castleSilver = new THREE.Mesh( castleGeometry.silver, silverMaterial );
 	castleSilver.name = '银顶';
 	castleSilver.position.copy( castleMarble.position );
-	castleSilver.scale.setScalar( gardenConfig.castleScale );
+	castleSilver.scale.setScalar( castleScale );
+	castleSilver.frustumCulled = false;
 	scene.add( castleMarble, castleSilver );
 	state.disposables.push( castleGeometry.marble, castleGeometry.silver, marbleMaterial, silverMaterial );
+	// 倒影里的城堡（perf.scenesA.reflectionLod.garden）：hi 档主画面是近处级 25 万三角，倒影只有 960×600 还被微波打散，换中档那一级（约 6 万，
+	// 规格书 10.2）。同一个材质，平时藏着，倒影那一遍和城堡换着显示；别的档主画面本来就是这一级，不用另读
+	state.reflectionCastle = null;
+	if ( content === 'hi' && tajModel && state.reflectionScale > 0 && ctx.config.perf.scenesA.reflectionLod.garden ) {
+
+		const reflectionModel = await loadTajCastle( 'mid' );
+		if ( reflectionModel ) {
+
+			const marbleLow = new THREE.Mesh( reflectionModel.marble, marbleMaterial );
+			const silverLow = new THREE.Mesh( reflectionModel.silver, silverMaterial );
+			marbleLow.name = '城堡·倒影';
+			silverLow.name = '银顶·倒影';
+			for ( const mesh of [ marbleLow, silverLow ] ) {
+
+				mesh.position.copy( castleMarble.position );
+				mesh.frustumCulled = false;
+				mesh.visible = false;
+
+			}
+
+			scene.add( marbleLow, silverLow );
+			state.disposables.push( reflectionModel.marble, reflectionModel.silver );
+			state.reflectionCastle = { near: [ castleMarble, castleSilver ], low: [ marbleLow, silverLow ] };
+
+		}
+
+	}
+
 	await yieldToBrowser();
 
 	// 水池：水面（hi、mid 有平面倒影，规格书 10.3 的验收就是城堡完整清晰的倒影）+ 池边压顶（大理石）
@@ -1208,10 +1496,14 @@ async function build( ctx ) {
 	water.name = '倒影水池';
 	scene.add( water );
 	state.water = water;
+	// 倒影跳过用的水面分块（camera.js 的 prepareMeshView），在这里取好点，不放进第一帧
+	prepareMeshView( water );
 	const copingMeshes = poolGeometry.copingParts.map( ( geometry ) => {
 
 		const parts = new Float32Array( geometry.attributes.position.count ).fill( 0 );
 		geometry.setAttribute( 'part', new THREE.BufferAttribute( parts, 1 ) );
+		// 城堡用模型时大理石材质要读 AO 顶点色：池边没有 AO，刷一层 1（和城堡共用一个材质，不多编一份着色器）
+		if ( tajModel ) geometry.setAttribute( 'color', new THREE.BufferAttribute( new Float32Array( geometry.attributes.position.count * 4 ).fill( 1 ), 4 ) );
 		const mesh = new THREE.Mesh( geometry, marbleMaterial );
 		mesh.name = '池边';
 		scene.add( mesh );
@@ -1226,14 +1518,20 @@ async function build( ctx ) {
 		state.reflectionPass = () => {
 
 			if ( ! state.ready || ! state.reflectorNode || state.uniforms.mirrorAmount.value < 0.5 ) return;
-			state.water.visible = false;
+			// 水面不在视锥里（转身背对水面）这一帧不画倒影（camera.js 的 isMeshInView）
+			if ( ! isMeshInView( ctx.camera, state.water ) ) return;
+			state.reflectorNode.reflector.resolutionScale = reflectionResolution();
+			const restore = enterReflection();
+			// 花树在倒影里只画倒影可能落进池面的那些（见下面 reflectWater）
+			if ( state.locationTrees ) state.locationTrees.setReflection( true );
 			try {
 
 				state.reflectorNode.reflector.updateBefore( { scene: state.scene, camera: ctx.camera, renderer: ctx.renderer, material: waterMaterial } );
 
 			} finally {
 
-				state.water.visible = true;
+				restore();
+				if ( state.locationTrees ) state.locationTrees.setReflection( false );
 
 			}
 
@@ -1258,64 +1556,91 @@ async function build( ctx ) {
 	flowers.name = '花圃';
 	flowers.frustumCulled = false;
 	scene.add( flowers );
+	state.flowers = flowers;
 	state.disposables.push( flowerBuild.geometry, flowerMaterial );
 	await yieldToBrowser();
 
-	// 开花的树
-	const templateRandom = createRandom( 9091 );
-	const templates = [];
-	for ( let i = 0; i < 4; i ++ ) templates.push( blossomTemplate( templateRandom, { height: 1.45 } ) );
+	// 开花的树：和远景花树同一套樱花模型（backdrop.createLocationBlossoms；2026-10-02 用户："这种树全部换掉"——
+	// 原来 tsl/blossom.js 的直棍树枝 + 散开的星形小花）。种在花园本地坐标，换成世界坐标交给远景画；模型读不到退回原来的程序化花树
 	const trees = plantBlossomTrees( createRandom( 3031 ) );
-	const barkMaterial = createBarkMaterial( { noiseTexture, shade, name: '花树干' } );
-	const trunks = instanceTrunks( templates, trees, barkMaterial, '花树干' );
-	for ( const mesh of trunks.meshes ) scene.add( mesh );
-	state.trunks = trunks.meshes;
-	state.disposables.push( barkMaterial, ...trunks.geometries );
-	const cardRatio = content === 'hi' ? 1 : ( content === 'mid' ? 0.75 : 0.55 );
-	const blossom = blossomCards( trees, templates, {
-		random: createRandom( 4413 ),
-		perCluster: ( tree ) => gardenConfig.cardsPerCluster * cardRatio * ( tree.distance < 60 ? 1 : 0.7 ),
-		sizeScale: ( tree ) => ( tree.distance < 60 ? 1.1 : 1.3 ),
-	} );
-	const blossomMaterial = createBlossomMaterial( {
-		time: state.uniforms.time,
-		windAmount: state.uniforms.windAmount,
-		shadeThin,
-		colors: { heart: '#e59ab1', inner: '#fadbe5', outer: '#ffffff' },
-		name: '花树的花',
-	} );
-	const blossoms = new THREE.Mesh( blossom.geometry, blossomMaterial );
-	blossoms.name = '花树的花';
-	blossoms.frustumCulled = false;
-	scene.add( blossoms );
-	state.disposables.push( blossom.geometry, blossomMaterial );
+	const worldPoint = new THREE.Vector3();
+	// 池面的倒影（有平面倒影时）：倒影平面的世界高度、池面的范围（沿中轴一段胶囊，半径是水面网格的半宽），哪些花树的倒影会落进池面由 trees.js
+	// 按镜头位置算（站在池边往对岸看，对岸一百米外的花树树冠也会倒映在池里，不能按离中轴多远一刀切）；slack 是微波把倒影采样错开的最大角度
+	const pool = state.layout;
+	const reflectWater = state.reflectorNode ? { level: ctx.world.toWorld( worldPoint.set( 0, pool.waterLevel, 0 ), key, worldPoint ).y, capsules: [], slack: ctx.config.perf.trees.reflectSlack.garden * Math.PI / 180 } : null;
+	if ( reflectWater ) {
 
-	// 草：只长在草地上（步道、花圃、水池、广场、台基没有）
-	const layout = state.layout;
+		const start = ctx.world.toWorld( worldPoint.set( pool.axisX, 0, pool.poolStart ), key, new THREE.Vector3() );
+		const end = ctx.world.toWorld( worldPoint.set( pool.axisX, 0, pool.poolEnd ), key, new THREE.Vector3() );
+		reflectWater.capsules.push( { ax: start.x, az: start.z, bx: end.x, bz: end.z, radius: pool.poolHalf + 0.2 } );
+
+	}
+
+	const locationTrees = await ctx.backdrop.createLocationBlossoms( trees.map( ( tree ) => {
+
+		ctx.world.toWorld( worldPoint.set( tree.x, tree.y, tree.z ), key, worldPoint );
+		// 樱花模型约 9 米高，花园的花树 5~7 米
+		return { x: worldPoint.x, y: worldPoint.y, z: worldPoint.z, size: tree.scale * gardenConfig.blossomTreeSize, yaw: tree.yaw, tint: ( tree.template + 0.5 ) / 4 };
+
+	} ), { near: content === 'hi' ? 700 : 420, colors: gardenConfig.blossomColors, name: '花园的花树', reflectWater } );
+	let blossoms = null;
+	if ( locationTrees ) {
+
+		state.locationTrees = locationTrees;
+		state.trunks = [];
+
+	} else {
+
+		const templateRandom = createRandom( 9091 );
+		const templates = [];
+		for ( let i = 0; i < 4; i ++ ) templates.push( blossomTemplate( templateRandom, { height: 1.45 } ) );
+		const barkMaterial = createBarkMaterial( { noiseTexture, shade, name: '花树干' } );
+		const trunks = instanceTrunks( templates, trees, barkMaterial, '花树干' );
+		for ( const mesh of trunks.meshes ) scene.add( mesh );
+		state.trunks = trunks.meshes;
+		state.disposables.push( barkMaterial, ...trunks.geometries );
+		const cardRatio = content === 'hi' ? 1 : ( content === 'mid' ? 0.75 : 0.55 );
+		const blossom = blossomCards( trees, templates, {
+			random: createRandom( 4413 ),
+			perCluster: ( tree ) => gardenConfig.cardsPerCluster * cardRatio * ( tree.distance < 60 ? 1 : 0.7 ),
+			sizeScale: ( tree ) => ( tree.distance < 60 ? 1.1 : 1.3 ),
+		} );
+		const blossomMaterial = createBlossomMaterial( {
+			time: state.uniforms.time,
+			windAmount: state.uniforms.windAmount,
+			shadeThin,
+			colors: { heart: '#e59ab1', inner: '#fadbe5', outer: '#ffffff' },
+			name: '花树的花',
+		} );
+		blossoms = new THREE.Mesh( blossom.geometry, blossomMaterial );
+		blossoms.name = '花树的花';
+		blossoms.frustumCulled = false;
+		scene.add( blossoms );
+		state.disposables.push( blossom.geometry, blossomMaterial );
+
+	}
+
+	// 草（阶段 12 CP3 返工：三环，规格书 10.2）：只长在草地上（步道、花圃、水池、广场、台基没有）
+	await buildGrassField();
+	// 洞的内口（局部）：草图要用，buildIntro 在后面才建
+	state.caveMouthLocal = ctx.world.toLocal( ctx.world.cave.at( ctx.world.cave.length, {} ).position.clone(), key, new THREE.Vector3() );
 	const grassConfig = gardenConfig.grass;
-	state.grass = createGrass( {
-		radius: grassConfig.radius,
-		spacing: grassConfig.spacing[ content ] || grassConfig.spacing.mid,
-		height: grassConfig.height,
-		width: grassConfig.width,
-		field: ( xz ) => {
-
-			const across = abs( xz.x.sub( layout.axisX ) );
-			const alongPool = xz.y.lessThanEqual( layout.poolStart ).and( xz.y.greaterThanEqual( layout.poolEnd ) );
-			const blocked = alongPool.and( across.lessThan( layout.pathOuter + 0.3 ) )
-				.or( alongPool.and( across.greaterThan( layout.bedInner - 0.2 ) ).and( across.lessThan( layout.bedOuter + 0.2 ) ) )
-				.or( xz.y.greaterThan( layout.poolStart ).and( xz.y.lessThan( layout.poolStart + 12 ) ).and( across.lessThan( 26.3 ) ) )
-				.or( across.lessThan( layout.plinthHalf + 0.5 ).and( abs( xz.y.sub( layout.castle.z ) ).lessThan( layout.plinthHalf + 0.5 ) ) );
-			const inside = abs( xz.x ).lessThan( layout.rect.maxX - 20 ).and( xz.y.greaterThan( layout.rect.minZ + 20 ) ).and( xz.y.lessThan( layout.rect.maxZ - 20 ) );
-			return vec2( float( 0 ), select( blocked.or( inside.not() ), float( 0 ), float( 0.95 ) ) );
-
-		},
-		colors: { base: '#3c5a2b', tip: '#a3bf6a', dry: '#c2bb80' },
-		wind: [ 0.2, - 0.98 ],
-		shade: shadeThin,
+	state.grass = createGrassField( {
 		name: '花园的草',
+		rings: resolveRings( ctx.config.grassField, content, grassConfig ),
+		bladeLength: grassConfig.length,
+		bladeWidth: grassConfig.width,
+		ground: grassGroundAt,
+		field: state.grassField,
+		palette: ctx.config.grassField.palette,
+		groundColor: grassConfig.groundColor,
+		dryAmount: grassConfig.dry,
+		lighting: ( albedo, normal, point, toViewer, extra ) => ctx.backdrop.worldLightingThin( albedo, normal, point, toViewer, extra ),
+		atmosphere: ( surface, point ) => ctx.backdrop.worldAtmosphere( surface, point ),
+		wind: grassConfig.wind,
+		seed: 2,
 	} );
-	scene.add( state.grass.mesh );
+	scene.add( state.grass.group );
 
 	// 飘落的花瓣
 	const petalConfig = gardenConfig.petals;
@@ -1349,8 +1674,8 @@ async function build( ctx ) {
 		银顶反射: state.uniforms.silverAmount,
 		柏树: visibility( cypress ),
 		花圃: visibility( flowers ),
-		花树: visibility( blossoms, ...state.trunks ),
-		草: state.grass.uniforms.amount,
+		花树: state.locationTrees ? state.locationTrees.toggle : visibility( blossoms, ...state.trunks ),
+		...state.grass.layers(),
 		飘落花瓣: state.petals.uniforms.amount,
 		漂浮花瓣: state.uniforms.floatingPetals,
 		地上落花: state.uniforms.groundPetals,
@@ -1360,7 +1685,7 @@ async function build( ctx ) {
 	};
 
 	state.ready = true;
-	console.log( `花园：建好了，用时 ${ ( performance.now() - started ).toFixed( 0 ) } ms；花圃 ${ flowerBuild.flowers } 朵、花树 ${ trees.length } 棵（花枝卡片 ${ blossom.cards } 张）、草 ${ state.grass.blades } 根、倒影 ${ state.reflectionScale > 0 ? state.reflectionScale + ' 倍分辨率' : '关' }` );
+	console.log( `花园：建好了，用时 ${ ( performance.now() - started ).toFixed( 0 ) } ms；花圃 ${ flowerBuild.flowers } 朵、花树 ${ trees.length } 棵（${ state.locationTrees ? "樱花模型" : "程序化" }）、草 ${ state.grass.blades } 根（三环 ${ state.grass.counts.inner } / ${ state.grass.counts.outer } / ${ state.grass.counts.far }）、倒影 ${ state.reflectionScale > 0 ? state.reflectionScale + ' 倍分辨率' : '关' }` );
 	return { scene };
 
 }
@@ -1373,7 +1698,8 @@ export async function compile() {
 	const reflectorObject = state.reflectorNode.reflector;
 	const virtualCamera = reflectorObject.getVirtualCamera( ctx.camera );
 	const target = reflectorObject.getRenderTarget( virtualCamera );
-	state.water.visible = false;
+	// 和倒影那一遍画的东西一样（城堡换 lod1、草和花圃不画）：倒影目标上只编真会画的
+	const restore = enterReflection();
 	let jobs;
 	try {
 
@@ -1384,11 +1710,67 @@ export async function compile() {
 
 	} finally {
 
-		state.water.visible = true;
+		restore();
 
 	}
 
 	await Promise.all( jobs );
+
+}
+
+// 倒影那一遍要换掉的东西：水面自己不画；perf.scenesA.reflectionCull 开着时草和花圃不画（眼睛离水约 2 米，花圃、草坪的反射交点
+// 横距 = 物体横距 × 2 / (2.35 + 物高)，都落在池子外面，池边压顶的上沿也挡着），关着时草照旧画三成；城堡换 lod1。返回还原函数
+function enterReflection() {
+
+	const cull = state.ctx.config.perf.scenesA.reflectionCull;
+	const saved = [];
+	const hide = ( object ) => {
+
+		saved.push( [ object, object.visible ] );
+		object.visible = false;
+
+	};
+	hide( state.water );
+	if ( cull ) {
+
+		if ( state.grass ) hide( state.grass.group );
+		if ( state.flowers ) hide( state.flowers );
+
+	} else if ( state.grass ) {
+
+		state.grass.beginReflection();
+
+	}
+
+	if ( state.reflectionCastle ) {
+
+		state.reflectionCastle.near.forEach( ( near, index ) => {
+
+			const low = state.reflectionCastle.low[ index ];
+			saved.push( [ low, low.visible ] );
+			// 跟着城堡的调试开关
+			low.visible = near.visible;
+			hide( near );
+
+		} );
+
+	}
+
+	return () => {
+
+		for ( const [ object, visible ] of saved ) object.visible = visible;
+		if ( ! cull && state.grass ) state.grass.endReflection();
+
+	};
+
+}
+
+// 倒影的分辨率倍数（相对画布）：放大模式下场景按 renderScale 画，倒影跟着乘（perf.scenesA.reflectionFollowScale）；满分辨率时就是配置值
+function reflectionResolution() {
+
+	const quality = state.ctx.quality;
+	const follow = state.ctx.config.perf.scenesA.reflectionFollowScale && quality.mode === 'upscale';
+	return state.reflectionScale * ( follow ? quality.renderScale : 1 );
 
 }
 
@@ -1477,8 +1859,7 @@ export function update( dt, time ) {
 	if ( state.intro ) updateIntro( time );
 	ctx.camera.updateMatrixWorld();
 	tempPoint.setFromMatrixPosition( ctx.camera.matrixWorld );
-	state.grass.uniforms.time.value = time;
-	state.grass.uniforms.center.value.set( tempPoint.x, tempPoint.z );
+	state.grass.update( time, tempPoint, ctx, ( point ) => ctx.world.toWorld( point, key, point ) );
 	state.petals.uniforms.time.value = time;
 	state.petals.uniforms.center.value.copy( tempPoint );
 
@@ -1505,10 +1886,14 @@ function releaseResources() {
 	if ( state.petals ) state.petals.dispose();
 	if ( state.reflectorNode ) state.reflectorNode.dispose();
 	if ( state.trunks ) for ( const mesh of state.trunks ) mesh.dispose();
+	if ( state.locationTrees ) state.locationTrees.dispose();
+	state.locationTrees = null;
 	state.grass = null;
 	state.petals = null;
 	state.reflectorNode = null;
 	state.reflectionPass = null;
+	state.reflectionCastle = null;
+	state.flowers = null;
 	state.trunks = null;
 
 }
@@ -1524,6 +1909,7 @@ export function dispose() {
 	state.scene = null;
 	state.heights = null;
 	state.layout = null;
+	state.grassField = null;
 	state.layers = {};
 	state.ctx = null;
 	console.log( '花园场景：已释放' );
@@ -1536,6 +1922,19 @@ export function dispose() {
 export function groundHeightAt( x, z ) {
 
 	return groundHeight( x, z );
+
+}
+
+// 引路（规格书 5.3 阶段 12）：出洞路线上第几秒走到第几米、离起点 distance 米的点（局部坐标）、出洞的时刻；没在出洞时返回 null
+export function getGuideRoute() {
+
+	const intro = state.intro;
+	if ( ! intro ) return null;
+	return {
+		distanceAt: ( time ) => intro.schedule( Math.min( time, intro.duration ) ),
+		pointAt: ( distance, target ) => introPoint( Math.min( distance, intro.total ), target ),
+		exitTime: intro.exitTime,
+	};
 
 }
 

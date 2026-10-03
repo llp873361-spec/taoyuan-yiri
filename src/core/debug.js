@@ -213,6 +213,7 @@ export function createDebug( ctx, enabled ) {
 
 		stats.档位 = ctx.quality.tier;
 		stats.渲染比例 = Math.round( ctx.quality.renderScale * 100 ) / 100;
+		stats.顶点压力 = ctx.quality.vertexPressure;
 		qualityState.档位 = ctx.quality.tier;
 
 		const info = ctx.renderer.info;

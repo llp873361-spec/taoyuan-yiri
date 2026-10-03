@@ -1,0 +1,67 @@
+{
+	"version": 1,
+	"hash": "689aab26",
+	"heightScale": 0.1,
+	"grids": {
+		"core": {
+			"minX": -2000,
+			"minZ": -2200,
+			"spacing": 4.166666666666667,
+			"width": 1009,
+			"height": 1153
+		},
+		"outer": {
+			"minX": -9900,
+			"minZ": -9800,
+			"spacing": 25,
+			"width": 801,
+			"height": 801
+		}
+	},
+	"masks": {
+		"surfaceA": [
+			"法线 x（0.5 + n/2）",
+			"法线 z（0.5 + n/2）",
+			"岩石外露",
+			"凹凸（0.5 平，亮凸暗凹）"
+		],
+		"surfaceB": [
+			"汇水（对数）",
+			"沉积（每档 6/255 米）",
+			"离谷底多高（每档 2 米）",
+			"适合长树"
+		]
+	},
+	"files": [
+		{
+			"id": "height-core",
+			"file": "height-core.i16.gz",
+			"mime": "application/gzip",
+			"bytes": 1358981
+		},
+		{
+			"id": "height-outer",
+			"file": "height-outer.i16.gz",
+			"mime": "application/gzip",
+			"bytes": 875626
+		},
+		{
+			"id": "surface-a",
+			"file": "surface-a.rgba.gz",
+			"mime": "application/gzip",
+			"bytes": 3160976
+		},
+		{
+			"id": "surface-b",
+			"file": "surface-b.rgba.gz",
+			"mime": "application/gzip",
+			"bytes": 2893786
+		}
+	],
+	"stats": {
+		"droplets": 1750000,
+		"protectedCells": 77866,
+		"protectedMaxChange": 0.1824665069580078,
+		"seconds": 27.199
+	}
+}

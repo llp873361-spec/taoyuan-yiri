@@ -17,8 +17,8 @@
 
 import * as THREE from 'three/webgpu';
 import {
-	Fn, uniform, float, vec2, vec3, vec4, color, texture, varying, attribute, NodeUpdateType,
-	positionGeometry, positionWorld, positionView, normalWorld, normalViewGeometry, cameraPosition, screenCoordinate, faceDirection,
+	Fn, If, uniform, float, vec2, vec3, vec4, color, texture, varying, attribute, NodeUpdateType,
+	positionGeometry, positionWorld, positionView, normalWorld, normalWorldGeometry, normalViewGeometry, cameraPosition, cameraViewMatrix, screenCoordinate, faceDirection,
 	mix, smoothstep, clamp, max, min, abs, pow, exp, sqrt, sin, cos, floor, length, normalize, dot, cross, reflect,
 	dFdx, dFdy, fwidth, luminance, pmremTexture, reflector,
 } from 'three/tsl';
@@ -27,6 +27,10 @@ import { mergeGeometries, mergeVertices } from 'three/addons/utils/BufferGeometr
 import { hash21, fbm2D, fbm3D, voronoi2D, jsFbm2D, jsValueNoise2D, jsHash21 } from '../tsl/noise.js';
 import { sparkleLayer } from '../tsl/sparkle.js';
 import { heightFog, applyVeil } from '../tsl/fog.js';
+import { buildCreekRibbon, createCreekMaterial, flattenModel } from './narrows.js';
+import { loadModel, disposeModel } from '../core/assets.js';
+import { isMeshInView, prepareMeshView } from '../core/camera.js';
+import { groundDetailInScene } from '../tsl/terrain.js';
 
 export const key = 'sunset';
 
@@ -72,6 +76,7 @@ const state = {
 	seagulls: null,
 	waves: null,
 	veil: null,                // 交接薄雾的参数（fog.js 的 veil）
+	creek: null,               // 小溪（阶段 12 CP3 返工）
 	reflectionPass: null,      // 平面反射：每帧画主场景之前在最外层画（见 createOceanMaterial）
 	oceanCenterWorld: [ 0, 0 ],
 	fogColor: new THREE.Color(),
@@ -87,6 +92,9 @@ const state = {
 	sunLowColor: new THREE.Color( '#ff8a4a' ),   // 太阳贴着海平线时的颜色
 	sunHighColor: new THREE.Color(),             // 太阳高一点时的颜色（config.sunset.sunColor）
 	currentTier: '',
+	shadowCenter: new THREE.Vector3( NaN, NaN, NaN ),   // 阴影图上一次画的中心（吸附后）
+	shadowLightDirection: new THREE.Vector3(),          // 上一次画阴影图时的太阳方向
+	shadowFrames: 0,                                    // 离上一次画阴影图过了几帧
 };
 
 // ===================== 地形（CPU 高度场）=====================
@@ -96,21 +104,33 @@ function terrainHeightRaw( x, z, edgeHeight = NaN ) {
 
 	const distance = z - shoreZ( x );   // 正 = 陆地一侧
 
-	// 陆地：从岸边 0.9 米往里缓慢抬高，40 米外再抬一段成小山；海底：往外越来越深，最深 6 米
-	const land = 0.9 + 0.12 * distance + 3.5 * smoothstepJs( 12, 70, distance );
+	// 陆地：从岸边 0.9 米往里抬高，岸边十几米陡一点（每米约 0.1 米），再往里很缓（每米 0.025 米），一直到身后岩丘脚下都是一片低平的地；
+	// 海底：往外越来越深，最深 6 米。（2026-10-02 改：原来 40 米外再抬 3.5 米，内陆是一块高出去的沙台子，镜头要从挖出来的沟里穿过）
+	const land = 0.9 + 0.025 * distance + 1.12 * ( 1 - Math.exp( - Math.max( distance, 0 ) / 14 ) );
 	const sea = Math.max( - 6, - 0.4 + 0.25 * distance );
 	let height = sea + ( land - sea ) * smoothstepJs( - 3, 2, distance );
 
-	// 岸边一带的岩石起伏：脊状噪声（1 - |2n - 1|）出棱，立方让棱更窄、谷更宽
-	const band = smoothstepJs( - 8, - 2, distance ) * ( 1 - smoothstepJs( 35, 60, distance ) );
+	// 小溪离这里多远（溪床、沙丘的口子用）
+	const creek = creekDistance( x, z );
+
+	// 沙丘：离岸 16~58 米一带，圆鼓鼓的（噪声取 1.5 次方，顶是圆的、丘间是平的）；小溪两边 6~18 米、出生点身后（|x| < 8~22 米）是溪水冲平的低地，没有丘
+	const duneBand = smoothstepJs( 16, 26, distance ) * ( 1 - smoothstepJs( 46, 58, distance ) );
+	const duneGap = smoothstepJs( 6, 18, creek ) * smoothstepJs( 8, 22, Math.abs( x - 1 ) );
+	height += Math.pow( jsFbm2D( x / 26 + 1.3, z / 19 - 4.2, 3 ), 1.5 ) * 2.4 * duneBand * duneGap;
+
+	// 内陆的草甸：很缓的起伏 ±0.6 米
+	height += ( jsFbm2D( x / 38 - 2.6, z / 38 + 5.1, 3 ) - 0.5 ) * 1.2 * smoothstepJs( 40, 70, distance );
+
+	// 溪床：中线挖下去 0.45 米，岸是 2.5 米宽的缓坡；进了海就不挖
+	height -= 0.45 * ( 1 - smoothstepJs( creekHalfWidth * 0.6, creekHalfWidth + 2.5, creek ) ) * smoothstepJs( 0, 4, distance );
+
+	// 岸边一带的岩石起伏：脊状噪声（1 - |2n - 1|）出棱，立方让棱更窄、谷更宽（只到离岸 30~42 米，再往里是沙丘和草甸）
+	const band = smoothstepJs( - 8, - 2, distance ) * ( 1 - smoothstepJs( 28, 42, distance ) );
 	const ridge = 1 - Math.abs( 2 * jsFbm2D( x / 14 + 4.2, z / 14 - 1.7, 3 ) - 1 );
 	height += ridge * ridge * ridge * 2.6 * band;
 	const smallRidge = 1 - Math.abs( 2 * jsFbm2D( x / 5 - 7.7, z / 5 + 3.3, 2 ) - 1 );
 	height += smallRidge * smallRidge * 0.6 * band;
 	height += ( jsFbm2D( x / 4 - 2.3, z / 4 + 8.1, 3 ) - 0.5 ) * 0.5 * band;
-
-	// 陆地里面再加几座缓丘，回头看时天际线不是一条直线
-	height += ( jsFbm2D( x / 45 - 6.2, z / 45 + 2.4, 3 ) - 0.5 ) * 9 * smoothstepJs( 30, 60, distance );
 
 	// 半岛的边：海里那边慢慢沉到 −4（藏在水下），岸上那几边落到远景地形下面 0.5 米，接进世界的地面，不留一圈水沟
 	const island = smoothstepJs( 108, 82, Math.abs( x ) ) * smoothstepJs( 118, 92, z );
@@ -183,6 +203,39 @@ function placeRocks() {
 
 }
 
+// 小溪（阶段 12 CP3 返工）：从身后岩丘的口子里流出来（口子和口子里那段溪在远景里，见 narrows.js），穿过草甸、
+// 从沙丘的口子里出来，在出生点左手边流进海里。本地坐标的中线，开头接着远景那段溪的尾巴（本地 z ≈ 104~108 两段交叉淡入淡出）
+const creekPath = [ [ 0, 108 ], [ - 1.5, 92 ], [ - 5, 74 ], [ - 11, 54 ], [ - 17, 34 ], [ - 22, 16 ], [ - 26, 0 ], [ - 29, - 14 ] ];
+const creekHalfWidth = 1.3;
+
+// 本地 (x, z) 离小溪中线多远（米）
+function creekDistance( x, z ) {
+
+	let best = Infinity;
+	for ( let i = 1; i < creekPath.length; i ++ ) {
+
+		const [ ax, az ] = creekPath[ i - 1 ];
+		const [ bx, bz ] = creekPath[ i ];
+		const dx = bx - ax;
+		const dz = bz - az;
+		const t = Math.min( 1, Math.max( 0, ( ( x - ax ) * dx + ( z - az ) * dz ) / ( dx * dx + dz * dz ) ) );
+		best = Math.min( best, Math.hypot( x - ax - dx * t, z - az - dz * t ) );
+
+	}
+
+	return best;
+
+}
+
+// 飞行贴地用：自己地形块里的地面高度（本地），块外面是 NaN（交给远景）
+export function ownGroundAt( x, z ) {
+
+	if ( ! state.heightData ) return NaN;
+	if ( Math.abs( x ) > terrainSize / 2 || Math.abs( z - terrainCenterZ ) > terrainSize / 2 ) return NaN;
+	return heightAt( x, z );
+
+}
+
 // 高度场：R = 地形高度（海面算水深、浅水色用），G = 离礁石多近（1 = 贴着礁石，泡沫用），都存成半精度纹理
 async function buildHeightField( spots ) {
 
@@ -236,7 +289,7 @@ async function buildHeightField( spots ) {
 const tempWorldPoint = new THREE.Vector3();
 function backdropHeightAt( x, z ) {
 
-	if ( Math.abs( x ) < 80 && z < 90 ) return NaN;
+	if ( Math.abs( x ) < 80 && z < 20 ) return NaN;
 	const ctx = state.ctx;
 	const location = ctx.world.locations[ key ];
 	ctx.world.toWorld( tempWorldPoint.set( x, 0, z ), key, tempWorldPoint );
@@ -759,6 +812,66 @@ function addShadowProxies( scene, light ) {
 
 }
 
+// 阴影图按需重画（性能，2026-10-02，perf.scenesB.shadowOnDemand）：原来每帧重画一张 2048 的阴影图，倒影的虚拟相机还要再画一遍
+// （ShadowNode 按"相机 + 帧号"去重）。现在 autoUpdate 关掉：阴影中心按 shadowSnap 米吸附，再在光的横、竖方向上对齐到阴影图的纹素
+// （中心挪一格时纹素格子不滑，影子边不闪）；中心换了格，或者太阳动了且离上次重画满 sunsetShadowFrames 帧，才 needsUpdate 一次。
+// 一帧里先画倒影（预画），倒影那一遍画了阴影图（ShadowNode 画完把 needsUpdate 清掉），主场景那一遍就不再画。
+// 太阳贴着海平线，影子拉得很长，方向一变影子尖就挪，所以不能像雪原那样等转够角度。
+// 灯每帧按"中心 + 方向 × 距离"摆，照明方向每帧都是准的；阴影图的投影矩阵只在重画时更新（ShadowNode.renderShadow）
+const shadowFocus = new THREE.Vector3();
+const shadowCandidate = new THREE.Vector3();
+const shadowBasis = new THREE.Matrix4();
+const shadowRight = new THREE.Vector3();
+const shadowUp = new THREE.Vector3();
+const shadowBack = new THREE.Vector3();
+const shadowOrigin = new THREE.Vector3();
+
+function followShadow( light, focus, direction, distance ) {
+
+	const perf = state.ctx.config.perf.scenesB;
+	const shadow = light.shadow;
+	if ( ! perf.shadowOnDemand ) {
+
+		// 原来的做法：阴影相机每帧正对着人，每一遍都重画
+		shadow.autoUpdate = true;
+		light.target.position.copy( focus );
+		light.position.copy( focus ).addScaledVector( direction, distance );
+		light.target.updateMatrixWorld();
+		return;
+
+	}
+
+	const shadowSnap = perf.shadowSnap;
+	shadow.autoUpdate = false;
+	const shadowCamera = shadow.camera;
+	shadowCandidate.set( Math.round( focus.x / shadowSnap ) * shadowSnap, Math.round( focus.y / shadowSnap ) * shadowSnap, Math.round( focus.z / shadowSnap ) * shadowSnap );
+	// 阴影相机的横、竖、后三个轴：和 three 给平行光阴影相机 lookAt 的结果一样（相机在中心 + 方向 × 距离，朝中心看，up 是阴影相机的 up）
+	shadowBasis.lookAt( direction, shadowOrigin, shadowCamera.up ).extractBasis( shadowRight, shadowUp, shadowBack );
+	const texelX = ( shadowCamera.right - shadowCamera.left ) / Math.max( 1, shadow.mapSize.width );
+	const texelY = ( shadowCamera.top - shadowCamera.bottom ) / Math.max( 1, shadow.mapSize.height );
+	const alongRight = Math.round( shadowCandidate.dot( shadowRight ) / texelX ) * texelX;
+	const alongUp = Math.round( shadowCandidate.dot( shadowUp ) / texelY ) * texelY;
+	const alongBack = shadowCandidate.dot( shadowBack );
+	shadowCandidate.copy( shadowRight ).multiplyScalar( alongRight ).addScaledVector( shadowUp, alongUp ).addScaledVector( shadowBack, alongBack );
+
+	state.shadowFrames ++;
+	const moved = ! ( shadowCandidate.distanceToSquared( state.shadowCenter ) < 1e-6 );
+	const turned = ! direction.equals( state.shadowLightDirection ) && state.shadowFrames >= perf.sunsetShadowFrames;
+	if ( moved || turned ) {
+
+		state.shadowCenter.copy( shadowCandidate );
+		state.shadowLightDirection.copy( direction );
+		state.shadowFrames = 0;
+		shadow.needsUpdate = true;
+
+	}
+
+	light.target.position.copy( state.shadowCenter );
+	light.position.copy( state.shadowCenter ).addScaledVector( direction, distance );
+	light.target.updateMatrixWorld();
+
+}
+
 // 重新生成环境光贴图（只有天空，不含太阳圆盘），礁石的环境光、低档海面的反射都用它。
 // 生成器是整个程序共用的 ctx.pmrem（开场卡阶段热过身，模糊和背景盒的着色器已经编好）
 function updateEnvironment() {
@@ -794,6 +907,7 @@ function updateEnvironment() {
 function createOceanMaterial( tierName, useReflector ) {
 
 	const sunsetConfig = state.ctx.config.sunset;
+	const perf = state.ctx.config.perf.scenesB;
 	const uniforms = state.uniforms;
 	const { growth, scale } = state.oceanGrid;
 	const sparkleLevels = tierName === 'lo' ? 1 : 2;
@@ -896,14 +1010,18 @@ function createOceanMaterial( tierName, useReflector ) {
 		const sunIrradiance = uniforms.sunRadiance.mul( uniforms.sunSolidAngle );
 		const glint = sunIrradiance.mul( fresnelHalf.mul( slopeDensity ).mul( shadowing ).div( normalDotView.mul( 4 ) ) )
 			.mul( uniforms.pathIntensity ).mul( uniforms.pathToggle ).mul( smoothstep( - 0.02, 0.02, normalDotLight ) )
-			// 近处的碎光由闪点负责，高光瓣只给一点底；越远闪点越稀、越小，平均亮度交还给高光瓣，远处连成一条金色光柱
-			.mul( mix( 0.3, 1, smoothstep( 20, 220, distance ) ) );
+			// 近处的碎光由闪点负责，高光瓣只给一点底；越远闪点越稀、越小，平均亮度交还给高光瓣，远处连成一条金色光柱。
+			// 审查 R17：原来 20~220 米从三成升到满，中距离（40~150 米）一大段暗紫，光路断成两截；底抬到五成五、80 米就满
+			.mul( mix( 0.55, 1, smoothstep( 8, 80, distance ) ) );
 
 		// ④ 闪点：sparkle.js，微法线锥约等于近处剩下的斜率标准差；随时间生灭（水面的小晶面一直在换）
 		// 锥角 ≈ 2 倍"画不出来的"斜率标准差（近处小、远处大），闪点只在光路附近出现
 		const sparkleCone = clamp( sqrt( variance ).mul( 2 * 180 / Math.PI ), 5, 26 );
+		// 只在光路附近算单颗闪点（性能，perf.scenesB.glitterPathOnly）：微法线最多偏离海面法线一个锥角，海面法线和半程向量的夹角
+		// 比"锥角 + glitterMargin"还大时，微法线和半程向量至少差 glitterMargin（12°），cos12° 的 700 次方以上小于 2e-7，闪点看不出来；那里只留统计补偿
+		const nearGlitterPath = perf.glitterPathOnly ? cosHalf.greaterThan( cos( sparkleCone.add( perf.glitterMargin ).mul( Math.PI / 180 ) ) ) : null;
 		const sparkleCommon = {
-			position: worldPosition, normal, viewDirection, lightDirection: sunDirection, coneDegrees: sparkleCone,
+			position: worldPosition, normal, viewDirection, lightDirection: sunDirection, coneDegrees: sparkleCone, active: nearGlitterPath, lean: perf.sparkleSkip,
 			// sparkle.js 按"小晶面被照亮"算（乘了 m·L 和 N·L 的朝向项，雪地是对的）；海面的闪点是一小片水面像镜子一样把太阳反射过来，
 			// 亮度应该是 F·L_太阳，不该因为太阳贴地就变暗，所以这里把那两项（约 sinθ_太阳 × 0.5）除回去
 			lightColor: uniforms.sunRadiance.mul( uniforms.sunVisibleFraction ).mul( fresnelHalf ).div( max( sunDirection.y, 0.03 ).mul( 0.5 ) ),
@@ -944,7 +1062,8 @@ function createOceanMaterial( tierName, useReflector ) {
 		const terrain = texture( state.heightTexture, terrainUV( worldPosition.xz ) );
 		const depthToGround = worldPosition.y.sub( terrain.r );
 		const rockProximity = terrain.g;
-		const shallow = max( exp( depthToGround.max( 0 ).div( - 2.2 ) ), rockProximity.mul( 0.6 ) ).mul( uniforms.shallowToggle );
+		// 礁石边只透一点青（原来六成，海蚀柱脚一圈青绿的亮环，审查 R34），岩脚主要靠下面的白泡沫
+		const shallow = max( exp( depthToGround.max( 0 ).div( - 2.2 ) ), rockProximity.mul( 0.22 ) ).mul( uniforms.shallowToggle );
 		const ambient = pmremTexture( state.environmentTarget.texture, vec3( 0, 1, 0 ), float( 1 ) );
 		const bodyColor = mix( uniforms.waterColor, uniforms.shallowColor, shallow ).mul( ambient.mul( 1.7 ).add( uniforms.sunLightColor.mul( 0.06 ) ) );
 
@@ -966,17 +1085,26 @@ function createOceanMaterial( tierName, useReflector ) {
 		const foamCoverage = max( crestFoam.mul( 0.8 ), shoreFoam ).clamp( 0, 1 );
 		// 形状：先扭曲坐标，fbm 出一团团的块，块里再用细 Voronoi 的细胞边（F2 − F1 小）挖出一圈圈花边，
 		// 浓淡再用细 fbm 调，半透明。这样是一条条、一团团带孔的泡沫，不是一整片平涂
-		const foamPoint = worldPosition.xz.add( vec2( uniforms.sceneTime.mul( 0.06 ), uniforms.sceneTime.mul( - 0.03 ) ) );
-		const foamWarp = vec2( fbm2D( foamPoint.mul( 0.35 ), 2 ), fbm2D( foamPoint.mul( 0.35 ).add( 17.3 ), 2 ) ).sub( 0.5 ).mul( 2.2 );
-		const clumps = fbm2D( foamPoint.mul( 1.4 ).add( foamWarp ), 3 );
-		const laceCells = voronoi2D( foamPoint.mul( 3.2 ).add( foamWarp.mul( 1.5 ) ), float( 1 ), float( 1 ) );
-		const lace = pow( smoothstep( 0.02, 0.35, laceCells.y.sub( laceCells.x ) ).oneMinus(), 1.5 );
-		const fineShade = fbm2D( foamPoint.mul( 7 ), 2 );
-		const threshold = mix( 0.7, 0.4, foamCoverage );
-		const foamBody = smoothstep( threshold, threshold.add( 0.22 ), clumps );
-		// 团块边缘之外只剩花边，团块中间是花边加一层薄薄的底
-		const foamMask = foamBody.mul( lace.mul( 0.75 ).add( foamBody.mul( 0.25 ) ) ).mul( fineShade.mul( 0.5 ).add( 0.5 ) )
-			.mul( smoothstep( 0.02, 0.15, foamCoverage ) ).mul( uniforms.foamToggle );
+		// 覆盖度 ≤ 0.02 时下面最后乘的 smoothstep( 0.02, 0.15, 覆盖度 ) 正好是 0（「泡沫」开关关了也是乘 0）：
+		// 那里泡沫图案（五个 fbm + Voronoi）整段不算，结果一样（性能，perf.scenesB.foamSkip）
+		const foamMask = float( 0 ).toVar();
+		const foamPattern = () => {
+
+			const foamPoint = worldPosition.xz.add( vec2( uniforms.sceneTime.mul( 0.06 ), uniforms.sceneTime.mul( - 0.03 ) ) );
+			const foamWarp = vec2( fbm2D( foamPoint.mul( 0.35 ), 2 ), fbm2D( foamPoint.mul( 0.35 ).add( 17.3 ), 2 ) ).sub( 0.5 ).mul( 2.2 );
+			const clumps = fbm2D( foamPoint.mul( 1.4 ).add( foamWarp ), 3 );
+			const laceCells = voronoi2D( foamPoint.mul( 3.2 ).add( foamWarp.mul( 1.5 ) ), float( 1 ), float( 1 ) );
+			const lace = pow( smoothstep( 0.02, 0.35, laceCells.y.sub( laceCells.x ) ).oneMinus(), 1.5 );
+			const fineShade = fbm2D( foamPoint.mul( 7 ), 2 );
+			const threshold = mix( 0.7, 0.4, foamCoverage );
+			const foamBody = smoothstep( threshold, threshold.add( 0.22 ), clumps );
+			// 团块边缘之外只剩花边，团块中间是花边加一层薄薄的底
+			foamMask.assign( foamBody.mul( lace.mul( 0.75 ).add( foamBody.mul( 0.25 ) ) ).mul( fineShade.mul( 0.5 ).add( 0.5 ) )
+				.mul( smoothstep( 0.02, 0.15, foamCoverage ) ).mul( uniforms.foamToggle ) );
+
+		};
+		if ( perf.foamSkip ) If( foamCoverage.greaterThan( 0.02 ).and( uniforms.foamToggle.greaterThan( 0 ) ), foamPattern );
+		else foamPattern();
 		// 黄昏里的泡沫：天空环境光 + 一点夕阳，逆光时边缘透亮一点；不能比天空还白
 		const foamLit = uniforms.foamColor.mul( ambient.mul( 1.2 ).add( uniforms.sunLightColor.mul( max( normalDotLight, 0 ).mul( 0.5 ).add( backLight.mul( 0.6 ) ) ).mul( uniforms.sunVisibleFraction ) ) );
 
@@ -1018,15 +1146,18 @@ function createRockMaterial( withSand ) {
 	const worldPosition = positionWorld;
 	const large = fbm3D( worldPosition.mul( 0.3 ), 3 );
 	const detail = fbm3D( worldPosition.mul( 2.6 ), 3 );
-	// 石缝：脊状噪声 1 − |2n − 1| 的尖顶（不用 Voronoi，Voronoi 会切成一格格的地砖）。坐标先扭一下，缝是弯的
+	// 石缝：脊状噪声 1 − |2n − 1| 的尖顶（不用 Voronoi，Voronoi 会切成一格格的地砖）。坐标先扭一下，缝是弯的。
+	// 缝窄一点、淡一点（原来一道道黑缝满石头都是，近看像皮革，2026-10-02 自查）；岸上的岩石形状换成扫描以后，起伏主要靠形状
 	const warped = worldPosition.mul( 0.9 ).add( fbm3D( worldPosition.mul( 0.4 ).add( 3.7 ), 2 ).mul( 1.5 ) );
 	const ridge = float( 1 ).sub( abs( fbm3D( warped, 3 ).mul( 2 ).sub( 1 ) ) );
-	const crevice = smoothstep( 0.9, 0.985, ridge );
+	// 岸上的岩石（岬角）明暗主要交给下面的岩面扫描贴图，缝只留很淡的几道（审查 R18：黑缝连成网，像皮革、像大脑）
+	const crevice = smoothstep( 0.965, 0.995, ridge ).mul( withSand ? 0.25 : 0.6 );
 	// 层理：沿高度的细条纹，被大尺度噪声扭一下；只在陡的岩壁上出现（平地上沿高度画条纹会变成一圈圈等高线）
 	const steep = float( 1 ).sub( smoothstep( 0.55, 0.85, normalWorld.y.abs() ) );
 	const strata = sin( worldPosition.y.mul( 7 ).add( large.mul( 9 ) ) ).mul( 0.5 ).add( 0.5 ).mul( steep );
 
-	let rockColor = mix( color( '#2a2420' ), color( '#54473c' ), smoothstep( 0.3, 0.7, large ) );
+	// 偏冷的灰褐（原来 #54473c 在晚霞里被染成红褐色的皮）
+	let rockColor = mix( color( '#2a2624' ), color( '#4f4843' ), smoothstep( 0.3, 0.7, large ) );
 	rockColor = rockColor.mul( strata.mul( 0.25 ).add( 0.85 ) ).mul( detail.mul( 0.4 ).add( 0.8 ) ).mul( crevice.mul( - 0.6 ).add( 1 ) );
 	// 高处朝上的面长一点橙黄色地衣
 	const lichen = smoothstep( 0.62, 0.7, fbm3D( worldPosition.mul( 0.9 ).add( 7.3 ), 3 ) )
@@ -1045,18 +1176,28 @@ function createRockMaterial( withSand ) {
 	if ( ! withSand ) rockColor = rockColor.mul( 0.6 );
 	let surfaceColor = mix( rockColor, rockColor.mul( 0.5 ), wet );
 	let roughness = mix( mix( float( 0.92 ), float( 0.75 ), detail ), mix( float( 0.5 ), float( 0.3 ), grain ), wet );
-	let bumpHeight = detail.mul( 0.05 ).add( medium.mul( 0.14 ) ).add( grain.mul( 0.01 ) ).add( strata.mul( 0.012 ) );
+	// 中尺度坑洼原来 0.14 米，一团团鼓包像大脑；起伏交给扫描贴图的法线，这里减半
+	let bumpHeight = detail.mul( 0.05 ).add( medium.mul( 0.07 ) ).add( grain.mul( 0.01 ) ).add( strata.mul( 0.012 ) );
 	// 干的岩石是多孔的，镜面反射很弱：高光强度（也就是掠射角的 F90）压到 0.3，不然朝着太阳看整片岩面泛一层米色；
 	// 湿的地方水膜反光，恢复到 1
 	let specular = mix( float( 0.3 ), float( 1 ), wet );
 
+	// 草甸、沙的程度（只有地形用，见下面）
+	let meadow = float( 0 );
+	let sandAmount = float( 0 );
 	if ( withSand ) {
 
 		// 沙：平缓（法线朝上）、离出生点那块岬角远的地方；陡坡露出岩石。
 		// 不在平地上撒岩石斑块——从高处往回看，平地上一块块深色石斑像污渍
 		const headland = exp( worldPosition.x.div( 13 ).pow2().negate() ).mul( float( 1 ).sub( smoothstep( 4, 14, worldPosition.z ) ) );
 		const flat = smoothstep( 0.8, 0.92, normalWorld.y );
-		const sand = flat.mul( float( 1 ).sub( headland ) ).toVar();
+		// 离岸约 50 米以外是草甸（见下面），那里不画沙纹
+		const shoreLine = float( - 2 ).add( sin( worldPosition.x.mul( 0.043 ).add( 0.6 ) ).mul( 5.5 ) ).add( sin( worldPosition.x.mul( 0.12 ).add( 2.0 ) ).mul( 2.5 ) )
+			.sub( exp( worldPosition.x.div( 10 ).pow2().negate() ).mul( 7 ) );
+		const meadowEdge = fbm2D( worldPosition.xz.mul( 0.035 ).add( 2.7 ), 3 ).sub( 0.5 ).mul( 24 ).add( 50 );
+		meadow = smoothstep( meadowEdge.sub( 5 ), meadowEdge.add( 5 ), worldPosition.z.sub( shoreLine ) ).mul( smoothstep( 0.82, 0.93, normalWorld.y ) ).mul( uniforms.meadowToggle ).toVar();
+		const sand = flat.mul( float( 1 ).sub( headland ) ).mul( float( 1 ).sub( meadow ) ).toVar();
+		sandAmount = sand;
 		// 风吹出来的沙纹：沿一个方向的细条纹，被噪声扭弯，只改法线
 		const rippleCoordinate = worldPosition.x.mul( 0.6 ).add( worldPosition.z.mul( 0.8 ) ).mul( 14 ).add( fbm2D( worldPosition.xz.mul( 0.5 ), 2 ).mul( 6 ) );
 		const sandRipple = sin( rippleCoordinate ).mul( 0.004 );
@@ -1069,12 +1210,46 @@ function createRockMaterial( withSand ) {
 
 	}
 
+	if ( withSand ) {
+
+		// 草甸（阶段 12 CP3 返工）：离岸约 50 米以外（边界按噪声进退 ±12 米）沙地换成草甸的颜色——只是地面的颜色，不长草叶
+		// （2026-10-02 用户："沙滩你长啥草"）。颜色和光照走远景同一套（远景的 worldLighting，放在自发光通道，乘远景这里的亮度倍数），
+		// 地形块的边上和远景的草甸接得上；沙丘、陡坡上不长
+		const meadowPatch = fbm2D( worldPosition.xz.mul( 0.02 ).add( 9.1 ), 3 );
+		const meadowDetail = fbm2D( worldPosition.xz.mul( 0.11 ).sub( 4.4 ), 2 );
+		const meadowAlbedo = mix( mix( color( '#73a050' ), color( '#8daf5b' ), smoothstep( 0.35, 0.65, meadowDetail ) ), mix( color( '#7d9d57' ), color( '#6a9259' ), meadowDetail ), smoothstep( 0.4, 0.6, meadowPatch ) )
+			.mul( detail.mul( 0.2 ).add( 0.9 ) );
+		// 远景的光照函数里有 If（地形阴影），要包在 Fn 里建
+		const meadowLit = Fn( () => state.ctx.backdrop.worldLighting( meadowAlbedo, normalWorld, worldPosition ).mul( uniforms.meadowGain ) )();
+		surfaceColor = surfaceColor.mul( float( 1 ).sub( meadow ) );
+		specular = specular.mul( float( 1 ).sub( meadow ) );
+		roughness = mix( roughness, float( 1 ), meadow );
+		material.emissiveNode = meadowLit.mul( meadow );
+
+	}
+
+	// 近处的真贴图（和远景、其他地点同一套地表贴图，tsl/terrain.js）：岩石按"岩石"层（岩面扫描），沙按"沙土"，草甸按"草甸"；
+	// 贴图只给明暗（按这一层的平均亮度归一）和法线细节，颜色还是上面按调色板算的（审查 R18）。颜色、法线各算一次（两个输出）
+	const ground = state.ctx.backdrop.getGround();
+	let baseNormal = normalViewGeometry;
+	if ( ground ) {
+
+		const rockAmount = float( 1 ).sub( sandAmount ).sub( meadow ).max( 0 );
+		const weights = vec4( meadow, 0, rockAmount, sandAmount );
+		const detailOf = ( normal ) => groundDetailInScene( ground, state.ctx.backdrop.getSceneToWorld(), {
+			point: worldPosition, normal, weights, near: state.ctx.backdrop.getGroundNear(), cameraPoint: cameraPosition,
+		} );
+		surfaceColor = surfaceColor.mul( Fn( () => detailOf( normalWorld ).shade )() );
+		baseNormal = Fn( () => normalize( cameraViewMatrix.mul( vec4( detailOf( normalWorldGeometry ).normal, 0 ) ).xyz ) )();
+
+	}
+
 	material.colorNode = surfaceColor;
 	material.roughnessNode = roughness;
 	material.specularIntensityNode = specular;
-	// 凹下去的地方（中尺度噪声低处）挡掉一部分天空光
-	material.aoNode = mix( float( 0.7 ), float( 1 ), smoothstep( 0.25, 0.65, medium ) );
-	material.normalNode = bumpNormal( positionView, normalViewGeometry, bumpHeight );
+	// 凹下去的地方（中尺度噪声低处）挡掉一部分天空光；原来 0.7~1，从高处看一块块暗斑像带孔的奶酪板，收到 0.85~1
+	material.aoNode = mix( float( 0.85 ), float( 1 ), smoothstep( 0.25, 0.65, medium ) );
+	material.normalNode = bumpNormal( positionView, baseNormal, bumpHeight );
 
 	state.disposables.push( material );
 	return material;
@@ -1082,17 +1257,72 @@ function createRockMaterial( withSand ) {
 }
 
 // 程序化礁石：二十面体细分后合并顶点，沿径向用噪声推出不规则块面；海蚀柱拉高，底部插进海底。
+// 岸边和岸上的石头（阶段 12 CP3 返工）换成 Poly Haven 的两块大石扫描（boulder_01、namaqualand_boulder_02，CC0）的形状，
+// 颜色还是这里的程序化材质（世界坐标噪声，不用贴图）；原来是圆滚滚的变形球。hi 档用 1 万三角那一级，其余档用 3 千那一级；没读到用变形球
 // 几十块石头变换好以后合成一个网格，一次绘制（主画面、平面反射、阴影各省几十次绘制调用，核显上明显）
-async function createRockMeshes( material, shadows ) {
+async function loadRockShapes( tier ) {
+
+	const shapes = [];
+	const suffix = tier === 'hi' ? '' : '-lod1';
+	for ( const name of [ 'boulder_01', 'namaqualand_boulder_02' ] ) {
+
+		const model = await loadModel( 'models', name + suffix );
+		const shape = model ? flattenModel( model ) : null;
+		if ( model ) disposeModel( model );
+		if ( ! shape ) {
+
+			console.warn( `落日场景：岩石扫描 ${ name + suffix } 没读到，岸上的石头用程序化的` );
+			continue;
+
+		}
+
+		// 只要形状：归一到底面中心在原点、水平最大边长 2、高按比例
+		const geometry = shape.geometry;
+		if ( shape.map ) shape.map.dispose();
+		geometry.deleteAttribute( 'uv' );
+		geometry.computeBoundingBox();
+		const box = geometry.boundingBox;
+		const size = Math.max( box.max.x - box.min.x, box.max.z - box.min.z );
+		geometry.translate( - ( box.min.x + box.max.x ) / 2, - box.min.y, - ( box.min.z + box.max.z ) / 2 );
+		geometry.scale( 2 / size, 2 / size, 2 / size );
+		geometry.computeBoundingBox();
+		shapes.push( { geometry, height: geometry.boundingBox.max.y } );
+
+	}
+
+	return shapes;
+
+}
+
+async function createRockMeshes( material, shadows, tier ) {
 
 	const point = new THREE.Vector3();
 	const placement = new THREE.Object3D();
 	const pieces = [];
+	const shapes = await loadRockShapes( tier );
 
 	const slice = { start: performance.now() };
 	for ( const spot of state.rockSpots ) {
 
 		await yieldIfBusy( slice );
+		if ( spot.kind !== 'stack' && shapes.length ) {
+
+			// 扫描的形状：水平按半径缩放（扫描本身是 2 米宽）、高按 spot.height，埋进去三成（岸边的埋得多一点，浪打得到）
+			const shape = shapes[ Math.floor( spot.seed * 7.3 ) % shapes.length ];
+			const geometry = shape.geometry.clone();
+			const ground = heightAt( spot.x, spot.z );
+			const scaleY = spot.height / shape.height * ( spot.kind === 'shore' ? 1.15 : 1 );
+			placement.scale.set( spot.radius * 1.1, scaleY, spot.radius * 0.95 );
+			placement.position.set( spot.x, ( Number.isFinite( ground ) ? ground : 0 ) - spot.height * ( spot.kind === 'shore' ? 0.38 : 0.28 ), spot.z );
+			placement.rotation.set( ( jsHash21( spot.seed, 3.3 ) - 0.5 ) * 0.25, spot.seed * 2.1, ( jsHash21( spot.seed, 8.1 ) - 0.5 ) * 0.25 );
+			placement.updateMatrix();
+			geometry.applyMatrix4( placement.matrix );
+			if ( ! geometry.getAttribute( 'normal' ) ) geometry.computeVertexNormals();
+			pieces.push( geometry );
+			continue;
+
+		}
+
 		const detailLevel = spot.kind === 'stack' ? 5 : 4;
 		const geometry = mergeVertices( new THREE.IcosahedronGeometry( 1, detailLevel ).deleteAttribute( 'normal' ).deleteAttribute( 'uv' ) );
 		const positions = geometry.attributes.position;
@@ -1139,8 +1369,11 @@ async function createRockMeshes( material, shadows ) {
 
 	}
 
+	// 扫描带索引、变形球也带索引（mergeVertices）；属性只留位置和法线，合并时一致
+	for ( const piece of pieces ) for ( const name of Object.keys( piece.attributes ) ) if ( name !== 'position' && name !== 'normal' ) piece.deleteAttribute( name );
 	const merged = mergeGeometries( pieces );
 	for ( const piece of pieces ) piece.dispose();
+	for ( const shape of shapes ) shape.geometry.dispose();
 	if ( ! merged ) throw new Error( '落日场景：礁石几何体合并失败' );
 	state.disposables.push( merged );
 
@@ -1312,6 +1545,8 @@ async function buildScene( ctx ) {
 	const started = performance.now();
 	state.ctx = ctx;
 	state.disposables = [];
+	state.shadowCenter.set( NaN, NaN, NaN );
+	state.shadowFrames = 0;
 	const sunsetConfig = ctx.config.sunset;
 	state.sunHighColor.set( sunsetConfig.sunColor );
 	const sceneConfig = ctx.config.scenes.find( ( item ) => item.key === key );
@@ -1406,6 +1641,8 @@ async function buildScene( ctx ) {
 		shallowToggle: uniform( 1 ),
 		wetToggle: uniform( 1 ),
 		fogAmount: uniform( 1 ),
+		meadowToggle: uniform( 1 ),
+		meadowGain: uniform( sunsetConfig.backdropGain ),   // 草甸的亮度倍数，和远景这里的一样（update 里跟着交接的薄雾变）
 	};
 	const uniforms = state.uniforms;
 
@@ -1424,7 +1661,8 @@ async function buildScene( ctx ) {
 
 	};
 
-	state.rockSpots = placeRocks();
+	// 溪床里不放礁石
+	state.rockSpots = placeRocks().filter( ( spot ) => spot.kind === 'stack' || creekDistance( spot.x, spot.z ) > creekHalfWidth + spot.radius * 1.3 + 0.5 );
 	const heightField = await buildHeightField( state.rockSpots );
 	state.heightData = heightField.heights;
 	state.heightTexture = heightField.heightTexture;
@@ -1440,8 +1678,43 @@ async function buildScene( ctx ) {
 	terrain.receiveShadow = shadows;
 	scene.add( terrain );
 	await markStep( '地形' );
-	scene.add( await createRockMeshes( rockMaterial, shadows ) );
+	scene.add( await createRockMeshes( rockMaterial, shadows, tier ) );
 	await markStep( '礁石' );
+
+	// 小溪：贴着看得见的地面（自己的地形和远景取高的），流到地面低过 0.3 米（进了海）为止
+	const creekGround = ( x, z ) => {
+
+		const own = heightAt( x, z );
+		const drawn = backdropHeightAt( x, z );
+		return Number.isFinite( drawn ) ? Math.max( own, drawn ) : own;
+
+	};
+	const creekPoints = [];
+	for ( let i = 1; i < creekPath.length; i ++ ) {
+
+		const [ ax, az ] = creekPath[ i - 1 ];
+		const [ bx, bz ] = creekPath[ i ];
+		const steps = Math.ceil( Math.hypot( bx - ax, bz - az ) / 2 );
+		for ( let k = i === 1 ? 0 : 1; k <= steps; k ++ ) creekPoints.push( { x: ax + ( bx - ax ) * k / steps, z: az + ( bz - az ) * k / steps } );
+
+	}
+
+	const mouth = creekPoints.findIndex( ( point ) => heightAt( point.x, point.z ) < 0.3 );
+	if ( mouth < 0 ) console.warn( '落日场景：小溪的中线没走到海里，溪口停在中线的尽头' );
+	const creekGeometry = buildCreekRibbon( creekPoints.slice( 0, mouth < 0 ? creekPoints.length : mouth + 2 ), creekGround, { halfWidth: creekHalfWidth, fadeIn: 4, fadeOut: 3, lift: 0.08 } );
+	const creekMaterial = createCreekMaterial( '小溪', {
+		lighting: ctx.backdrop.worldLighting,
+		atmosphere: ctx.backdrop.worldAtmosphere,
+		sky: ctx.world.uniforms,
+		time: uniforms.sceneTime,
+		toWorldDirection: ctx.backdrop.sceneDirectionToWorld,
+	} );
+	state.disposables.push( creekGeometry, creekMaterial );
+	const creekMesh = new THREE.Mesh( creekGeometry, creekMaterial );
+	creekMesh.name = '小溪';
+	creekMesh.renderOrder = 2;
+	scene.add( creekMesh );
+	state.creek = creekMesh;
 
 	// ---------- 天空和环境光 ----------
 	state.sky = createSky();
@@ -1478,10 +1751,14 @@ async function buildScene( ctx ) {
 	ocean.frustumCulled = false;
 	scene.add( ocean );
 	state.ocean = ocean;
+	// 倒影跳过用的水面分块（camera.js 的 prepareMeshView），在这里取好点，不放进第一帧
+	prepareMeshView( ocean, { groundHeight: heightAt } );
 	if ( state.reflectorTarget ) scene.add( state.reflectorTarget );
 	state.reflectionPass = () => {
 
 		if ( ! state.ready || ! state.reflectorNode || state.ocean.material !== state.oceanMaterials.reflective ) return;
+		// 水面不在视锥里（转身背对水面）这一帧不画倒影（camera.js 的 isMeshInView）
+		if ( ! isMeshInView( state.ctx.camera, state.ocean, { margin: 3, groundHeight: heightAt } ) ) return;
 		state.reflectorNode.reflector.updateBefore( { scene: state.scene, camera: state.ctx.camera, renderer: state.ctx.renderer, material: state.ocean.material } );
 
 	};
@@ -1556,6 +1833,12 @@ async function buildScene( ctx ) {
 
 		},
 		海雾: uniforms.fogAmount,
+		草甸: uniforms.meadowToggle,
+		小溪: ( enabled ) => {
+
+			state.creek.visible = enabled;
+
+		},
 	};
 
 	state.ready = true;
@@ -1737,7 +2020,11 @@ export function update( dt, time ) {
 	uniforms.secondSparkleLayer.value = params.sparkleLayers >= 2 ? 1 : 0;
 	uniforms.thirdSparkleLayer.value = params.sparkleLayers >= 3 ? 1 : 0;
 	const wantReflector = params.reflectionScale > 0;
-	if ( state.reflectorNode && wantReflector ) state.reflectorNode.reflector.resolutionScale = params.reflectionScale;
+	// 倒影分辨率跟着场景比例走：放大模式下场景按 renderScale 画，倒影的目标是按画布算的，原来比场景本身还清楚
+	// （性能，perf.scenesB.sunsetReflectionFollowScale；满分辨率时不变）
+	const follow = ctx.config.perf.scenesB.sunsetReflectionFollowScale && ctx.quality.mode === 'upscale';
+	const sceneScale = follow ? Math.min( 1, Math.max( 0.25, ctx.quality.renderScale ) ) : 1;
+	if ( state.reflectorNode && wantReflector ) state.reflectorNode.reflector.resolutionScale = params.reflectionScale * sceneScale;
 	if ( tier !== state.currentTier ) {
 
 		state.currentTier = tier;
@@ -1748,10 +2035,9 @@ export function update( dt, time ) {
 	applySunState( ctx.world.getDayTime() );
 	applyWorldSettings();
 
-	// ---------- 阴影相机跟着人 ----------
-	state.sunLight.target.position.set( camera.position.x, 0, camera.position.z - 20 );
-	state.sunLight.position.copy( state.sunLight.target.position ).addScaledVector( state.sunDirection, 300 );
-	state.sunLight.target.updateMatrixWorld();
+	// ---------- 阴影相机跟着人（按需重画，见 followShadow）----------
+	shadowFocus.set( camera.position.x, 0, camera.position.z - 20 );
+	followShadow( state.sunLight, shadowFocus, state.sunDirection, 300 );
 
 	updateSeagulls( time );
 
@@ -1772,6 +2058,7 @@ function applyWorldSettings() {
 	ctx.backdrop.setSkyVisible( blend > 0.001 );
 	// 化进薄雾时增益慢慢回到 1（化完以后只画远景，用的是统一天空本来的亮度）
 	ctx.backdrop.setSurfaceGain( 1 + ( sunsetConfig.backdropGain - 1 ) * ( 1 - worldUniforms.locationVeil.value ) );
+	uniforms.meadowGain.value = 1 + ( sunsetConfig.backdropGain - 1 ) * ( 1 - worldUniforms.locationVeil.value );
 	ctx.backdrop.setSeaCut( { center: state.oceanCenterWorld, radius: oceanRadius, fade: 150, depth: 2 } );
 	state.fogColor.set( sunsetConfig.fogColor ).multiplyScalar( uniforms.skyDarken.value );
 	state.fogScatter.copy( uniforms.sunLightColor.value ).multiplyScalar( sunsetConfig.fogScatter * uniforms.sunVisibleFraction.value );
@@ -1893,6 +2180,7 @@ function resetState() {
 	state.oceanMaterials = { reflective: null, plain: null };
 	state.pendingOceanSwitch = false;
 	state.seagulls = null;
+	state.creek = null;
 	state.sunLight = null;
 	state.reflectionPass = null;
 	state.veil = null;

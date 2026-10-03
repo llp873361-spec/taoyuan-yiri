@@ -1,4 +1,205 @@
 {
-	"说明": "每个外部素材一条。author、license、url 由我手填；scripts/opt.mjs 只校验字段齐全。license 只能是 CC0 / CC BY 4.0 / CC BY 3.0 / MIT 之类的免费许可。",
-	"items": []
+	"说明": "每个外部素材 / 外部代码一条。必填：title、author、license、url、usedFor、kind（model / texture / code / audio）；id 是配方（scripts/opt.mjs 的 credit 字段）找署名用的键，同一个素材包的几个配方共用一条；file 只给通用处理产出的散装 glb 用（按文件名匹配）。license 只能是 CC0 / CC BY 4.0 / CC BY 3.0 / MIT 之类的免费许可，带 NC、ND 的校验不过。scripts/opt.mjs 只校验，不改这个文件。",
+	"items": [
+		{
+			"id": "polyhaven/rock_09",
+			"kind": "model",
+			"title": "Rock 09",
+			"author": "Jenelle van Heerden",
+			"license": "CC0",
+			"url": "https://polyhaven.com/a/rock_09",
+			"usedFor": "小卵石（约 7 厘米，溪边、路边点缀）",
+			"source": "Poly Haven"
+		},
+		{
+			"id": "polyhaven/boulder_01",
+			"kind": "model",
+			"title": "Boulder 01",
+			"author": "Rico Cilliers",
+			"license": "CC0",
+			"url": "https://polyhaven.com/a/boulder_01",
+			"usedFor": "大石头（约 1.8 米）",
+			"source": "Poly Haven"
+		},
+		{
+			"id": "polyhaven/namaqualand_boulder_02",
+			"kind": "model",
+			"title": "Namaqualand Boulder 02",
+			"author": "Greg Zaal, Rico Cilliers",
+			"license": "CC0",
+			"url": "https://polyhaven.com/a/namaqualand_boulder_02",
+			"usedFor": "扁平巨石（约 2.5 米）",
+			"source": "Poly Haven"
+		},
+		{
+			"id": "polyhaven/coast_rocks_05",
+			"kind": "model",
+			"title": "Coast Rocks 05",
+			"author": "Rob Tuytel",
+			"license": "CC0",
+			"url": "https://polyhaven.com/a/coast_rocks_05",
+			"usedFor": "海边礁石群",
+			"source": "Poly Haven"
+		},
+		{
+			"id": "polyhaven/rock_face_02",
+			"kind": "model",
+			"title": "Rock Face 02",
+			"author": "Dario Barresi, Rico Cilliers",
+			"license": "CC0",
+			"url": "https://polyhaven.com/a/rock_face_02",
+			"usedFor": "岩壁",
+			"source": "Poly Haven"
+		},
+		{
+			"id": "polyhaven/mountainside",
+			"kind": "model",
+			"title": "Mountainside",
+			"author": "Dario Barresi, Rico Cilliers",
+			"license": "CC0",
+			"url": "https://polyhaven.com/a/mountainside",
+			"usedFor": "山坡崖面（近景山体，另有远景低模）",
+			"source": "Poly Haven"
+		},
+		{
+			"id": "polyhaven/rock_moss_set_01",
+			"kind": "model",
+			"title": "Rock Moss Set 01",
+			"author": "Kless Gyzen",
+			"license": "CC0",
+			"url": "https://polyhaven.com/a/rock_moss_set_01",
+			"usedFor": "长苔的石头（6 块拆开单用）",
+			"source": "Poly Haven"
+		},
+		{
+			"id": "polyhaven/aerial_grass_rock",
+			"kind": "texture",
+			"title": "Aerial Grass Rock",
+			"author": "Rob Tuytel",
+			"license": "CC0",
+			"url": "https://polyhaven.com/a/aerial_grass_rock",
+			"usedFor": "草地夹碎石的地表贴图",
+			"source": "Poly Haven"
+		},
+		{
+			"id": "polyhaven/forrest_ground_01",
+			"kind": "texture",
+			"title": "Forest Ground 01",
+			"author": "Rob Tuytel",
+			"license": "CC0",
+			"url": "https://polyhaven.com/a/forrest_ground_01",
+			"usedFor": "林下落叶地表贴图",
+			"source": "Poly Haven"
+		},
+		{
+			"id": "polyhaven/rocky_terrain_02",
+			"kind": "texture",
+			"title": "Rocky Terrain 02",
+			"author": "Amal Kumar",
+			"license": "CC0",
+			"url": "https://polyhaven.com/a/rocky_terrain_02",
+			"usedFor": "碎石地表贴图",
+			"source": "Poly Haven"
+		},
+		{
+			"id": "polyhaven/coast_sand_01",
+			"kind": "texture",
+			"title": "Coast Sand 01",
+			"author": "Rob Tuytel",
+			"license": "CC0",
+			"url": "https://polyhaven.com/a/coast_sand_01",
+			"usedFor": "海边沙地贴图",
+			"source": "Poly Haven"
+		},
+		{
+			"id": "polyhaven/bark_willow_02",
+			"kind": "texture",
+			"title": "Bark Willow 02",
+			"author": "Charlotte Baglioni",
+			"license": "CC0",
+			"url": "https://polyhaven.com/a/bark_willow_02",
+			"usedFor": "树皮贴图",
+			"source": "Poly Haven"
+		},
+		{
+			"id": "quaternius/stylized-nature-megakit",
+			"kind": "model",
+			"title": "Stylized Nature MegaKit",
+			"author": "Quaternius",
+			"license": "CC0",
+			"url": "https://quaternius.itch.io/stylized-nature-megakit",
+			"usedFor": "灌木、开花灌木、蕨、花丛、高草、三叶草、矮植物、卵石、中石块、石板路、蘑菇",
+			"source": "Quaternius"
+		},
+		{
+			"id": "code/seblague-hydraulic-erosion",
+			"kind": "code",
+			"title": "Hydraulic-Erosion（水滴侵蚀算法，按本项目风格用 JavaScript 重写）",
+			"author": "Sebastian Lague",
+			"license": "MIT",
+			"url": "https://github.com/SebLague/Hydraulic-Erosion",
+			"usedFor": "离线烘焙地形时的水滴侵蚀（scripts/terrain-erosion.mjs，原版权和许可声明保留在源码注释里）",
+			"source": "GitHub"
+		},
+		{
+			"id": "code/simondev-quick-grass",
+			"kind": "code",
+			"title": "Quick_Grass（草地的做法参考：实例化草叶、分层的风、侧对镜头时加宽；本项目没有搬代码，全部用 TSL 自己写）",
+			"author": "SimonDev（Simon Dev）",
+			"license": "MIT",
+			"url": "https://github.com/simondevyoutube/Quick_Grass",
+			"usedFor": "src/tsl/grass.js 的三环草（阶段 12 CP3 返工）",
+			"source": "GitHub"
+		},
+		{
+			"id": "sketchfab/gothic-aria-kit",
+			"kind": "model",
+			"title": "Gothic Building For Aria Pack 1.0",
+			"author": "ChamberSu1996",
+			"license": "CC BY 4.0",
+			"url": "https://sketchfab.com/3d-models/gothic-building-for-aria-pack-10-4c00c5e9a9a14388bd58ab9f87f0637b",
+			"usedFor": "哥特城堡（用零件包里的尖塔、副塔、飞扶壁中殿拼成，减面、烘 AO）",
+			"source": "Sketchfab"
+		},
+		{
+			"id": "texture/simon-thommes-brcks",
+			"kind": "texture",
+			"title": "Br'cks（程序砖块着色器）",
+			"author": "Simon Thommes",
+			"license": "CC BY",
+			"url": "https://sketchfab.com/3d-models/gothic-building-for-aria-pack-10-4c00c5e9a9a14388bd58ab9f87f0637b",
+			"usedFor": "哥特城堡零件包的砖石贴图是用这个着色器烘出来的（零件包页面上的署名）",
+			"source": "经 Gothic Building For Aria Pack 1.0"
+		},
+		{
+			"id": "sketchfab/taj-gokul",
+			"kind": "model",
+			"title": "Taj mahal",
+			"author": "Gokul Saravanappriyan",
+			"license": "CC BY 4.0",
+			"url": "https://sketchfab.com/3d-models/taj-mahal-80a8f0644c5d4d739a3a6c02e425adf4",
+			"usedFor": "白银花园的城堡（减面成三级、烘 AO、重新着色成白色大理石和银顶）",
+			"source": "Sketchfab"
+		},
+		{
+			"id": "sketchfab/sakura-rostic-tree",
+			"kind": "model",
+			"title": "Tree Sakura",
+			"author": "RosticOstafi",
+			"license": "CC BY 4.0",
+			"url": "https://sketchfab.com/3d-models/tree-sakura-4a201fe7f1a548fa9a0b32388be75499",
+			"usedFor": "花园里的焦点樱花树（只用树干和枝，花换成程序化的花卡）",
+			"source": "Sketchfab"
+		},
+		{
+			"id": "sketchfab/sakura-rostic",
+			"kind": "model",
+			"title": "Sakura",
+			"author": "RosticOstafi",
+			"license": "CC BY 4.0",
+			"url": "https://sketchfab.com/3d-models/sakura-a995ce485d4d4329a19f6d4604b18c71",
+			"usedFor": "花园里的焦点樱花树（只用树干和枝，花换成程序化的花卡）",
+			"source": "Sketchfab"
+		}
+	]
 }

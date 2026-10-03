@@ -16,12 +16,22 @@ import {
 	positionLocal, positionWorld, positionGeometry, normalGeometry, normalWorld, modelWorldMatrix,
 	cameraPosition, cameraViewMatrix, cameraProjectionMatrix, screenSize,
 	normalize, length, dot, max, min, mix, smoothstep, exp, pow, abs, sin, atan, fwidth, reflect, step,
+	floor, clamp, sqrt, ivec2, textureLoad,
 } from 'three/tsl';
 import { mergeVertices } from 'three/addons/utils/BufferGeometryUtils.js';
 import { jsFbm2D, createNoiseTextureData, sampleNoiseTexture } from '../tsl/noise.js';
 import { daySkyColor, dayAerialColor } from '../tsl/sky.js';
 import { heightFogFactor, henyeyGreenstein } from '../tsl/fog.js';
 import { seaStacks } from './sunset.js';
+import { buildNarrows } from './narrows.js';
+import { createGuide } from '../tsl/guide.js';
+import { loadGroundTextures, groundDetail } from '../tsl/terrain.js';
+import { buildSpeciesTemplates, createLeafMaterial, createBarkMaterial, createTreeField, createUnderstoryLayer, treeSpeciesHash, buildFocalTemplate, loadBlossomModel, buildModelBlossomTemplates, viewFromCamera } from '../tsl/trees.js';
+import { createImpostorForest } from '../tsl/impostors.js';
+import { planForest } from '../core/forest.js';
+import { gardenLayout, gardenGroundLocal } from './garden.js';
+import { loadTexture, loadModel, disposeModel, getManifest, blobOf, gunzipToArrayBuffer } from '../core/assets.js';
+import { grassUnderlayShape } from '../tsl/grass.js';
 
 export const key = 'backdrop';
 
@@ -84,10 +94,16 @@ function fadeOut( low, high, value ) {
 // ===================== 模块状态 =====================
 
 const state = {
+	patches: [],              // 窄处的地形补丁（阶段 12 CP3 返工，见 patchFootprints）
 	ctx: null,
 	world: null,
 	scene: null,
 	root: null,
+	locationTrees: new Set(),   // 地点自己的花树（createLocationBlossoms），每帧跟着镜头重挑
+	mistLayers: [],             // 谷雾每层的网格和高度（镜头在雾层以下时整层不画）
+	cloudClusterMesh: null,     // 云团（入夜整片不画）
+	treeUniforms: null,
+	treeShade: null,
 	ready: false,
 	building: null,       // init 进行中的 Promise：重复调用时直接等同一个，不会两份互相覆盖
 	disposables: [],
@@ -99,12 +115,22 @@ const state = {
 	forest: [],
 	proxyGroups: {},      // 地点 key → 替身 Group（4b 交接时单独显隐）
 	houseFootprints: [],  // 小镇房子的 [x, z, 半径]：树不种在房子里
+	townHouses: [],       // 小镇每栋房子的尺寸（世界坐标），星月夜按面画笔触用：见 buildTown
 	caveUniforms: null,   // 山洞的中线折线、截面、包围盒（地形挖洞和洞里的光用）
 	caveMeshes: [],
 	core: null,
 	outer: null,
 	horizon: null,
 	windDirection: new THREE.Vector2( 1, 0 ),
+	narrows: [],          // 先窄后豁然开朗的窄处网格（narrows.js）
+	corridors: [],        // 窄处和进场低空航线的走廊 [x, z, 半径]：树林让开
+	guide: null,          // 引路的花瓣和光点（tsl/guide.js）
+	ground: null,         // 地表贴图（tsl/terrain.js）；没读到是 null，地面用原来的程序化细节
+	forestItems: [],      // 每棵树（远景树团和近处 3D 树共用）
+	treeField: null,      // 近处的 3D 树（tsl/trees.js）
+	treeView: { x: 0, z: - 1, halfAngle: Math.PI },   // 镜头视锥的水平投影（世界坐标），每帧算一次，近处的树按它挑
+	windowAmounts: {},    // 地点 key → 那个地点替身窗灯的亮度倍数 uniform
+	windowLists: {},      // 地点 key → 替身窗灯的窗户表（世界坐标，星月夜的窗灯笔触用）
 };
 
 const tempVector = new THREE.Vector3();
@@ -120,6 +146,10 @@ const cloudSunWhite = new THREE.Color( '#fff2e0' );
 const caveRingSegments = 40;
 const caveCutoutSegments = 16;
 const caveLightFalloff = 7;      // 洞里的光每 7 米弱 e 倍：洞中间（35 米）只剩洞口的 0.7%，比外面暗两个多数量级
+// 出口那头的光衰减得慢一些（16 米），再加一点洞里的底光：原来洞中段整屏是黑的，只剩引路的光点（2026-10-02 自查开场 57~62 秒）；
+// 规格书 5.1.1 要"镜头擦着两壁前进，出口越来越亮"，洞壁要隐约看得见，往前越走越亮
+const caveExitFalloff = 16;
+const caveFloorLight = 0.012;
 
 // 截面：angle 绕洞一圈；返回 [横向, 离地高度]（米）。超椭圆（指数 2.5）比椭圆方一点，像人工凿过又被水磨圆的洞；
 // 中心在 0.45 × 高，下半截压平成地面
@@ -417,8 +447,11 @@ function caveRockAlbedo( point, normal, mossAmount ) {
 		.add( noiseAt( layerName, point.xy.mul( scale ) )[ channel ].mul( weights.z ) ).div( weightSum );
 	const patch = triplanar( 'small', 6, 'r' );
 	const grain = triplanar( 'rippleFine', 5, 'g' );
-	const crack = float( 1 ).sub( smoothstep( 0, 0.02, abs( triplanar( 'rippleFine', 2.2, 'r' ).sub( 0.5 ) ) ) ).mul( 0.18 );
-	const rock = mix( color( '#55524d' ), color( '#86817a' ), patch ).mul( grain.mul( 0.25 ).add( 0.85 ) ).mul( float( 1 ).sub( crack ) );
+	// 石缝：噪声 0.5 那条等值线，再按另一层噪声断成一截一截（审查 R27：原来是连着的细黑线，洞壁像带卡通描线的光滑管子）
+	const crackBreak = smoothstep( 0.5, 0.7, triplanar( 'small', 2.7, 'g' ) );
+	const crack = float( 1 ).sub( smoothstep( 0, 0.03, abs( triplanar( 'rippleFine', 2.2, 'r' ).sub( 0.5 ) ) ) ).mul( crackBreak ).mul( 0.22 );
+	// 明暗斑块对比加大一点（湿的地方暗、干的地方浅），岩面不是一整片均匀的米色
+	const rock = mix( color( '#4a4743' ), color( '#8a847c' ), smoothstep( 0.2, 0.8, patch ) ).mul( grain.mul( 0.4 ).add( 0.78 ) ).mul( float( 1 ).sub( crack ) );
 	const moss = mix( color( '#3f4a33' ), color( '#56603f' ), grain );
 	const mossCover = smoothstep( 0.55, 0.9, normal.y.add( patch.mul( 0.3 ) ) ).mul( mossAmount ).mul( 0.7 );
 	return mix( rock, moss, mossCover );
@@ -449,10 +482,10 @@ function createCaveWallMaterial() {
 		const towardOuter = normalize( caveUniforms.outerMouth.sub( point ) );
 		const towardInner = normalize( caveUniforms.innerMouth.sub( point ) );
 		const outerLight = exp( along.div( - caveLightFalloff ) ).mul( max( dot( normal, towardOuter ), 0 ).mul( 0.6 ).add( 0.4 ) );
-		const innerLight = exp( fromInner.div( - caveLightFalloff ) ).mul( max( dot( normal, towardInner ), 0 ).mul( 0.6 ).add( 0.4 ) ).mul( 1.3 );
+		const innerLight = exp( fromInner.div( - caveExitFalloff ) ).mul( max( dot( normal, towardInner ), 0 ).mul( 0.6 ).add( 0.4 ) ).mul( 1.3 );
 		// 外口里那团暖光（见 buildCaveGlows）照亮口子里头几米的洞壁，从溪上看洞口里是暖的
 		const mouthWarm = color( '#ffc98f' ).mul( state.ctx.config.overture.mouthGlow * 0.4 ).mul( exp( abs( along.sub( 4 ) ).div( - 2.5 ) ) );
-		const light = skyAmbient.mul( outerLight.add( innerLight.mul( caveUniforms.innerWarmth ) ).add( 0.003 ) ).add( mouthWarm ).mul( state.toggles.山洞.mul( 0.98 ).add( 0.02 ) );
+		const light = skyAmbient.mul( outerLight.add( innerLight.mul( caveUniforms.innerWarmth ) ).add( caveFloorLight ) ).add( mouthWarm ).mul( state.toggles.山洞.mul( 0.98 ).add( 0.02 ) );
 		const surface = albedo.mul( light );
 		// 洞壁外面那一面（从洞口和山坡的缝里偶尔看得到）：暗岩
 		const outside = albedo.mul( skyAmbient ).mul( 0.05 );
@@ -498,7 +531,7 @@ function buildCaveGlows( cave ) {
 
 	const sky = state.world.uniforms;
 	const parts = [];
-	for ( const [ distance, facingOut, size ] of [ [ 4, true, 2.4 ], [ cave.length + 1, false, 7 ] ] ) {
+	for ( const [ distance, facingOut, size ] of [ [ 4, true, 2.4 ], [ cave.length + 1, false, 12 ] ] ) {
 
 		const sample = cave.at( Math.min( cave.length, distance ), {} );
 		const geometry = new THREE.PlaneGeometry( size, size );
@@ -510,7 +543,7 @@ function buildCaveGlows( cave ) {
 		material.fog = false;
 		material.lights = false;
 		material.positionNode = compressedPosition( positionLocal );
-		const strength = facingOut ? 0.16 : 0.5;
+		const strength = facingOut ? 0.16 : 1.2;
 		// 外口（只在开场从溪上看得到）：天光之外再加一团不跟天色走的暖光，黎明前天还暗，洞里那点光要看得出来，靠泛光晕开
 		const warmth = facingOut ? state.ctx.config.overture.mouthGlow : 0;
 		material.colorNode = Fn( () => {
@@ -715,8 +748,35 @@ function gridHeight( grid, x, z ) {
 
 }
 
-// 远景地形的高度（就是网格画出来的高度）：核心区用细网格，外圈用粗网格，再往外当海平面
+// 网格上别的逐点数据（水深、离海多近、台地），插值方法和 gridHeight 一样
+function gridValue( grid, values, x, z ) {
+
+	const cellX = ( x - grid.minX ) / grid.spacing;
+	const cellZ = ( z - grid.minZ ) / grid.spacing;
+	if ( cellX < 0 || cellZ < 0 || cellX > grid.countX - 1 || cellZ > grid.countZ - 1 ) return NaN;
+	const i = Math.min( grid.countX - 2, Math.floor( cellX ) );
+	const j = Math.min( grid.countZ - 2, Math.floor( cellZ ) );
+	const fractionX = cellX - i;
+	const fractionZ = cellZ - j;
+	const index = j * grid.countX + i;
+	const near = values[ index ];
+	const nearRight = values[ index + 1 ];
+	const far = values[ index + grid.countX ];
+	const farRight = values[ index + grid.countX + 1 ];
+	if ( fractionX + fractionZ <= 1 ) return near + ( nearRight - near ) * fractionX + ( far - near ) * fractionZ;
+	return farRight + ( far - farRight ) * ( 1 - fractionX ) + ( nearRight - farRight ) * ( 1 - fractionZ );
+
+}
+
+// 远景地形的高度（就是网格画出来的高度）：窄处的地形补丁里按补丁，核心区用细网格，外圈用粗网格，再往外当海平面
 function terrainHeightAt( x, z ) {
+
+	for ( const patch of state.patches ) {
+
+		const height = patchHeightAt( patch, x, z );
+		if ( height !== null ) return height;
+
+	}
 
 	const fine = gridHeight( state.core, x, z );
 	if ( ! Number.isNaN( fine ) ) return fine;
@@ -818,8 +878,222 @@ function buildGridGeometry( grid, { skirt = 0, hole = null } = {} ) {
 	geometry.setAttribute( 'normal', new THREE.Float32BufferAttribute( normals, 3 ) );
 	// x 有符号海水深，y 离海多近（沙滩），z 在雪原台地上的程度
 	geometry.setAttribute( 'terrainInfo', new THREE.Float32BufferAttribute( terrainInfo, 3 ) );
+	// −1：远景网格本身（窄处的地形补丁里要丢掉）；补丁的顶点是 0~1（接回远景的程度）
+	geometry.setAttribute( 'patchBlend', new THREE.Float32BufferAttribute( new Float32Array( positions.length / 3 ).fill( - 1 ), 1 ) );
 	geometry.setIndex( positions.length / 3 > 65535 ? new THREE.Uint32BufferAttribute( indices, 1 ) : new THREE.Uint16BufferAttribute( indices, 1 ) );
 	geometry.computeBoundingSphere();
+	return geometry;
+
+}
+
+// ===================== 窄处的地形补丁（阶段 12 CP3 返工）=====================
+// 远景网格 8 米一格，画不出窄处 10 米宽的口子、陡壁和岩坎（会被抹成一道软 V）。窄处的 frame 带 patch 时，沿窄处中线铺一块
+// 0.6 米一格（中档 0.9、低档 1.2）的细网格：里面按解析地形（world.sampleAnalytic，岩丘和口子都在里面，烘焙时这一块不侵蚀，
+// 解析和烘焙一致）取高度，边上 blend 米内慢慢接回远景网格画出来的高度。远景网格在补丁里逐像素丢掉（用同一个地形材质，
+// 补丁的顶点 patchBlend ≥ 0 不丢）；补丁比丢掉的范围每边多出 overlap 米、压低 5 厘米藏在远景网格下面，接缝处不会透出天
+function patchFootprints( worldConfig ) {
+
+	const result = [];
+	for ( const leg of worldConfig.legs ) {
+
+		const frame = leg.frame;
+		if ( ! frame || ! frame.patch || ! Array.isArray( frame.path ) || frame.path.length < 2 ) continue;
+		const first = frame.path[ 0 ];
+		const last = frame.path[ frame.path.length - 1 ];
+		const length = Math.hypot( last[ 0 ] - first[ 0 ], last[ 2 ] - first[ 2 ] );
+		if ( length < 1 ) {
+
+			console.warn( `窄处「${ frame.name }」的地形补丁：中线太短，不建补丁` );
+			continue;
+
+		}
+
+		const axisX = ( last[ 0 ] - first[ 0 ] ) / length;
+		const axisZ = ( last[ 2 ] - first[ 2 ] ) / length;
+		const [ before, after ] = frame.patch.extend;
+		const centerAlong = ( length + after - before ) / 2;
+		result.push( {
+			name: frame.name,
+			settings: frame.patch,
+			centerX: first[ 0 ] + axisX * centerAlong,
+			centerZ: first[ 2 ] + axisZ * centerAlong,
+			axisX,
+			axisZ,
+			halfLength: ( length + before + after ) / 2,
+			halfWidth: frame.patch.halfWidth,
+			overlap: frame.patch.overlap,
+		} );
+
+	}
+
+	// 不在窄处的补丁（terrainShape.patches：哥特岩台的崖面……）
+	for ( const patch of worldConfig.terrainShape.patches || [] ) {
+
+		const length = Math.hypot( patch.to[ 0 ] - patch.from[ 0 ], patch.to[ 1 ] - patch.from[ 1 ] );
+		if ( length < 1 ) {
+
+			console.warn( `地形补丁「${ patch.name }」：长轴太短，不建` );
+			continue;
+
+		}
+
+		result.push( {
+			name: patch.name,
+			settings: patch,
+			centerX: ( patch.from[ 0 ] + patch.to[ 0 ] ) / 2,
+			centerZ: ( patch.from[ 1 ] + patch.to[ 1 ] ) / 2,
+			axisX: ( patch.to[ 0 ] - patch.from[ 0 ] ) / length,
+			axisZ: ( patch.to[ 1 ] - patch.from[ 1 ] ) / length,
+			halfLength: length / 2,
+			halfWidth: patch.halfWidth,
+			overlap: patch.overlap,
+		} );
+
+	}
+
+	return result;
+
+}
+
+// 世界 (x, z) 在补丁里的坐标：沿轴 along、横向 across（往轴的右手边为正，和补丁网格的 j 方向一致）
+function patchCoordinates( patch, x, z ) {
+
+	const offsetX = x - patch.centerX;
+	const offsetZ = z - patch.centerZ;
+	return [ offsetX * patch.axisX + offsetZ * patch.axisZ, - offsetX * patch.axisZ + offsetZ * patch.axisX ];
+
+}
+
+// 补丁画出来的高度（三角形插值，对角线和几何体一样）；不在丢掉远景的那块范围里返回 null
+function patchHeightAt( patch, x, z ) {
+
+	if ( ! patch.heights ) return null;
+	const [ along, across ] = patchCoordinates( patch, x, z );
+	if ( Math.abs( along ) > patch.halfLength - patch.overlap || Math.abs( across ) > patch.halfWidth - patch.overlap ) return null;
+	const cellA = ( along + patch.halfLength ) / patch.spacingA;
+	const cellC = ( across + patch.halfWidth ) / patch.spacingC;
+	const i = Math.min( patch.countA - 2, Math.max( 0, Math.floor( cellA ) ) );
+	const j = Math.min( patch.countC - 2, Math.max( 0, Math.floor( cellC ) ) );
+	const fractionA = cellA - i;
+	const fractionC = cellC - j;
+	const index = j * patch.countA + i;
+	const heights = patch.heights;
+	const near = heights[ index ];
+	const nearRight = heights[ index + 1 ];
+	const far = heights[ index + patch.countA ];
+	const farRight = heights[ index + patch.countA + 1 ];
+	if ( fractionA + fractionC <= 1 ) return near + ( nearRight - near ) * fractionA + ( far - near ) * fractionC;
+	return farRight + ( far - farRight ) * ( 1 - fractionA ) + ( nearRight - farRight ) * ( 1 - fractionC );
+
+}
+
+// 建补丁的几何体（世界坐标，属性和远景网格一样：position、normal、terrainInfo、patchBlend）；高度存进 patch 给 terrainHeightAt 用
+async function buildTerrainPatch( patch, tier, world, slice ) {
+
+	const settings = patch.settings;
+	const spacing = settings.spacing[ tier ] || settings.spacing.mid;
+	const countA = Math.ceil( patch.halfLength * 2 / spacing ) + 1;
+	const countC = Math.ceil( patch.halfWidth * 2 / spacing ) + 1;
+	const spacingA = patch.halfLength * 2 / ( countA - 1 );
+	const spacingC = patch.halfWidth * 2 / ( countC - 1 );
+	const total = countA * countC;
+	const heights = new Float32Array( total );
+	const positions = new Float32Array( total * 3 );
+	const terrainInfo = new Float32Array( total * 3 );
+	const blends = new Float32Array( total );
+	const core = state.core;
+	const started = performance.now();
+	for ( let j = 0; j < countC; j ++ ) {
+
+		const across = - patch.halfWidth + j * spacingC;
+		for ( let i = 0; i < countA; i ++ ) {
+
+			const along = - patch.halfLength + i * spacingA;
+			const x = patch.centerX + patch.axisX * along - patch.axisZ * across;
+			const z = patch.centerZ + patch.axisZ * along + patch.axisX * across;
+			const edge = Math.min( patch.halfLength - Math.abs( along ), patch.halfWidth - Math.abs( across ) );
+			const blend = smoothJs( patch.overlap, patch.overlap + settings.blend, edge );
+			let coarse = gridHeight( core, x, z );
+			let fine = coarse;
+			if ( blend > 0 || ! Number.isFinite( coarse ) ) {
+
+				const sample = world.sampleAnalytic( x, z );
+				fine = sample.waterKind === 'sea' || sample.waterKind === 'lake' ? Math.max( sample.height, sample.waterLevel ) : sample.height;
+				if ( ! Number.isFinite( coarse ) ) coarse = fine;
+
+			}
+
+			const index = j * countA + i;
+			const height = coarse - 0.05 + ( fine - coarse + 0.05 ) * blend;
+			heights[ index ] = height;
+			blends[ index ] = blend;
+			positions[ index * 3 ] = x;
+			positions[ index * 3 + 1 ] = height;
+			positions[ index * 3 + 2 ] = z;
+			const depth = gridValue( core, core.depths, x, z );
+			terrainInfo[ index * 3 ] = Number.isFinite( depth ) ? depth : - 8;
+			terrainInfo[ index * 3 + 1 ] = gridValue( core, core.seaProximity, x, z ) || 0;
+			terrainInfo[ index * 3 + 2 ] = gridValue( core, core.plateau, x, z ) || 0;
+
+		}
+
+		await yieldIfBusy( slice );
+
+	}
+
+	// 法线：补丁网格上中心差分（沿轴、横向两个斜率），再换到世界的 x、z
+	const normals = new Float32Array( total * 3 );
+	for ( let j = 0; j < countC; j ++ ) {
+
+		for ( let i = 0; i < countA; i ++ ) {
+
+			const left = heights[ j * countA + Math.max( 0, i - 1 ) ];
+			const right = heights[ j * countA + Math.min( countA - 1, i + 1 ) ];
+			const down = heights[ Math.max( 0, j - 1 ) * countA + i ];
+			const up = heights[ Math.min( countC - 1, j + 1 ) * countA + i ];
+			const slopeAlong = ( right - left ) / ( ( Math.min( countA - 1, i + 1 ) - Math.max( 0, i - 1 ) ) * spacingA );
+			const slopeAcross = ( up - down ) / ( ( Math.min( countC - 1, j + 1 ) - Math.max( 0, j - 1 ) ) * spacingC );
+			const slopeX = slopeAlong * patch.axisX - slopeAcross * patch.axisZ;
+			const slopeZ = slopeAlong * patch.axisZ + slopeAcross * patch.axisX;
+			const length = Math.hypot( slopeX, 1, slopeZ );
+			const index = ( j * countA + i ) * 3;
+			normals[ index ] = - slopeX / length;
+			normals[ index + 1 ] = 1 / length;
+			normals[ index + 2 ] = - slopeZ / length;
+
+		}
+
+	}
+
+	// 三角形：对角线从 (i, j+1) 连到 (i+1, j)，和远景网格一样（沿轴当 x、横向当 z，横向是轴的右手边，三角形朝上）
+	const indices = new Uint32Array( ( countA - 1 ) * ( countC - 1 ) * 6 );
+	let cursor = 0;
+	for ( let j = 0; j < countC - 1; j ++ ) {
+
+		for ( let i = 0; i < countA - 1; i ++ ) {
+
+			const near = j * countA + i;
+			const far = near + countA;
+			indices[ cursor ++ ] = near;
+			indices[ cursor ++ ] = far;
+			indices[ cursor ++ ] = near + 1;
+			indices[ cursor ++ ] = near + 1;
+			indices[ cursor ++ ] = far;
+			indices[ cursor ++ ] = far + 1;
+
+		}
+
+	}
+
+	const geometry = new THREE.BufferGeometry();
+	geometry.setAttribute( 'position', new THREE.BufferAttribute( positions, 3 ) );
+	geometry.setAttribute( 'normal', new THREE.BufferAttribute( normals, 3 ) );
+	geometry.setAttribute( 'terrainInfo', new THREE.BufferAttribute( terrainInfo, 3 ) );
+	geometry.setAttribute( 'patchBlend', new THREE.BufferAttribute( blends, 1 ) );
+	geometry.setIndex( new THREE.BufferAttribute( indices, 1 ) );
+	geometry.computeBoundingSphere();
+	Object.assign( patch, { countA, countC, spacingA, spacingC, heights } );
+	console.log( `地形补丁「${ patch.name }」：${ countA }×${ countC } 个点（${ spacing } 米一格），取解析高度用了 ${ ( performance.now() - started ).toFixed( 0 ) } 毫秒` );
 	return geometry;
 
 }
@@ -1176,11 +1450,34 @@ function terrainShadow( point, selector, elevation, penumbra ) {
 	If( elevation.greaterThan( - 4 ).and( state.toggles.地形阴影.greaterThan( 0.5 ) ), () => {
 
 		const angle = horizonAngleAt( point, selector );
-		const lit = smoothstep( angle.sub( penumbra ), angle.add( penumbra ), elevation );
+		// 太阳很低（12° 以下）时半影放宽到 3.5°：地平线图格子粗，贴地的阳光下影子边一块块的，像蓝灰色的污渍（审查 R24 那条"带"其实是它）
+		const softPenumbra = float( penumbra ).add( float( 1 ).sub( smoothstep( 4, 12, elevation ) ).mul( 2.2 ) );
+		const lit = smoothstep( angle.sub( softPenumbra ), angle.add( softPenumbra ), elevation );
 		shadow.assign( mix( float( 1 ), lit, uniforms.insideCoreWide( point ) ) );
 
 	} );
+	// 云影（阶段 12 CP5）：只算太阳那一路
+	if ( selector === uniforms.sunHorizon ) return shadow.mul( cloudShadowAt( point ) );
 	return shadow;
+
+}
+
+// 云影：从地面这一点顺着太阳方向找到 4.5 公里高的薄云层（和天空里的薄云同一套坐标、同一张噪声），取两层噪声的覆盖率；
+// 太阳高过 6° 才有，最暗压到六成五（白天大片的云影慢慢飘过山坡和林子，地面不是一整片均匀的光）
+function cloudShadowAt( point ) {
+
+	const uniforms = state.uniforms;
+	const sky = state.world.uniforms;
+	const sunUp = max( sky.sunDirection.y, 0.1 );
+	const layerPoint = point.xz.add( sky.sunDirection.xz.mul( uniforms.cloudHeight.sub( point.y ).div( sunUp ) ) );
+	const along = dot( layerPoint, uniforms.cloudWind );
+	const across = dot( layerPoint, vec2( uniforms.cloudWind.y.negate(), uniforms.cloudWind.x ) );
+	const cloudUv = vec2( along.mul( 0.6 ), across.mul( 1.3 ) ).div( uniforms.cloudScale ).add( uniforms.cloudOffset ).div( 32 );
+	const density = texture( state.textures.noise, cloudUv ).level( 0 ).r.mul( 0.67 ).add( texture( state.textures.noise, cloudUv.mul( 2 ).add( 0.173 ) ).level( 0 ).r.mul( 0.33 ) );
+	const threshold = float( 1 ).sub( uniforms.cloudCoverage );
+	const coverage = smoothstep( threshold.sub( 0.1 ), threshold.add( 0.15 ), density );
+	const daytime = smoothstep( 4, 10, sky.sunElevation );
+	return float( 1 ).sub( coverage.mul( 0.35 ).mul( daytime ).mul( state.toggles.云影 ) );
 
 }
 
@@ -1190,7 +1487,8 @@ function nightAlbedo( albedo ) {
 	const sky = state.world.uniforms;
 	const night = fadeOut( 0.1, 0.5, sky.skyIntensity );
 	const gray = dot( albedo, vec3( lumaWeights[ 0 ], lumaWeights[ 1 ], lumaWeights[ 2 ] ) );
-	return mix( albedo, vec3( 0.62, 0.72, 0.88 ).mul( gray ), night.mul( 0.4 ) );
+	// 夜里人眼的色觉退到偏蓝的灰（Purkinje 效应）：原来只偏四成，雪原往下看盆地还是一片饱和的绿；改六成
+	return mix( albedo, vec3( 0.62, 0.72, 0.88 ).mul( gray ), night.mul( 0.6 ) );
 
 }
 
@@ -1203,10 +1501,15 @@ function lightAt( normal, sunShadow, moonShadow, skyView, wrap = 0.2 ) {
 	const moonDiffuse = dot( normal, sky.moonDirection ).add( wrap ).div( 1 + wrap ).clamp();
 	const skyColor = mix( sky.horizonColor, sky.zenithColor, normal.y.mul( 0.5 ).add( 0.5 ) ).mul( sky.skyIntensity );
 	const bounce = sky.sunLightColor.mul( max( sky.sunDirection.y, 0 ) ).mul( float( 1 ).sub( normal.y ).mul( 0.04 ) );
-	const moonFill = sky.moonLightColor.mul( normal.y.mul( 0.5 ).add( 0.5 ) ).mul( skyView ).mul( 0.12 );
+	// 月光补光：天光遮蔽最多压到一半、系数 0.18（原来 0.12、可以压到 0）。背月的凹崖原来是一大块死黑，
+	// 远看像山上破了个洞（2026-10-02 审查 R4：哥特 → 星月夜途中冰瀑右边那块）
+	const moonFill = sky.moonLightColor.mul( normal.y.mul( 0.5 ).add( 0.5 ) ).mul( max( skyView, 0.5 ) ).mul( 0.18 ).mul( state.uniforms.nightFill );
+	// 地点的反射补光（见 setBounceLight）：方向光，不看地形阴影
+	const bounce2 = state.uniforms.bounceColor.mul( dot( normal, state.uniforms.bounceDirection ).add( 0.15 ).div( 1.15 ).clamp() );
 	return sky.sunLightColor.mul( sunDiffuse.mul( sunShadow ) )
 		.add( sky.moonLightColor.mul( moonDiffuse.mul( moonShadow ) ) )
 		.add( moonFill )
+		.add( bounce2 )
 		.add( skyColor.mul( skyView ).mul( state.uniforms.ambientStrength ) )
 		.add( bounce );
 
@@ -1245,8 +1548,11 @@ function applyAtmosphere( litSurface, point, viewer ) {
 	// 高度从雾的底面（地点原点的海拔）量；底面以下 15~40 米以外不吃这层雾（雪原的雾不会灌进崖下的盆地），也防 exp 溢出
 	const fogPoint = vec3( point.x, max( point.y.sub( uniforms.locationFogBase ), - 40 ), point.z );
 	const fogEye = vec3( viewer.x, viewer.y.sub( uniforms.locationFogBase ), viewer.z );
+	// 水平 1.2~2.4 公里以外淡掉：这层雾是为了地点地形的边上看不出接缝，远处的山交给大气透视；不然雪原朝南看，
+	// 高过雾底面的远山山顶被染成一条均匀的青带（2026-10-02 审查 R2）
 	const locationFog = heightFogFactor( uniforms.locationFogDensity, uniforms.locationFogFalloff, fogPoint, fogEye )
-		.mul( smoothstep( - 40, - 15, point.y.sub( uniforms.locationFogBase ) ) ).mul( uniforms.locationFogAmount );
+		.mul( smoothstep( - 40, - 15, point.y.sub( uniforms.locationFogBase ) ) ).mul( uniforms.locationFogAmount )
+		.mul( float( 1 ).sub( smoothstep( 1200, 2400, length( point.xz.sub( viewer.xz ) ) ) ) );
 	const locationFogColor = uniforms.locationFogColor.add( uniforms.locationFogScatter.mul( henyeyGreenstein( dot( direction, uniforms.locationFogLight ), uniforms.locationFogAnisotropy ).mul( 0.25 ) ) );
 	return mix( misted, locationFogColor, locationFog );
 
@@ -1274,6 +1580,65 @@ function forestMaskJs( x, z, height, slope, flowers, peach ) {
 
 }
 
+// ===================== 融水冰槽的冰（地形着色用，雪原的雪材质也用）=====================
+// 离冰槽（terrainShape.notches 里 ice 的）中线多近：底宽以内 + 8 米是 1，再往外 6 米淡掉。折线是常数，直接写进着色器
+export function iceTroughAmount( worldXZ ) {
+
+	const notches = ( state.world.config.terrainShape.notches || [] ).filter( ( notch ) => notch.ice );
+	let amount = float( 0 );
+	for ( const notch of notches ) {
+
+		let nearest = float( 1e5 );
+		for ( let i = 1; i < notch.points.length; i ++ ) {
+
+			const from = vec2( notch.points[ i - 1 ][ 0 ], notch.points[ i - 1 ][ 2 ] );
+			const span = vec2( notch.points[ i ][ 0 ] - notch.points[ i - 1 ][ 0 ], notch.points[ i ][ 2 ] - notch.points[ i - 1 ][ 2 ] );
+			const t = clamp( dot( worldXZ.sub( from ), span ).div( dot( span, span ) ), 0, 1 );
+			nearest = min( nearest, length( worldXZ.sub( from.add( span.mul( t ) ) ) ) );
+
+		}
+
+		amount = max( amount, float( 1 ).sub( smoothstep( notch.halfBottom + 8, notch.halfBottom + 14, nearest ) ) );
+
+	}
+
+	return amount;
+
+}
+
+// 海边岩丘（terrainShape.knolls，落日身后被溪水切开的那座）的露岩：规格书 5.3 "顶上缓、长草，两侧有圆有陡、露岩"。
+// 岩丘被烘焙保护着（形状由解析公式定），烘焙的岩石外露里没有它，原来两侧整片是光滑的黄绿草坡（2026-10-02 自查）。
+// 岩丘范围里坡度 0.2 以上就开始露岩（别处 0.38），按两层噪声成片：一块块岩头从草里拱出来，顶上平缓处还是草
+function knollRockAmount( point, slope, mediumPatch, smallPatch ) {
+
+	const knolls = state.world.config.terrainShape.knolls || [];
+	let inside = float( 0 );
+	for ( const knoll of knolls ) {
+
+		const from = vec2( knoll.from[ 0 ], knoll.from[ 1 ] );
+		const span = vec2( knoll.to[ 0 ] - knoll.from[ 0 ], knoll.to[ 1 ] - knoll.from[ 1 ] );
+		const t = clamp( dot( point.xz.sub( from ), span ).div( dot( span, span ) ), 0, 1 );
+		const distance = length( point.xz.sub( from.add( span.mul( t ) ) ) );
+		inside = max( inside, float( 1 ).sub( smoothstep( knoll.width * 0.9, knoll.width * 1.3, distance ) ) );
+
+	}
+
+	// 噪声为主、坡度为辅：成团的岩头（约一半的坡面），不是整面坡刷成岩石（第一版整个侧面成了一块棕的）
+	// 着色只给细碎的小块（岩头本身是摆上去的半埋苔石，见 narrows.js 的 knollScatter.outcrops）：小斑块为主，大块的会像迷彩（第二版）
+	const outcrop = smoothstep( 0.6, 0.7, smallPatch.mul( 0.7 ).add( mediumPatch.mul( 0.3 ) ).add( slope.sub( 0.35 ).mul( 0.8 ) ) );
+	return outcrop.mul( inside ).mul( 0.85 );
+
+}
+
+// 冰的颜色：竖着的融水纹（沿槽方向窄、竖直方向长的噪声）、一层层冻上去的深浅
+export function iceTroughColor( point ) {
+
+	const streak = noiseAt( 'rippleFine', vec2( point.x.add( point.z ).mul( 2.2 ), point.y.mul( 0.35 ) ) ).r;
+	const layer = noiseAt( 'small', vec2( point.x.mul( 0.4 ), point.y.mul( 3 ) ) ).g;
+	return mix( color( '#8db2d8' ), color( '#d4e5f6' ), streak.mul( 0.45 ).add( layer.mul( 0.35 ) ).add( 0.1 ) );
+
+}
+
 // ===================== 地形材质 =====================
 
 function createTerrainMaterial() {
@@ -1290,24 +1655,48 @@ function createTerrainMaterial() {
 
 	// 地点自己画的东西底下，远景要让开，不然两层地面、两层海面互相穿插闪烁：
 	//   海面下沉（落日）：海面圆盘里远景的海顶点往下沉（岸上的点不动，着色还是按原来的位置算，颜色不变）
-	//   内容挖洞（雪原）：地点局部坐标的一个矩形里，远景整体压低（地点自己的地形边上贴着远景的高度，跨在边上的三角形只会往下斜）
+	//   内容挖洞（各地点）：地点局部坐标的一个矩形里，远景逐像素丢掉（阶段 12：原来是把顶点压低，跨在矩形边上的三角形
+	//   斜下去，边外一圈出现几十米深的沟；地点自己的地形边上贴着远景的高度，矩形边上正好接上）
 	const seaVertex = step( 0, attribute( 'terrainInfo', 'vec3' ).x );
 	const seaSink = seaVertex.mul( fadeOut( uniforms.seaCutRadius, uniforms.seaCutRadius.add( uniforms.seaCutFade ), length( positionLocal.xz.sub( uniforms.seaCutCenter ) ) ) ).mul( uniforms.seaCutDepth );
-	const scenePoint = modelWorldMatrix.mul( vec4( positionLocal, 1 ) ).xyz;
-	const inHole = step( uniforms.holeMin.x, scenePoint.x ).mul( step( scenePoint.x, uniforms.holeMax.x ) ).mul( step( uniforms.holeMin.y, scenePoint.z ) ).mul( step( scenePoint.z, uniforms.holeMax.y ) );
 	// 湖面下沉（哥特城堡）：湖岸线（和 world.lakeRadius 同一个带起伏的椭圆）以内的顶点往下沉，地点自己的湖面盖上去
 	const lakeConfig = state.world.config.lake;
 	const lakeOffset = positionLocal.xz.sub( vec2( lakeConfig.center[ 0 ], lakeConfig.center[ 1 ] ) ).div( vec2( lakeConfig.radiusX, lakeConfig.radiusZ ) );
 	const lakeAngle = atan( lakeOffset.y, lakeOffset.x );
 	const lakeWobble = float( 1 ).add( sin( lakeAngle.mul( 3 ).add( 0.7 ) ).mul( 0.08 ) ).add( sin( lakeAngle.mul( 7 ) ).mul( 0.05 ) );
 	const lakeSink = step( length( lakeOffset ).div( lakeWobble ), 1.02 ).mul( uniforms.lakeCutDepth );
-	material.positionNode = compressedPosition( positionLocal.sub( vec3( 0, seaSink.add( inHole.mul( uniforms.holeDepth ) ).add( lakeSink ), 0 ) ) );
+	// 地点地形边上的一条带（雪原原点往南到崖边的看台，不能挖洞：一挖连崖面一起挖掉）：远景顶点往下压几米、边上渐变，
+	// 地点自己的地面盖在上面（2026-10-02 自查：飞到雪原时远景的台地从雪原的雪面底下钻出来一大块灰影）
+	const sinkPoint = modelWorldMatrix.mul( vec4( positionLocal, 1 ) ).xz;
+	const sinkInside = smoothstep( uniforms.sinkMin.x, uniforms.sinkMin.x.add( uniforms.sinkFade ), sinkPoint.x )
+		.mul( float( 1 ).sub( smoothstep( uniforms.sinkMax.x.sub( uniforms.sinkFade ), uniforms.sinkMax.x, sinkPoint.x ) ) )
+		.mul( smoothstep( uniforms.sinkMin.y, uniforms.sinkMin.y.add( uniforms.sinkFade ), sinkPoint.y ) )
+		.mul( float( 1 ).sub( smoothstep( uniforms.sinkMax.y.sub( uniforms.sinkFade ), uniforms.sinkMax.y, sinkPoint.y ) ) );
+	const bandSink = sinkInside.mul( uniforms.sinkDepth );
+	material.positionNode = compressedPosition( positionLocal.sub( vec3( 0, seaSink.add( lakeSink ).add( bandSink ), 0 ) ) );
 
 	material.colorNode = Fn( () => {
 
 		const point = positionGeometry;   // 几何体就建在世界坐标里
 		// 山洞穿过的那一截地形不画（从外面看是山上的口子，从洞里看是洞壁）
 		Discard( caveCutout( point ).greaterThan( 0.5 ) );
+		// 地点自己的地形块里不画（地点坐标里的矩形，见 setContentHole）
+		const scenePoint = modelWorldMatrix.mul( vec4( point, 1 ) ).xyz;
+		const inHole = step( uniforms.holeMin.x, scenePoint.x ).mul( step( scenePoint.x, uniforms.holeMax.x ) ).mul( step( uniforms.holeMin.y, scenePoint.z ) ).mul( step( scenePoint.z, uniforms.holeMax.y ) );
+		Discard( inHole.greaterThan( 0.5 ) );
+		// 窄处的地形补丁里远景网格不画（补丁自己的顶点 patchBlend ≥ 0，不丢）。补丁的位置是定的，直接写成常数
+		const patchBlend = attribute( 'patchBlend', 'float' );
+		const isGrid = step( patchBlend, - 0.5 );
+		for ( const patch of state.patches ) {
+
+			const offset = point.xz.sub( vec2( patch.centerX, patch.centerZ ) );
+			const along = dot( offset, vec2( patch.axisX, patch.axisZ ) );
+			const across = dot( offset, vec2( - patch.axisZ, patch.axisX ) );
+			const inside = step( abs( along ), patch.halfLength - patch.overlap ).mul( step( abs( across ), patch.halfWidth - patch.overlap ) );
+			Discard( inside.mul( isGrid ).greaterThan( 0.5 ) );
+
+		}
+
 		const viewer = viewerPosition();
 		const toPoint = point.sub( viewer );
 		const distance = max( length( toPoint ), 1e-3 );
@@ -1315,7 +1704,14 @@ function createTerrainMaterial() {
 		const toViewer = viewDirection.negate();
 		const xz = point.xz;
 		const height = point.y;
-		const geometryNormal = normalize( normalGeometry );
+		// 法线：核心区里用烘焙地形的法线（4.17 米一格，侵蚀出来的冲沟、碎石坡都看得出）；网格的法线只有 25 米的平滑起伏
+		const surfaceSample = texture( state.textures.surface.texture, xz.mul( uniforms.surfaceScale ).add( uniforms.surfaceOffset ) ).toVar();
+		const bakedAmount = uniforms.bakedSurface.mul( uniforms.insideCore( point ) );
+		// 补丁里几何体本身就比烘焙的 4 米一格细：法线、岩石外露、凹凸按补丁的 patchBlend 退回几何体自己的（边上接回烘焙的，没有接缝）
+		const bakedShape = bakedAmount.mul( float( 1 ).sub( max( patchBlend, 0 ) ) );
+		const bakedXZ = surfaceSample.rg.mul( 2 ).sub( 1 );
+		const bakedNormal = normalize( vec3( bakedXZ.x, pow( max( float( 1 ).sub( dot( bakedXZ, bakedXZ ) ), 0.0004 ), 0.5 ), bakedXZ.y ) );
+		const geometryNormal = normalize( mix( normalize( normalGeometry ), bakedNormal, bakedShape ) );
 		const slope = float( 1 ).sub( geometryNormal.y );
 		// 一个像素在地面上多大（米）：小尺度的花纹在像素比它大时淡掉，远处不闪
 		const footprint = max( length( fwidth( point ) ), 0.01 ).toVar();
@@ -1340,9 +1736,38 @@ function createTerrainMaterial() {
 		const smallPatch = mix( float( 0.5 ), smallSample.r, smallFade );
 
 		// ---------- 反照率 ----------
-		// 草地：黄绿和翠绿按大斑块交替，高处的草甸偏黄褐
-		const meadow = mix( color( '#7d9a58' ), color( '#a3b46a' ), smoothstep( 0.3, 0.7, largePatch ) ).mul( mediumPatch.mul( 0.25 ).add( 0.85 ) );
+		// 草甸（阶段 12 CP3 绘本化）：不是一整片均匀的绿，而是几种绿和金绿成片地换——
+		//   汇水多的沟里、谷底是深而润的绿，山脊、离谷底高的坡偏干、偏金绿，冲出来的扇面（沉积）偏橄榄；
+		//   再按两层大斑块在三四个颜色之间"分色"（smoothstep 收窄，边缘是一块一块的，不是渐变），像水彩的色块；
+		//   最后一层顺等高线方向拉长的笔触（几十米长、几米宽），从飞行高度看下去地上有笔触感
+		const surfaceSampleB = texture( state.textures.surface.textureB, xz.mul( uniforms.surfaceScale ).add( uniforms.surfaceOffset ) ).toVar();
+		const wetness = smoothstep( 0.25, 0.75, surfaceSampleB.r ).mul( bakedAmount );
+		const sediment = smoothstep( 0.05, 0.4, surfaceSampleB.g ).mul( bakedAmount );
+		const dryness = smoothstep( 0.25, 0.75, surfaceSampleB.b ).mul( bakedAmount ).mul( float( 1 ).sub( wetness.mul( 0.7 ) ) );
+		const patchA = smoothstep( 0.33, 0.67, largePatch );
+		const patchB = smoothstep( 0.3, 0.7, mediumPatch );
+		const fresh = mix( color( '#73a050' ), color( '#8daf5b' ), patchB );          // 翠绿 ↔ 嫩黄绿
+		const mellow = mix( color( '#7d9d57' ), color( '#6a9259' ), patchB );         // 橄榄绿 ↔ 蓝绿
+		let meadow = mix( fresh, mellow, patchA );
+		meadow = mix( meadow, color( '#4e7c43' ), wetness.mul( 0.7 ) );              // 沟里、谷底：深润的绿
+		meadow = mix( meadow, color( '#a7a862' ), dryness.mul( 0.55 ) );             // 脊上：金绿
+		meadow = mix( meadow, color( '#8f9a5a' ), sediment.mul( 0.4 ) );             // 冲积扇：橄榄
+		// 笔触：沿等高线方向拉长的两层噪声（噪声贴图一圈 32 格：等高线方向一格 20 米、下坡方向一格 2.5 米；第二层一半大），只调明暗 ±8%。
+		// 直接取噪声贴图（noiseAt 的各层会把坐标转一个角度，拉长的方向就不顺等高线了）
+		const downhill = normalize( vec2( geometryNormal.x, geometryNormal.z ).add( vec2( 1e-4, 0 ) ) );
+		const strokeCoord = vec2( dot( xz, vec2( downhill.y.negate(), downhill.x ) ).div( 640 ), dot( xz, downhill ).div( 80 ) );
+		const stroke = texture( state.textures.noise, strokeCoord ).r.mul( 0.6 ).add( texture( state.textures.noise, strokeCoord.mul( 2.03 ).add( vec2( 0.37, 0.11 ) ) ).g.mul( 0.4 ) );
+		meadow = meadow.mul( stroke.sub( 0.5 ).mul( 0.16 ).mul( toggles.笔触边缘 ).add( 1 ) );
 		const albedo = mix( meadow, color( '#a29770' ), smoothstep( 260, 460, height ).mul( 0.6 ) ).mul( smallPatch.mul( 0.2 ).add( 0.9 ) ).toVar();
+
+		// 野花（阶段 12 CP3）：草甸上零零星星的白、黄、粉、淡紫小点，冲积的平地和润的地方多一些；
+		// 点按像素足迹淡掉（远处只剩一层很淡的花色，不闪）
+		const flowerSeed = noiseAt( 'rippleFine', xz.mul( 3.1 ) ).toVar();   // 一格约 1.4 米：一朵朵是半米上下的小团
+		const wildDensity = smoothstep( 0.35, 0.7, mediumPatch.mul( 0.6 ).add( sediment.mul( 0.4 ) ).add( wetness.mul( 0.2 ) ) ).mul( fadeOut( 0.08, 0.2, slope ) ).mul( fadeOut( 120, 260, height ) );
+		const wildDot = smoothstep( float( 0.8 ).sub( wildDensity.mul( 0.12 ) ), 0.9, flowerSeed.r ).mul( wildDensity ).mul( fadeOut( 0.25, 0.9, footprint ) );
+		const wildTint = mix( mix( color( '#f6f2ea' ), color( '#f1d66a' ), smoothstep( 0.3, 0.45, flowerSeed.g ) ), mix( color( '#f0b5c8' ), color( '#c9b6e8' ), smoothstep( 0.6, 0.75, flowerSeed.g ) ), smoothstep( 0.5, 0.55, flowerSeed.g ) );
+		const wildHaze = wildDensity.mul( 0.06 ).mul( smoothstep( 0.25, 0.9, footprint ) );
+		albedo.assign( mix( albedo, wildTint, max( wildDot.mul( 0.85 ), wildHaze ).mul( toggles.野花 ) ) );
 
 		// 花海：白、粉、淡紫的碎点，远看是一层柔和的粉白；只开在平地上
 		If( flowerAmount.greaterThan( 0.004 ), () => {
@@ -1364,10 +1789,24 @@ function createTerrainMaterial() {
 		albedo.assign( mix( albedo, mix( color( '#eeb0c2' ), color( '#f8d3de' ), smallPatch ), peachBloom ) );
 
 		// 岩石：陡坡露出岩石，带水平的岩层（两种频率叠加，噪声扰动，同 TerrainGenerator 的做法）
-		const rock = smoothstep( 0.38, 0.6, slope.add( mediumPatch.sub( 0.5 ).mul( 0.22 ) ) );
+		// 有烘焙时按烘焙的"岩石外露"（陡崖、被冲刷的地方），不再按一个坡度阈值（那样花园四周压平盘外面正好一圈水平的岩石带）
+		const rockBySlope = smoothstep( 0.38, 0.6, slope.add( mediumPatch.sub( 0.5 ).mul( 0.22 ) ) );
+		const rockBaked = smoothstep( 0.25, 0.75, surfaceSample.b.add( mediumPatch.sub( 0.5 ).mul( 0.3 ) ) );
+		const knollRock = knollRockAmount( point, slope, mediumPatch, smallPatch );
+		// 不太陡的坡上露岩碎成一块块（中间夹着草和灌丛），不是整片连着（审查 R23：花园东边山坡上一大片光滑的灰"毯子"）；陡崖照旧整面是岩
+		const rockBreakup = mix( smoothstep( 0.32, 0.62, mediumPatch.mul( 0.6 ).add( smallPatch.mul( 0.4 ) ) ), float( 1 ), smoothstep( 0.62, 0.82, slope ) );
+		const rock = max( mix( rockBySlope, rockBaked, bakedShape ).mul( rockBreakup ), knollRock ).toVar();
 		const strata = sin( height.mul( 0.11 ).add( point.x.mul( 0.008 ) ).add( largePatch.mul( 9 ) ) ).mul( 0.6 )
 			.add( sin( height.mul( 0.29 ).add( mediumPatch.mul( 5 ) ) ).mul( 0.4 ) ).mul( 0.5 ).add( 0.5 );
-		const rockColor = mix( color( '#8f887d' ), color( '#6c6763' ), strata.mul( 0.35 ).add( mediumPatch.mul( 0.65 ) ) ).mul( smallPatch.mul( 0.2 ).add( 0.9 ) );
+		const rockColor = mix( color( '#8f887d' ), color( '#6c6763' ), strata.mul( 0.35 ).add( mediumPatch.mul( 0.65 ) ) ).mul( smallPatch.mul( 0.2 ).add( 0.9 ) ).toVar();
+		// 岩丘的岩头是冷灰、暗一点（和口子两壁的岩石扫描一个色，夕照下不发红）
+		rockColor.mulAssign( mix( vec3( 1 ), vec3( 0.66, 0.7, 0.8 ), knollRock ) );
+		// 哥特岩台一带的岩是深色的（阶段 12 CP4：原来和别处一样的灰白，夜里一照像一块石膏；城堡要坐在暗的岩上，窗灯才跳出来）
+		rockColor.mulAssign( mix( float( 1 ), float( 0.5 ), uniforms.mesaDark( point ) ) );
+		// 雪原台地南缘那面崖（冰瀑崖）也是深色岩，岩层明暗加重（审查 R16：原来灰白的岩面夜里一照和雪一个色，
+		// 圆鼓鼓的冲沟像一面挂下来的布帘）；雪只留在缓一点的台阶上（下面的雪按坡度减）
+		const plateauCliff = smoothstep( - 1300, - 1420, point.z ).mul( smoothstep( 190, 280, height ) ).mul( fadeOut( 545, 562, height ) );
+		rockColor.mulAssign( mix( float( 1 ), strata.mul( 0.35 ).add( 0.38 ), plateauCliff ) );
 		albedo.assign( mix( albedo, rockColor, rock ) );
 
 		// 海边的沙滩
@@ -1377,7 +1816,9 @@ function createTerrainMaterial() {
 		// 雪：雪原台地上全是雪；别处只有 600 米上下的山顶戴雪帽；太陡的岩壁挂不住雪；风吹的雪窝颜色稍冷
 		const snowLine = float( 600 ).add( largePatch.sub( 0.5 ).mul( 140 ) );
 		const snowCover = max( smoothstep( snowLine.sub( 25 ), snowLine.add( 25 ), height ), smoothstep( 0.4, 0.9, terrainInfo.z ) );
-		const snow = snowCover.mul( float( 1 ).sub( smoothstep( 0.38, 0.62, slope.add( mediumPatch.sub( 0.5 ).mul( 0.15 ) ) ).mul( 0.85 ) ) );
+		// 冰瀑崖上雪挂不住的坡度放低一些（0.38 → 0.24 开始掉），陡面露出深色岩，缓的台阶上留雪
+		const snowSlopeStart = mix( float( 0.38 ), float( 0.24 ), plateauCliff );
+		const snow = snowCover.mul( float( 1 ).sub( smoothstep( snowSlopeStart, snowSlopeStart.add( 0.24 ), slope.add( mediumPatch.sub( 0.5 ).mul( 0.15 ) ) ).mul( mix( float( 0.85 ), float( 0.95 ), plateauCliff ) ) ) );
 		const snowColor = mix( color( '#eef3fa' ), color( '#d3dcea' ), smoothstep( 0.3, 0.75, smallPatch ).mul( 0.5 ) );
 		albedo.assign( mix( albedo, snowColor, snow ) );
 
@@ -1388,12 +1829,52 @@ function createTerrainMaterial() {
 			.mul( smoothstep( uniforms.iceFallZ.x.sub( 15 ), uniforms.iceFallZ.x.add( 15 ), point.z ) )
 			.mul( fadeOut( uniforms.iceFallZ.y.sub( 15 ), uniforms.iceFallZ.y.add( 15 ), point.z ) );
 		albedo.assign( mix( albedo, color( '#cfe6fb' ), iceFall ) );
+		// 融水冰槽（星月夜 → 雪原的窄处，阶段 12 CP3 返工）：槽壁是冰——偏青蓝、竖着的融水纹、一层层冻上去的深浅
+		const iceTrough = iceTroughAmount( point.xz ).mul( smoothstep( 0.28, 0.5, slope ) );
+		albedo.assign( mix( albedo, iceTroughColor( point ), iceTrough ) );
+		// 烘焙的凹凸：沟里暗一点、棱上亮一点（细的 AO，只在核心区）
+		albedo.assign( albedo.mul( mix( float( 1 ), surfaceSample.a.mul( 0.5 ).add( 0.75 ), bakedShape ) ) );
+		// 草根融合（阶段 12 CP3 返工）：地点里的草长出地点自己的地面、落到远景上时，近环里的地面往草根色压，草缝里是暗的草根不是亮的地面
+		// 远环范围里往草的中段色靠，近环里往草根色压（形状和 grass.js 的 underlay 共用 grassUnderlayShape）
+		const grassDistance = length( point.xz.sub( uniforms.grassUnderlayCenter ) );
+		// 半径先夹到 ≥ 1（没有草时半径是 0，smoothstep 的两个边界相等，结果未定义），再乘 step 关掉
+		const grassNearRadius = max( uniforms.grassUnderlayRadius, 1 );
+		const grassFarRadius = max( uniforms.grassUnderlayFar, 1 );
+		const grassNearness = fadeOut( grassNearRadius.mul( grassUnderlayShape.nearStart ), grassNearRadius, grassDistance )
+			.mul( step( 1, uniforms.grassUnderlayRadius ) ).mul( uniforms.grassUnderlayNear ).mul( grassUnderlayShape.nearStrength );
+		const grassFarness = fadeOut( grassFarRadius.mul( grassUnderlayShape.farStart ), grassFarRadius, grassDistance )
+			.mul( step( 1, uniforms.grassUnderlayFar ) ).mul( uniforms.grassUnderlayFarAmount ).mul( grassUnderlayShape.farStrength );
+		If( max( grassNearness, grassFarness ).mul( uniforms.grassUnderlayAmount ).greaterThan( 0.001 ), () => {
+
+			const grassDensity = grassGroundAtWorld( point.xz ).density.mul( uniforms.grassUnderlayAmount );
+			albedo.assign( mix( albedo, uniforms.grassMiddleColor, grassFarness.mul( grassDensity ) ) );
+			albedo.assign( mix( albedo, uniforms.grassRootColor, grassNearness.mul( grassDensity ) ) );
+
+		} );
 		albedo.assign( nightAlbedo( albedo ) );
 
 		// ---------- 细节起伏：直接用噪声贴图里的梯度通道扰动法线（对 8 位噪声求屏幕导数会出等高线和棋盘格）----------
 		const reliefAmplitude = mix( float( 1.2 ), float( 3.5 ), rock ).mul( mix( float( 1 ), float( 0.2 ), snow ) ).mul( fadeOut( 8, 30, footprint ) ).mul( toggles.地表细节 );
 		const reliefSlope = noiseGradientWorld( 'relief', reliefSample ).mul( reliefAmplitude );
-		const normal = normalize( geometryNormal.sub( vec3( reliefSlope.x, 0, reliefSlope.y ) ) );
+		let normal = normalize( geometryNormal.sub( vec3( reliefSlope.x, 0, reliefSlope.y ) ) );
+
+		// ---------- 近处的真贴图（阶段 12 CP3）：明暗、一点色相、法线；雪上、水里不加 ----------
+		if ( state.ground ) {
+
+			const forestWeight = forest.mul( 0.9 );
+			const meadowWeight = max( float( 1 ).sub( rock ).sub( beach ).sub( forestWeight.mul( 0.7 ) ), 0.05 );
+			const detail = groundDetail( state.ground, {
+				point,
+				normal,
+				weights: vec4( meadowWeight, forestWeight, rock, beach ),
+				viewDistance: distance,
+				near: uniforms.groundNear,
+			} );
+			const bare = float( 1 ).sub( snow.mul( 0.9 ) );
+			albedo.assign( albedo.mul( mix( vec3( 1 ), detail.shade, bare ) ) );
+			normal = normalize( mix( normal, detail.normal, bare ) );
+
+		}
 
 		// ---------- 光照 ----------
 		const sunShadow = terrainShadow( point, uniforms.sunHorizon, sky.sunElevation, 1.3 );
@@ -1403,7 +1884,7 @@ function createTerrainMaterial() {
 
 		// 冰瀑和雪在逆光里的一点镜面（掠射时亮）
 		const grazing = max( float( 1 ).sub( max( dot( normal, toViewer ), 0 ) ), 0 );
-		const sheen = pow( grazing, 4 ).mul( snow.mul( 0.12 ).add( iceFall.mul( 0.2 ) ) );
+		const sheen = pow( grazing, 4 ).mul( snow.mul( 0.12 ).add( iceFall.mul( 0.2 ) ).add( iceTrough.mul( 0.35 ) ) );
 		surface.addAssign( sky.sunLightColor.mul( sunShadow ).add( sky.moonLightColor.mul( moonShadow ) ).mul( sheen ) );
 
 		// ---------- 水：海按顶点（海岸线由顶点插值），湖、河、水池按地表图（4 米一个像素，按像素足迹软边）----------
@@ -1434,6 +1915,16 @@ function createTerrainMaterial() {
 
 			// 太阳、月亮的高光：Beckmann 分布，海面粗糙度按 Cox–Munk 的量级（σ² ≈ 0.02），湖面更平；远处像素里的微波平均掉，粗糙度变大
 			const roughness = mix( float( 0.004 ), float( 0.02 ), seaAmount ).add( smoothstep( 0, 40, footprint ).mul( 0.02 ) );
+			// Smith 遮挡（Walter 2007 对 Beckmann 的有理近似，和落日海面同一个式子）：掠射角下浪背面互相挡。
+			// 原来没有它，太阳贴着海平线时 1 / (4·N·V) 在地平线上冲成一个圆亮斑，出裂隙那一刻像"两个太阳"（审查 R20）
+			const smith = ( cosineTheta ) => {
+
+				const clamped = clamp( cosineTheta, 1e-3, 0.9999 );
+				const ratio = clamped.div( sqrt( roughness ).mul( sqrt( float( 1 ).sub( clamped.mul( clamped ) ) ) ) );
+				const rational = ratio.mul( 3.535 ).add( ratio.mul( ratio ).mul( 2.181 ) ).div( ratio.mul( 2.276 ).add( ratio.mul( ratio ).mul( 2.577 ) ).add( 1 ) );
+				return select( ratio.lessThan( 1.6 ), rational, float( 1 ) );
+
+			};
 			const glint = ( lightDirection, lightColor, shadow ) => {
 
 				const halfVector = normalize( lightDirection.add( toViewer ) );
@@ -1441,7 +1932,8 @@ function createTerrainMaterial() {
 				const cosineSquared = cosine.mul( cosine );
 				const beckmann = exp( cosineSquared.sub( 1 ).div( cosineSquared.mul( roughness ) ) ).div( roughness.mul( Math.PI ).mul( cosineSquared ).mul( cosineSquared ) );
 				const glintFresnel = float( 0.02 ).add( pow( max( float( 1 ).sub( max( dot( toViewer, halfVector ), 0 ) ), 0 ), 5 ).mul( 0.98 ) );
-				return lightColor.mul( beckmann.mul( glintFresnel ).div( facing.mul( 4 ) ) ).mul( shadow ).mul( smoothstep( - 0.02, 0.02, lightDirection.y ) );
+				const masking = smith( facing ).mul( smith( dot( waterNormal, lightDirection ) ) );
+				return lightColor.mul( beckmann.mul( glintFresnel ).mul( masking ).div( facing.mul( 4 ) ) ).mul( shadow ).mul( smoothstep( - 0.02, 0.02, lightDirection.y ) );
 
 			};
 			const highlights = glint( sky.sunDirection, sky.sunLightColor, sunShadow ).add( glint( sky.moonDirection, sky.moonLightColor, moonShadow ) ).mul( toggles.水面高光 );
@@ -1469,6 +1961,49 @@ function createTerrainMaterial() {
 	} )();
 
 	return material;
+
+}
+
+// ===================== 烘焙地形的遮罩贴图 =====================
+// A 通道：法线 x、法线 z、岩石外露、凹凸（scripts/bake-terrain.mjs 写的，4.17 米一个像素）。没有烘焙时给一个 1×1 的中性像素
+// （法线朝上、没有岩石、不凹不凸），着色器的节点一样，不用另编一套
+function createSurfaceTexture( terrainBake ) {
+
+	if ( ! terrainBake || ! terrainBake.surfaceA ) {
+
+		const neutral = new THREE.DataTexture( new Uint8Array( [ 128, 128, 0, 128 ] ), 1, 1, THREE.RGBAFormat, THREE.UnsignedByteType );
+		neutral.needsUpdate = true;
+		neutral.name = '烘焙地形遮罩（没有）';
+		// B 的中性值：汇水少、不沉积、离谷底一半高、适合长树
+		const neutralB = new THREE.DataTexture( new Uint8Array( [ 40, 0, 64, 200 ] ), 1, 1, THREE.RGBAFormat, THREE.UnsignedByteType );
+		neutralB.needsUpdate = true;
+		neutralB.name = '烘焙地形遮罩 B（没有）';
+		return { texture: neutral, textureB: neutralB, grid: null, scale: new THREE.Vector2( 0, 0 ), offset: new THREE.Vector2( 0.5, 0.5 ) };
+
+	}
+
+	const grid = terrainBake.grid;
+	if ( terrainBake.surfaceA.length !== grid.width * grid.height * 4 ) throw new Error( `远景：烘焙地形的遮罩大小不对（${ terrainBake.surfaceA.length }，应该是 ${ grid.width * grid.height * 4 }）` );
+	const surfaceTexture = new THREE.DataTexture( terrainBake.surfaceA, grid.width, grid.height, THREE.RGBAFormat, THREE.UnsignedByteType );
+	surfaceTexture.magFilter = THREE.LinearFilter;
+	surfaceTexture.minFilter = THREE.LinearMipmapLinearFilter;
+	surfaceTexture.generateMipmaps = true;
+	surfaceTexture.wrapS = THREE.ClampToEdgeWrapping;
+	surfaceTexture.wrapT = THREE.ClampToEdgeWrapping;
+	surfaceTexture.needsUpdate = true;
+	surfaceTexture.name = '烘焙地形遮罩 A';
+	const surfaceTextureB = new THREE.DataTexture( terrainBake.surfaceB, grid.width, grid.height, THREE.RGBAFormat, THREE.UnsignedByteType );
+	surfaceTextureB.magFilter = THREE.LinearFilter;
+	surfaceTextureB.minFilter = THREE.LinearMipmapLinearFilter;
+	surfaceTextureB.generateMipmaps = true;
+	surfaceTextureB.wrapS = THREE.ClampToEdgeWrapping;
+	surfaceTextureB.wrapT = THREE.ClampToEdgeWrapping;
+	surfaceTextureB.needsUpdate = true;
+	surfaceTextureB.name = '烘焙地形遮罩 B';
+	// 网格点 i 在 x = minX + i·spacing，对准第 i 个像素的中心：u = (x − minX) / (width·spacing) + 0.5 / width
+	const scale = new THREE.Vector2( 1 / ( grid.width * grid.spacing ), 1 / ( grid.height * grid.spacing ) );
+	const offset = new THREE.Vector2( - grid.minX * scale.x + 0.5 / grid.width, - grid.minZ * scale.y + 0.5 / grid.height );
+	return { texture: surfaceTexture, textureB: surfaceTextureB, grid, scale, offset };
 
 }
 
@@ -1604,8 +2139,11 @@ function createForestMaterial() {
 
 	// 按距离随机稀疏：t = (距离 − from) / (to − from)，随机数小于 t 的树收成一个点（positionLocal 已经乘过实例矩阵）
 	const viewer = viewerPosition();
-	const thinning = length( treeBase.sub( viewer ) ).sub( uniforms.forestFrom ).div( uniforms.forestTo.sub( uniforms.forestFrom ) );
-	const keep = step( thinning, treeData.w ).mul( state.toggles.树林显示 );
+	const treeDistance = length( treeBase.sub( viewer ) );
+	const thinning = treeDistance.sub( uniforms.forestFrom ).div( uniforms.forestTo.sub( uniforms.forestFrom ) );
+	// 近处画 3D 树（tsl/trees.js）的那些，树团不画：这一棵在 near − band·cull 以内（3D 树那边是同一个判断，一棵树只画一种）
+	const nearHandover = step( uniforms.treeNear.sub( uniforms.treeBand.mul( treeData.w ) ), treeDistance );
+	const keep = step( thinning, treeData.w ).mul( state.toggles.树林显示 ).mul( mix( float( 1 ), nearHandover, uniforms.treeNearOn ) );
 	material.positionNode = compressedPosition( positionLocal ).mul( keep ).add( viewer.mul( float( 1 ).sub( keep ) ) );
 
 	material.colorNode = Fn( () => {
@@ -1627,13 +2165,803 @@ function createForestMaterial() {
 
 }
 
+// ===================== 谷雾（阶段 12 CP5）=====================
+// 盆地上空几层水平的薄雾片（吉卜力背景那种一层层的雾，不是均匀的一整片）：成团（两层噪声，顺风慢慢飘），
+// 碰到地面的地方变薄（按远景草地图里的地面高度，离地 2~18 米里淡出，不和山坡切出一道硬边）；
+// 镜头在雾层以下、或者离镜头 150 米以内淡掉（飞进雾里不是一块平板）。浓淡跟着一天的贴地薄雾 mistAmount 走（白天没有），
+// 颜色是这个方向上的大气色（朝太阳、月亮看前向散射亮一点）
+function buildValleyMist() {
+
+	const mistConfig = state.world.config.valleyMist;
+	if ( ! mistConfig || ! state.grassGround ) return [];
+	const sky = state.world.uniforms;
+	const uniforms = state.uniforms;
+	const grid = state.grassGround;
+	const meshes = [];
+	const width = ( grid.countX - 1 ) * grid.spacing;
+	const depth = ( grid.countZ - 1 ) * grid.spacing;
+	for ( const layer of mistConfig.layers ) {
+
+		const geometry = new THREE.PlaneGeometry( width, depth, 1, 1 );
+		geometry.rotateX( - Math.PI / 2 );
+		geometry.translate( grid.minX + width / 2, layer.height, grid.minZ + depth / 2 );
+		const material = new THREE.MeshBasicNodeMaterial();
+		material.name = '谷雾';
+		material.transparent = true;
+		material.depthWrite = false;
+		material.side = THREE.DoubleSide;
+		material.fog = false;
+		material.lights = false;
+		material.positionNode = compressedPosition( positionLocal );
+		material.colorNode = Fn( () => {
+
+			const point = positionGeometry;
+			const viewer = viewerPosition();
+			// 成团：两层噪声（一格 260 米、70 米），顺风飘
+			const drift = uniforms.cloudWind.mul( uniforms.time.mul( layer.drift ) );
+			const large = noiseAt( 'large', point.xz.sub( drift ).add( layer.seed ) ).r;
+			const medium = noiseAt( 'medium', point.xz.sub( drift.mul( 1.6 ) ).add( layer.seed * 1.7 ) ).g;
+			const patches = smoothstep( layer.coverage[ 0 ], layer.coverage[ 1 ], large.mul( 0.65 ).add( medium.mul( 0.35 ) ) );
+			// 碰到地面处变薄：离地 6 米以内没有、45 米才满（审查 R24：原来 2~18 米，雾层切过山坡的地方一块块蓝灰的斑，像低分辨率贴图）
+			const ground = grassGroundAtWorld( point.xz ).height;
+			const aboveGround = smoothstep( 6, 45, point.y.sub( ground ) );
+			// 镜头在雾层以下看不见；离镜头 150 米以内淡掉
+			const viewerAbove = smoothstep( layer.height + 4, layer.height + 50, viewer.y );
+			const toPoint = point.sub( viewer );
+			const distance = length( toPoint );
+			const nearFade = smoothstep( 80, 220, distance );
+			const amount = max( sky.mistAmount, mistConfig.minAmount ).mul( layer.density ).mul( patches ).mul( aboveGround ).mul( viewerAbove ).mul( nearFade ).mul( state.toggles.谷雾 );
+			const direction = toPoint.div( max( distance, 1 ) );
+			const sunForward = henyeyGreenstein( dot( direction, sky.sunDirection ), float( 0.55 ) );
+			const moonForward = henyeyGreenstein( dot( direction, sky.moonDirection ), float( 0.55 ) );
+			// 夜里大气色几乎是黑的：雾被月光照着，给一个月光色的底（月光的三成五），从高处往下看是一层层泛白的雾带
+			const moonLit = sky.moonLightColor.mul( 0.35 ).add( sky.moonLightColor.mul( moonForward.mul( 0.1 ) ) );
+			const mistColor = max( dayAerialColor( vec3( direction.x, 0.05, direction.z ).normalize(), sky ).mul( layer.brightness ), moonLit )
+				.add( sky.sunLightColor.mul( sunForward.mul( 0.06 ) ) );
+			return vec4( mistColor.mul( uniforms.surfaceGain ), amount );
+
+		} )();
+		const mesh = new THREE.Mesh( geometry, material );
+		mesh.name = '谷雾';
+		mesh.frustumCulled = false;
+		mesh.renderOrder = 8;
+		meshes.push( mesh );
+		state.mistLayers.push( { mesh, height: layer.height } );
+		state.disposables.push( geometry, material );
+
+	}
+
+	return meshes;
+
+}
+
+// ===================== 云团（阶段 12 CP5）=====================
+// 天上几团有体积感的积云：每团几个朝镜头的大方片（公告板），片元里按噪声咬出棉花团的边、底部压平（积云是平底的），
+// 朝太阳的一面亮、底下暗、逆着太阳看时边上一圈银边；远处溶进大气。只放在盆地东、南两面的山上空（西边是海和落日、北边是极光，都不放），
+// 白天和黄昏才有（入夜淡掉，不挡哥特城堡的剪影和极光）。调试开关"云团"
+function buildCloudClusters( tier ) {
+
+	const clusterConfig = state.world.config.cloudClusters;
+	if ( ! clusterConfig ) return [];
+	const sky = state.world.uniforms;
+	const uniforms = state.uniforms;
+	const random = createRandom( 5151 );
+	const [ centerX, centerZ ] = state.world.config.terrain.coreCenter;
+	const clusterCount = clusterConfig.count[ tier ] || clusterConfig.count.mid;
+	const clusterCenters = [];
+	const puffData = [];
+	const cornerData = [];
+	const indices = [];
+	let puffCount = 0;
+	for ( let attempts = 0; clusterCenters.length < clusterCount && attempts < clusterCount * 40; attempts ++ ) {
+
+		// 方位在允许的扇形里（从北顺时针），离盆地中心 radius 米，团和团至少隔 spacing 米
+		const [ fromAzimuth, toAzimuth ] = clusterConfig.azimuth;
+		const azimuth = ( fromAzimuth + random() * ( toAzimuth - fromAzimuth ) ) * degree;
+		const distance = clusterConfig.radius[ 0 ] + Math.sqrt( random() ) * ( clusterConfig.radius[ 1 ] - clusterConfig.radius[ 0 ] );
+		const x = centerX + Math.sin( azimuth ) * distance;
+		const z = centerZ - Math.cos( azimuth ) * distance;
+		if ( clusterCenters.some( ( item ) => Math.hypot( item[ 0 ] - x, item[ 1 ] - z ) < clusterConfig.spacing ) ) continue;
+		clusterCenters.push( [ x, z ] );
+		const base = clusterConfig.altitude[ 0 ] + random() * ( clusterConfig.altitude[ 1 ] - clusterConfig.altitude[ 0 ] );
+		const width = clusterConfig.width[ 0 ] + random() * ( clusterConfig.width[ 1 ] - clusterConfig.width[ 0 ] );
+		const axis = random() * Math.PI;
+		const puffs = clusterConfig.puffs[ 0 ] + Math.floor( random() * ( clusterConfig.puffs[ 1 ] - clusterConfig.puffs[ 0 ] + 1 ) );
+		for ( let k = 0; k < puffs; k ++ ) {
+
+			// 沿团的长轴排开，中间的大、高，两头小、低（积云的馒头形）
+			const along = ( puffs === 1 ? 0 : k / ( puffs - 1 ) - 0.5 ) + ( random() - 0.5 ) * 0.15;
+			const middle = 1 - Math.min( 1, Math.abs( along ) * 2 );
+			const size = clusterConfig.size[ 0 ] + ( clusterConfig.size[ 1 ] - clusterConfig.size[ 0 ] ) * ( 0.35 + 0.65 * middle ) * ( 0.75 + random() * 0.35 );
+			const depthOffset = ( random() - 0.5 ) * width * 0.25;
+			const puffX = x + Math.cos( axis ) * along * width - Math.sin( axis ) * depthOffset;
+			const puffZ = z + Math.sin( axis ) * along * width + Math.cos( axis ) * depthOffset;
+			const puffY = base + size * 0.42 + middle * width * 0.12 + random() * size * 0.15;
+			const seed = random();
+			for ( const [ cornerX, cornerY ] of [ [ - 1, - 1 ], [ 1, - 1 ], [ 1, 1 ], [ - 1, 1 ] ] ) {
+
+				puffData.push( puffX, puffY, puffZ, size );
+				cornerData.push( cornerX, cornerY, seed, base );
+
+			}
+
+			const first = puffCount * 4;
+			indices.push( first, first + 1, first + 2, first, first + 2, first + 3 );
+			puffCount ++;
+
+		}
+
+	}
+
+	const positions = new Float32Array( puffCount * 4 * 3 );
+	for ( let v = 0; v < puffCount * 4; v ++ ) positions.set( [ puffData[ v * 4 ], puffData[ v * 4 + 1 ], puffData[ v * 4 + 2 ] ], v * 3 );
+	const geometry = new THREE.BufferGeometry();
+	geometry.setAttribute( 'position', new THREE.BufferAttribute( positions, 3 ) );
+	geometry.setAttribute( 'puffData', new THREE.Float32BufferAttribute( puffData, 4 ) );
+	geometry.setAttribute( 'puffCorner', new THREE.Float32BufferAttribute( cornerData, 4 ) );
+	geometry.setIndex( indices );
+	geometry.boundingSphere = new THREE.Sphere( new THREE.Vector3( centerX, 2000, centerZ ), 1e6 );
+
+	const material = new THREE.MeshBasicNodeMaterial();
+	material.name = '云团';
+	material.transparent = true;
+	material.depthWrite = false;
+	material.fog = false;
+	material.lights = false;
+	const puff = attribute( 'puffData', 'vec4' );           // 中心 xyz（世界坐标）、方片边长（米）
+	const corner = attribute( 'puffCorner', 'vec4' );       // 角（±1, ±1）、随机数、这一团的底（海拔）
+	// 朝镜头的方片：视图空间里搭（同窗灯），远处按远景的深度压缩拉近
+	const viewCenter = cameraViewMatrix.mul( modelWorldMatrix.mul( vec4( puff.xyz, 1 ) ) ).xyz;
+	// 方片压扁成横的椭圆（0.62）：一片片圆的看着像棉花球，远处的云是一条条横的
+	const viewPosition = viewCenter.add( vec3( corner.xy.mul( vec2( 1, 0.62 ) ).mul( puff.w ).mul( 0.5 ), 0 ) );
+	const viewDistance = max( length( viewPosition ), 1e-3 );
+	material.vertexNode = cameraProjectionMatrix.mul( vec4( viewPosition.mul( compressDistance( viewDistance ).div( viewDistance ) ), 1 ) );
+	const cornerVarying = varying( corner.xy, 'cloudCorner' );
+	const seedVarying = varying( corner.z, 'cloudSeed' );
+	const heightVarying = varying( puff.y.add( corner.y.mul( puff.w ).mul( 0.31 ) ), 'cloudPointHeight' );
+	const baseVarying = varying( corner.w, 'cloudBase' );
+	const sizeVarying = varying( puff.w, 'cloudSize' );
+	const centerVarying = varying( puff.xyz, 'cloudCenter' );
+
+	material.colorNode = Fn( () => {
+
+		const viewer = viewerPosition();
+		// 形状：圆形往外淡，边被两层噪声咬成一团团的棉花边（每片按随机数取噪声贴图的不同地方）
+		const radius = length( cornerVarying );
+		const noiseUv = cornerVarying.mul( 0.45 ).add( vec2( seedVarying.mul( 7.3 ), seedVarying.mul( 3.1 ) ) );
+		const lumps = texture( state.textures.noise, noiseUv ).r.mul( 0.5 ).add( texture( state.textures.noise, noiseUv.mul( 2.3 ).add( 0.37 ) ).g.mul( 0.3 ) )
+			.add( texture( state.textures.noise, noiseUv.mul( 5.1 ).add( 0.71 ) ).r.mul( 0.2 ) );
+		// 边咬得深一点（不是一个个圆盘），里面实
+		const shape = float( 1 ).sub( smoothstep( 0.45, 1.0, radius.add( lumps.sub( 0.5 ).mul( 1.1 ) ) ) );
+		// 平底：这一团的底往上 18% 片高里慢慢长出来
+		const flatBottom = smoothstep( baseVarying.sub( 15 ), baseVarying.add( sizeVarying.mul( 0.18 ) ), heightVarying );
+		// 光照：方片当成球面的一块，法线从角的位置算（视图空间 → 场景 → 世界），再往世界的上方掰三成半：
+		// 逆着太阳看时整片球面的中间都背光，只剩一圈亮边，一团团像甜甜圈（2026-10-02 自查）；云是上亮下暗
+		const viewNormal = normalize( vec3( cornerVarying.mul( 0.85 ), 0.55 ) );
+		const sceneNormal = vec4( viewNormal, 0 ).mul( cameraViewMatrix ).xyz;
+		const worldNormal = normalize( mix( normalize( uniforms.sceneToWorld.mul( vec4( sceneNormal, 0 ) ).xyz ), vec3( 0, 1, 0 ), 0.35 ) );
+		const sunWrap = max( dot( worldNormal, sky.sunDirection ).add( 0.45 ).div( 1.45 ), 0 );
+		const heightShade = mix( float( 0.45 ), float( 1.05 ), smoothstep( baseVarying, baseVarying.add( sizeVarying.mul( 1.1 ) ), heightVarying ) );
+		const toCenter = centerVarying.sub( viewer );
+		const centerDistance = max( length( toCenter ), 1 );
+		// 逆着太阳看时整团透亮（Henyey–Greenstein 前向散射，g = 0.6），薄的边（形状淡的地方）多一点
+		const silver = henyeyGreenstein( dot( toCenter.div( centerDistance ), sky.sunDirection ), float( 0.6 ) ).mul( float( 1 ).sub( shape ).mul( 0.5 ).add( 0.5 ) ).mul( 0.22 );
+		const ambient = mix( sky.horizonColor, sky.zenithColor, 0.5 ).mul( sky.skyIntensity ).mul( 0.95 );
+		// 太阳很低时背着太阳那边的云暗一些（地球的影子升上来了），不然黄昏回身看是一团团发亮的粉棉花
+		const towardSun = dot( toCenter.div( centerDistance ).xz, normalize( sky.sunDirection.xz.add( vec2( 1e-4, 0 ) ) ) ).mul( 0.5 ).add( 0.5 );
+		const highSun = smoothstep( 4, 12, sky.sunElevation );
+		const duskDim = mix( mix( float( 0.45 ), float( 1 ), towardSun ), float( 1 ), highSun );
+		const lit = uniforms.cloudSunColor.mul( sunWrap.mul( 0.75 ).add( silver ) ).add( ambient ).mul( heightShade ).mul( duskDim );
+		// 大气透视：按团中心算（一片里颜色一致，不会一块块的）
+		const colorOut = applyAtmosphere( lit, centerVarying, viewer );
+		// 白天、黄昏有，入夜淡掉；镜头离得很近（飞行时）淡掉，不贴脸看到一张大方片
+		const dayAmount = smoothstep( 0.08, 0.35, sky.skyIntensity );
+		const nearFade = smoothstep( 250, 900, centerDistance );
+		// 很远的团淡一些（地平线上一排一样亮的小团像贴纸，落日回身看时最明显）
+		const farFade = mix( float( 1 ), float( 0.55 ), smoothstep( 4000, 9000, centerDistance ) );
+		// 黄昏背着太阳的团也淡下去（落日的天比统一天空暗，亮的小团浮在上面像贴纸）
+		const duskFade = mix( mix( float( 0.2 ), float( 1 ), pow( towardSun, 1.5 ) ), float( 1 ), highSun );
+		const alpha = shape.mul( flatBottom ).mul( dayAmount ).mul( nearFade ).mul( farFade ).mul( duskFade ).mul( 0.93 ).mul( state.toggles.云团 );
+		return vec4( colorOut, alpha );
+
+	} )();
+
+	const mesh = new THREE.Mesh( geometry, material );
+	mesh.name = '云团';
+	mesh.frustumCulled = false;
+	mesh.renderOrder = 3;
+	state.cloudClusterMesh = mesh;
+	state.disposables.push( geometry, material );
+	console.log( `远景：云团 ${ clusterCenters.length } 团、${ puffCount } 片` );
+	return [ mesh ];
+
+}
+
+// ===================== 树林布点的离线烘焙（scripts/bake-forest.mjs）=====================
+// 树表每棵 10 个 32 位浮点：x、y、z、size、tint、yaw、cull、树种序号、变体、种类（0 林子 1 林缘 2 草甸 3 河岸）。
+// 指纹 forestHash：布点用到的全部配置（世界、树、花园）+ 烘焙地形的指纹；配置一改就对不上，退回当场算
+const forestKinds = [ 'forest', 'edge', 'meadow', 'river' ];
+
+function speciesNamesOf( treeConfig ) {
+
+	return Object.keys( treeConfig.species );
+
+}
+
+export function forestHash() {
+
+	const config = state.ctx.config;
+	const bake = getManifest( 'terrain' );
+	// 只算影响布点的：地形形状、地点、航线（窄处的走廊和加密）、水系、山洞、地形网格、树、花园；飞行速度、天色这些不算
+	const world = config.world;
+	const text = JSON.stringify( { terrainShape: world.terrainShape, locations: world.locations, legs: world.legs, lake: world.lake, rivers: world.rivers, cave: world.cave, terrain: world.terrain,
+		trees: config.trees, garden: config.garden, terrainBake: bake ? bake.hash : null, version: 2 } );
+	let hash = 2166136261;
+	for ( let i = 0; i < text.length; i ++ ) {
+
+		hash ^= text.charCodeAt( i );
+		hash = Math.imul( hash, 16777619 );
+
+	}
+
+	return ( hash >>> 0 ).toString( 16 );
+
+}
+
+async function loadBakedForest( forestKey, speciesNames ) {
+
+	const manifest = getManifest( 'forest' );
+	if ( ! manifest ) {
+
+		console.warn( '远景：没有烘焙的树林布点（assets/opt/forest），当场算；跑一下 node scripts/bake-forest.mjs' );
+		return null;
+
+	}
+
+	const currentHash = forestHash();
+	if ( manifest.hash !== currentHash ) {
+
+		console.warn( `远景：烘焙的树林布点和现在的配置对不上（烘焙时 ${ manifest.hash }，现在 ${ currentHash }），当场算；重跑 node scripts/bake-forest.mjs` );
+		return null;
+
+	}
+
+	const entry = ( manifest.files || [] ).find( ( item ) => item.id === 'forest-' + forestKey );
+	const blob = entry ? await blobOf( 'forest', entry.id ) : null;
+	if ( ! blob ) {
+
+		console.warn( `远景：树林布点的数据块 forest-${ forestKey } 没读到，当场算` );
+		return null;
+
+	}
+
+	const buffer = await gunzipToArrayBuffer( blob );
+	const data = new Float32Array( buffer );
+	const items = [];
+	for ( let i = 0; i + 9 < data.length; i += 10 ) {
+
+		const species = speciesNames[ Math.round( data[ i + 7 ] ) ];
+		if ( ! species ) {
+
+			console.warn( '远景：烘焙的树林布点里有不认识的树种序号，当场算' );
+			return null;
+
+		}
+
+		items.push( { x: data[ i ], y: data[ i + 1 ], z: data[ i + 2 ], size: data[ i + 3 ], tint: data[ i + 4 ], yaw: data[ i + 5 ], cull: data[ i + 6 ], species, variant: Math.round( data[ i + 8 ] ), kind: forestKinds[ Math.round( data[ i + 9 ] ) ] } );
+
+	}
+
+	console.log( `远景：树林布点用烘焙的（${ forestKey }），${ items.length } 棵` );
+	return items;
+
+}
+
+// 烘焙脚本用：把这一次布出来的树表打成 10 个浮点一棵
+export function dumpForest() {
+
+	const plan = state.plannedForest;
+	if ( ! plan ) return null;
+	const speciesNames = speciesNamesOf( state.ctx.config.trees );
+	const data = new Float32Array( plan.items.length * 10 );
+	plan.items.forEach( ( item, index ) => data.set( [ item.x, item.y, item.z, item.size, item.tint, item.yaw, item.cull, speciesNames.indexOf( item.species ), item.variant, Math.max( 0, forestKinds.indexOf( item.kind ) ) ], index * 10 ) );
+	return { key: plan.key, hash: forestHash(), data };
+
+}
+
+// ===================== 远处的树：替身卡片 =====================
+// 图集由 scripts/bake-foliage.mjs 烘（assets/opt/foliage）。交接、按距离稀疏的规则和树团（createForestMaterial）一样；
+// 光照和树团一样（地形阴影按树根查、夜里的反照率、大气透视），法线来自图集
+async function buildImpostorForest( items ) {
+
+	const manifest = getManifest( 'foliage' );
+	if ( ! manifest ) {
+
+		console.warn( '远景：没有树的替身图集（assets/opt/foliage），远处画树团；跑一下 node scripts/bake-foliage.mjs' );
+		return null;
+
+	}
+
+	const treeConfig = state.ctx.config.trees;
+	const currentHash = treeSpeciesHash( treeConfig.species, treeConfig.variants );
+	if ( manifest.hash !== currentHash ) {
+
+		console.warn( `远景：树的替身图集和现在的树种配置对不上（烘焙时 ${ manifest.hash }，现在 ${ currentHash }），远处画树团；重跑 node scripts/bake-foliage.mjs` );
+		return null;
+
+	}
+
+	const [ colorTexture, normalTexture ] = await Promise.all( [
+		loadTexture( 'foliage', 'impostor-color', { colorSpace: THREE.NoColorSpace } ),
+		loadTexture( 'foliage', 'impostor-normal', { colorSpace: THREE.NoColorSpace } ),
+	] );
+	if ( ! colorTexture || ! normalTexture ) {
+
+		console.warn( '远景：树的替身图集读不出来，远处画树团' );
+		if ( colorTexture ) colorTexture.dispose();
+		if ( normalTexture ) normalTexture.dispose();
+		return null;
+
+	}
+
+	for ( const item of [ colorTexture, normalTexture ] ) {
+
+		item.wrapS = THREE.ClampToEdgeWrapping;
+		item.wrapT = THREE.ClampToEdgeWrapping;
+		state.disposables.push( item );
+
+	}
+
+	const sky = state.world.uniforms;
+	const uniforms = state.uniforms;
+	const result = createImpostorForest( {
+		// 焦点樱花树没有自己的替身图，远处借花树第一个变体那一张；nearScale：这个树种画 3D 的距离比例（交接要和近处的树对上）
+		items: items.map( ( item ) => ( item.species === 'focal' ? { ...item, species: 'blossom', variant: 0, nearScale: 1 } : { ...item, nearScale: speciesNearScale( item.species ) } ) ),
+		manifest,
+		textures: { color: colorTexture, normal: normalTexture },
+		viewer: viewerPosition(),
+		place: ( point ) => compressedPosition( point ),
+		// 和树团同一个判断：按距离随机稀疏（随机数小于稀疏比例的收掉）、近处画 3D 的那些不画、调试开关
+		keep: ( base, cull, distance, nearScale ) => {
+
+			const thinning = distance.sub( uniforms.forestFrom ).div( uniforms.forestTo.sub( uniforms.forestFrom ) );
+			const nearHandover = step( uniforms.treeNear.mul( nearScale ).sub( uniforms.treeBand.mul( cull ) ), distance );
+			return step( thinning, cull ).mul( state.toggles.树林显示 ).mul( mix( float( 1 ), nearHandover, uniforms.treeNearOn ) );
+
+		},
+		// 地形阴影、大气透视每棵树不变，替身在顶点里按树根算一次（applyAtmosphere 对颜色是仿射的：表面色只经过乘亮度增益和几次 mix）
+		shadowsAt: ( base ) => vec2( terrainShadow( base, uniforms.sunHorizon, sky.sunElevation, 1.3 ), terrainShadow( base, uniforms.moonHorizon, sky.moonElevation, 3 ) ),
+		atmosphere: ( surface, base ) => applyAtmosphere( surface, base.add( vec3( 0, 5, 0 ) ), viewerPosition() ),
+		shade: ( albedo, normal, shadows ) => nightAlbedo( albedo ).mul( lightAt( normal, shadows.x, shadows.y, float( 0.85 ), 0.35 ) ),
+	} );
+	state.disposables.push( result.geometry, result.material );
+	if ( result.missing.length ) console.warn( `远景：替身图集里没有树种 ${ result.missing.join( '、' ) }，这些树远处不画` );
+	console.log( `远景：远处的树画替身卡片 ${ result.count } 张（图集 ${ manifest.templates.length } 个模板 × ${ manifest.views } 个方位）` );
+	return result.mesh;
+
+}
+
+// 地点自己的花树（花园草坪上的花树、开场夹岸的桃林；2026-10-02 用户："这种树全部换掉"——原来是 tsl/blossom.js 的直棍树枝 + 散开的星形小花）：
+// 和远景花树同一套樱花模型（树干 + 程序化花簇）、同一种光照，种在给的世界坐标上，按镜头位置挑实例，near 米以内画 3D
+// （地点里一路都看得到，不交给替身卡片）。items：[{ x, y, z（世界坐标，y 是树根）, size, yaw, tint }]；
+// options：{ near（米）, colors（三调，缺省用花树的）, cards、cell（花簇，缺省用花树的）, name,
+//   reflectWater（可选）：地点自己的水面 { level（倒影平面的世界高度）, capsules（世界 xz 上的胶囊）, slack（弧度）}，见 trees.js createTreeField }。
+// 模型读不到返回 null（调用方退回原来的程序化花树）。返回 { group, toggle（调试开关的 uniform）, count,
+//   setReflection( on )（倒影 pass 前 true、画完 false：倒影里只画倒影可能落进水面的那些）, dispose() }
+export async function createLocationBlossoms( items, options = {} ) {
+
+	if ( ! state.ready || ! state.treeUniforms ) return null;
+	const spec = state.ctx.config.trees.species.blossom;
+	if ( ! spec || ! spec.models ) return null;
+	const variantCount = spec.forms ? spec.forms.length : state.ctx.config.trees.variants;
+	const built = await buildModelBlossomTemplates( { ...spec, models: { ...spec.models, cards: options.cards ?? spec.models.cards, cell: options.cell ?? spec.models.cell } }, variantCount );
+	if ( ! built ) return null;
+	const near = uniform( options.near ?? 400 );
+	const toggle = uniform( 1 );
+	const uniforms = { ...state.treeUniforms, near, band: uniform( 0 ), toggle };
+	const colors = options.colors || spec.colors;
+	const palette = { dark: color( colors[ 0 ] ), mid: color( colors[ 1 ] ), light: color( colors[ 2 ] ) };
+	const name = options.name || '地点的花树';
+	if ( built.barkMap ) {
+
+		built.barkMap.wrapS = THREE.RepeatWrapping;
+		built.barkMap.wrapT = THREE.RepeatWrapping;
+
+	}
+
+	const materials = {
+		blossom: {
+			leaves: createLeafMaterial( { name: name + '·花', palette, uniforms, shade: state.treeShade, style: 'blossom' } ),
+			bark: createBarkMaterial( { name: name + '·树皮', barkColor: color( spec.bark ), barkTexture: built.barkMap || null, uniforms, shade: state.treeShade } ),
+		},
+	};
+	const random = createRandom( 7207 + items.length );
+	const fieldItems = items.map( ( item ) => ( { ...item, cull: 0, species: 'blossom', variant: Math.floor( random() * variantCount ) } ) );
+	const field = createTreeField( {
+		items: fieldItems,
+		templates: { blossom: built.templates },
+		materials,
+		settings: { near, band: uniform( 0 ), refreshDistance: 6, maxPerMesh: state.ctx.config.trees.maxPerMesh, view: treeViewSettings() },
+		uniforms,
+		reflectWater: options.reflectWater || null,
+	} );
+	field.group.name = name;
+	state.root.add( field.group );
+	field.update( state.skyDome ? state.skyDome.position : new THREE.Vector3(), true );
+	state.locationTrees.add( field );
+	let triangles = 0;
+	for ( const template of built.templates ) triangles += ( template.bark.index.count + template.leaves.index.count ) / 3;
+	console.log( `远景：${ name } ${ items.length } 棵（樱花模型，${ variantCount } 个变体，平均每棵 ${ ( triangles / variantCount ).toFixed( 0 ) } 个三角形），${ near.value } 米以内画 3D` );
+	return {
+		group: field.group,
+		toggle,
+		count: items.length,
+		setReflection: ( on ) => field.setReflection( on ),
+		dispose() {
+
+			state.locationTrees.delete( field );
+			if ( field.group.parent ) field.group.parent.remove( field.group );
+			field.dispose();
+			materials.blossom.leaves.dispose();
+			materials.blossom.bark.dispose();
+			if ( built.barkMap ) built.barkMap.dispose();
+
+		},
+	};
+
+}
+
+// 某个树种画 3D 的距离比例（config.trees.species[名].models.near，默认 1）
+function speciesNearScale( name ) {
+
+	const spec = state.ctx.config.trees.species[ name ];
+	return spec && spec.models && spec.models.near ? spec.models.near : 1;
+
+}
+
+// 近处的树按镜头朝向挑（config.perf.trees，度换成弧度；createTreeField 的 settings.view）。没配或者关了返回 null（只按距离挑）
+function treeViewSettings() {
+
+	const perfTrees = state.ctx.config.perf ? state.ctx.config.perf.trees : null;
+	if ( ! perfTrees ) {
+
+		console.warn( '远景：config.perf.trees 没配，近处的树不按朝向挑（四面八方都画）' );
+		return null;
+
+	}
+
+	if ( ! perfTrees.viewCulling ) return null;
+	const degree = Math.PI / 180;
+	return { closeRadius: perfTrees.closeRadius, extraAngle: ( perfTrees.dragAngle + perfTrees.marginAngle ) * degree, turnAngle: perfTrees.turnAngle * degree };
+
+}
+
+// ===================== 近处的 3D 树 =====================
+// 树种（config.trees.species）× 变体的模板（tsl/trees.js 生成）；光照、大气和远景的树团一样（地形阴影按树根查）
+async function buildNearTrees( ctx, tier, slice ) {
+
+	const treeConfig = ctx.config.trees;
+	const uniforms = state.uniforms;
+	const sky = state.world.uniforms;
+	const speciesNames = [ ...new Set( state.forestItems.map( ( item ) => item.species ) ) ];
+	if ( speciesNames.length === 0 ) return null;
+	const barkTexture = await loadTexture( 'textures', 'bark_willow_02-diff', { colorSpace: THREE.SRGBColorSpace, anisotropy: tier === 'hi' ? 4 : 2 } );
+	if ( barkTexture ) state.disposables.push( barkTexture );
+	else console.warn( '远景：树皮贴图没读到，树皮用纯色' );
+
+	const treeUniforms = {
+		time: uniforms.time,
+		near: uniforms.treeNear,
+		band: uniforms.treeBand,
+		sceneToWorld: uniforms.sceneToWorld,
+		viewer: viewerPosition(),
+		toggle: state.toggles.近处树,
+		sunDirection: sky.sunDirection,
+		sunColor: sky.sunLightColor,
+		night: fadeOut( 0.1, 0.5, sky.skyIntensity ),
+	};
+	// 光照：和远景树团同一套（地形阴影按树根查、夜里的反照率、大气透视）
+	const shade = ( albedo, normal, point, { skyView, wrap, base } ) => {
+
+		const sunShadow = terrainShadow( base, uniforms.sunHorizon, sky.sunElevation, 1.3 );
+		const moonShadow = terrainShadow( base, uniforms.moonHorizon, sky.moonElevation, 3 );
+		const surface = nightAlbedo( albedo ).mul( lightAt( normal, sunShadow, moonShadow, skyView, wrap ) );
+		return applyAtmosphere( surface, point, viewerPosition() );
+
+	};
+
+	// 地点自己的花树（createLocationBlossoms）用同一套光照
+	state.treeUniforms = treeUniforms;
+	state.treeShade = shade;
+	const templates = {};
+	const materials = {};
+	let triangles = 0;
+	// 焦点樱花树：模型的树干 + 程序化花簇（花卡、颜色用花树那一套）；模型读不到就把这几棵当普通花树种
+	if ( speciesNames.includes( 'focal' ) ) {
+
+		const focalConfig = treeConfig.focal;
+		const blossomSpec = { ...treeConfig.species.blossom, ...treeConfig.species.blossom.forms[ 0 ], cell: focalConfig.cell };
+		templates.focal = [];
+		let barkMap = null;
+		for ( const [ index, id ] of focalConfig.models.entries() ) {
+
+			const loaded = await loadBlossomModel( id );
+			if ( ! loaded ) {
+
+				console.warn( `远景：焦点樱花树模型 ${ id } 没读到或者没有花位，这一棵种成普通花树` );
+				templates.focal.push( buildSpeciesTemplates( 'blossom', treeConfig.species.blossom, treeConfig.variants )[ index % treeConfig.species.blossom.forms.length ] );
+				continue;
+
+			}
+
+			if ( loaded.barkMap ) {
+
+				if ( ! barkMap ) barkMap = loaded.barkMap;
+				else loaded.barkMap.dispose();
+
+			}
+
+			const template = buildFocalTemplate( loaded.bark, loaded.points, blossomSpec, 700 + index * 31 );
+			triangles += ( template.bark.index.count + template.leaves.index.count ) / 3;
+			console.log( `远景：焦点樱花树 ${ id }，花簇 ${ template.clumps } 团、高 ${ template.height.toFixed( 1 ) } 米，${ ( ( template.bark.index.count + template.leaves.index.count ) / 3 ).toFixed( 0 ) } 三角` );
+			templates.focal.push( template );
+
+		}
+
+		if ( barkMap ) {
+
+			barkMap.wrapS = THREE.RepeatWrapping;
+			barkMap.wrapT = THREE.RepeatWrapping;
+			state.disposables.push( barkMap );
+
+		}
+
+		const palette = { dark: color( blossomSpec.colors[ 0 ] ), mid: color( blossomSpec.colors[ 1 ] ), light: color( blossomSpec.colors[ 2 ] ) };
+		materials.focal = {
+			leaves: createLeafMaterial( { name: '近处的树·焦点樱花·花', palette, uniforms: treeUniforms, shade, style: 'blossom' } ),
+			bark: createBarkMaterial( { name: '近处的树·焦点樱花·树皮', barkColor: color( blossomSpec.bark ), barkTexture: barkMap || barkTexture, uniforms: treeUniforms, shade } ),
+		};
+		state.disposables.push( materials.focal.leaves, materials.focal.bark );
+
+	}
+
+	for ( const name of speciesNames ) {
+
+		if ( name === 'focal' ) continue;
+		const spec = treeConfig.species[ name ];
+		if ( ! spec ) throw new Error( `远景：config.trees.species 里没有树种「${ name }」` );
+		// 花树（spec.models）：樱花模型的树干 + 程序化花簇，模型读不到退回程序化的树形
+		let speciesBarkTexture = barkTexture;
+		const modelBuilt = spec.models ? await buildModelBlossomTemplates( spec, spec.forms ? spec.forms.length : treeConfig.variants ) : null;
+		if ( spec.models && ! modelBuilt ) console.warn( `远景：树种「${ name }」的模型一个都没读到，用程序化的树形` );
+		if ( modelBuilt ) {
+
+			templates[ name ] = modelBuilt.templates;
+			if ( modelBuilt.barkMap ) {
+
+				modelBuilt.barkMap.wrapS = THREE.RepeatWrapping;
+				modelBuilt.barkMap.wrapT = THREE.RepeatWrapping;
+				state.disposables.push( modelBuilt.barkMap );
+				speciesBarkTexture = modelBuilt.barkMap;
+
+			}
+
+		} else templates[ name ] = buildSpeciesTemplates( name, spec, treeConfig.variants );
+		for ( const template of templates[ name ] ) triangles += ( template.bark.index.count + template.leaves.index.count ) / 3;
+		await yieldIfBusy( slice );
+
+		// 这个树种画 3D 的距离（近处的树的 near 乘 nearScale）：模型花树三角多、花园四周又一千多棵，只在近一些的地方画 3D
+		const speciesUniforms = speciesNearScale( name ) < 1 ? { ...treeUniforms, near: uniforms.treeNear.mul( speciesNearScale( name ) ) } : treeUniforms;
+		const palette = { dark: color( spec.colors[ 0 ] ), mid: color( spec.colors[ 1 ] ), light: color( spec.colors[ 2 ] ) };
+		materials[ name ] = {
+			leaves: createLeafMaterial( { name: '近处的树·' + name + '·树叶', palette, uniforms: speciesUniforms, shade, style: spec.cardStyle || 'leaf' } ),
+			bark: createBarkMaterial( { name: '近处的树·' + name + '·树皮', barkColor: color( spec.bark ), barkTexture: speciesBarkTexture, uniforms: speciesUniforms, shade } ),
+		};
+		state.disposables.push( materials[ name ].leaves, materials[ name ].bark );
+
+	}
+
+	// 林下（MegaKit 的灌木、蕨、花丛、草丛）：读得到几种就用几种，一种都没有就不建
+	const understoryConfig = treeConfig.understory;
+	const understoryKinds = [];
+	for ( const [ name, kind ] of Object.entries( understoryConfig.kinds ) ) {
+
+		const object = await loadModel( 'models', kind.model );
+		if ( ! object ) continue;
+		understoryKinds.push( { name, object, tint: color( kind.tint ), keepHue: kind.keepHue, upright: kind.upright } );
+		await yieldIfBusy( slice );
+
+	}
+
+	let understory = null;
+	if ( understoryKinds.length > 0 ) {
+
+		const layer = createUnderstoryLayer( {
+			kinds: understoryKinds,
+			uniforms: { ...treeUniforms, near: uniforms.understoryNear, toggle: state.toggles.林下灌木 },
+			shade,
+			maxPerMesh: treeConfig.maxPerMesh,
+		} );
+		// 模型里的几何体已经复制进实例网格，原来的模型（连贴图以外的部分）释放；贴图实例网格还在用，留着
+		for ( const kind of understoryKinds ) {
+
+			kind.object.traverse( ( child ) => {
+
+				if ( child.isMesh ) child.geometry.dispose();
+
+			} );
+			kind.object.traverse( ( child ) => {
+
+				if ( child.isMesh && child.material && child.material.map ) state.disposables.push( child.material.map );
+
+			} );
+
+		}
+
+		// 林间小路的路面上不撒（路两边的树按规则往周围撒灌木、蕨，会撒到路上）
+		const blocked = ( x, z ) => {
+
+			for ( const path of state.trailPaths || [] ) {
+
+				for ( const sample of path.samples ) if ( Math.abs( sample.x - x ) < path.halfWidth + 1.5 && Math.abs( sample.z - z ) < path.halfWidth + 1.5 && Math.hypot( sample.x - x, sample.z - z ) < path.halfWidth ) return true;
+
+			}
+
+			return false;
+
+		};
+		understory = { layer, near: uniforms.understoryNear, rules: understoryConfig.rules, groundAt: ( x, z ) => terrainHeightAt( x, z ), blocked };
+		console.log( `远景：林下 ${ understoryKinds.map( ( kind ) => kind.name ).join( '、' ) }，${ uniforms.understoryNear.value } 米以内` );
+
+	} else {
+
+		console.warn( '远景：林下的模型一个都没读到，不撒灌木' );
+
+	}
+
+	const field = createTreeField( {
+		items: state.forestItems,
+		templates,
+		materials,
+		settings: { near: uniforms.treeNear, band: uniforms.treeBand, refreshDistance: treeConfig.refreshDistance, maxPerMesh: treeConfig.maxPerMesh, nearScale: speciesNearScale, view: treeViewSettings() },
+		uniforms: treeUniforms,
+		understory,
+	} );
+	if ( understory ) field.group.add( understory.layer.group );
+	state.disposables.push( field );
+	const templateCount = Object.values( templates ).reduce( ( sum, list ) => sum + list.length, 0 );
+	console.log( `远景：近处的树 ${ speciesNames.map( ( name ) => name + ' ' + templates[ name ].length ).join( '、' ) } 个变体，平均每棵 ${ ( triangles / templateCount ).toFixed( 0 ) } 个三角形，${ uniforms.treeNear.value } 米以内画 3D` );
+	return field;
+
+}
+
+// ===================== 草地图（阶段 12 CP3 返工）=====================
+// 地点里的草长出地点自己的地面以后落在远景网格上：每个核心网格点一组（高度、长草的密度、法线 x、法线 z），RGBA 32 位浮点。
+// 着色器里用 textureLoad 取四个格点，高度按网格同一条对角线三角插值（gridHeight），和画出来的地面完全一样，草不会浮着或埋进去
+async function buildGrassGround( slice ) {
+
+	const core = state.core;
+	const world = state.world;
+	const { countX, countZ, minX, minZ, spacing } = core;
+	const data = new Float32Array( countX * countZ * 4 );
+	const normal = new THREE.Vector3();
+	for ( let j = 0; j < countZ; j ++ ) {
+
+		for ( let i = 0; i < countX; i ++ ) {
+
+			const index = j * countX + i;
+			const x = minX + i * spacing;
+			const z = minZ + j * spacing;
+			gridNormal( core, i, j, normal );
+			// 长草的地方：不在水里、水边（河岸 R 通道 0.5）、不是雪原台地、不是海边沙滩、不在高山上。
+			// 裸岩、陡坡不在这里按顶点算：烘焙的岩石外露 4 米一格、坡上一格一个样，按 8 米的顶点取再双线性插值，
+			// 草地上就是一块块三角形的秃斑（2026-10-02 用户："洞口刚出来草地是三角形的"）。改在着色器里按每根草的位置、
+			// 用和地形着色同一个岩石算法挖掉（见 grassGroundAtWorld）
+			let density = smoothJs( - 0.6, - 2.5, core.depths[ index ] );
+			density *= 1 - smoothJs( 0.3, 0.45, biomeAt( x, z, 0 ) );
+			density *= 1 - Math.min( 1, core.plateau[ index ] );
+			density *= 1 - smoothJs( 0.35, 0.75, core.seaProximity[ index ] );
+			density *= smoothJs( 520, 430, core.heights[ index ] );
+			// 湖岸 1.03 倍以内：远景在那里把顶点往下沉（让哥特自己的湖面盖上去），草按没沉的高度放会浮在湖上
+			if ( world.lakeRadius( x, z ) < 1.03 ) density = 0;
+			data[ index * 4 ] = core.heights[ index ];
+			data[ index * 4 + 1 ] = density;
+			data[ index * 4 + 2 ] = normal.x;
+			data[ index * 4 + 3 ] = normal.z;
+
+		}
+
+		await yieldIfBusy( slice );
+
+	}
+
+	const texture = new THREE.DataTexture( data, countX, countZ, THREE.RGBAFormat, THREE.FloatType );
+	texture.magFilter = THREE.NearestFilter;
+	texture.minFilter = THREE.NearestFilter;
+	texture.generateMipmaps = false;
+	texture.needsUpdate = true;
+	texture.name = '远景草地图';
+	return { texture, countX, countZ, minX, minZ, spacing };
+
+}
+
+// 世界坐标 xz 处远景地面的（高度、长草的密度、世界法线）——着色器节点；出了核心区密度是 0
+function grassGroundAtWorld( worldXZ ) {
+
+	const grid = state.grassGround;
+	const cell = worldXZ.sub( vec2( grid.minX, grid.minZ ) ).div( grid.spacing );
+	const inside = step( 0, cell.x ).mul( step( 0, cell.y ) ).mul( step( cell.x, grid.countX - 1 ) ).mul( step( cell.y, grid.countZ - 1 ) );
+	const base = clamp( floor( cell ), vec2( 0, 0 ), vec2( grid.countX - 2, grid.countZ - 2 ) );
+	const fraction = clamp( cell.sub( base ), 0, 1 ).toVar();
+	const index = ivec2( base );
+	const near = textureLoad( grid.texture, index ).toVar();
+	const nearRight = textureLoad( grid.texture, index.add( ivec2( 1, 0 ) ) ).toVar();
+	const far = textureLoad( grid.texture, index.add( ivec2( 0, 1 ) ) ).toVar();
+	const farRight = textureLoad( grid.texture, index.add( ivec2( 1, 1 ) ) ).toVar();
+	// 高度：和 gridHeight 同一条对角线（从 (i, j+1) 连到 (i+1, j)）三角插值
+	const lowerHeight = near.x.add( nearRight.x.sub( near.x ).mul( fraction.x ) ).add( far.x.sub( near.x ).mul( fraction.y ) );
+	const upperHeight = farRight.x.add( far.x.sub( farRight.x ).mul( float( 1 ).sub( fraction.x ) ) ).add( nearRight.x.sub( farRight.x ).mul( float( 1 ).sub( fraction.y ) ) );
+	// 两个三角形都算、按权重混（不能用 select：TSL 会把它编成 if / else，四个角的取样只在先用到它们的那个分支里赋值，
+	// 另一个分支读到的是没赋值的变量——每个格子上半个三角形的草高度全错、整片不见，2026-10-02 用户："洞口刚出来草地是三角形的"）
+	const height = mix( upperHeight, lowerHeight, step( fraction.x.add( fraction.y ), 1 ) );
+	// 密度、法线双线性
+	const blended = mix( mix( near, nearRight, fraction.x ), mix( far, farRight, fraction.x ), fraction.y );
+	const normal = normalize( vec3( blended.z, sqrt( max( float( 1 ).sub( blended.z.mul( blended.z ) ).sub( blended.w.mul( blended.w ) ), 0.01 ) ), blended.w ) );
+	// 看得见的岩石上不长草：和远景地形着色同一个算法（烘焙的岩石外露 + 中尺度斑块扰动；核心区外按坡度），按这一根草的位置取，
+	// 草的边界就是地面上岩石和草甸的边界。在顶点着色器里也会用到，贴图都按第 0 级取
+	const uniforms = state.uniforms;
+	const mediumPatch = texture( state.textures.noise, noiseUv( 'medium', worldXZ ) ).level( 0 ).g;
+	const rockExposure = texture( state.textures.surface.texture, worldXZ.mul( uniforms.surfaceScale ).add( uniforms.surfaceOffset ) ).level( 0 ).b;
+	const rockBySlope = smoothstep( 0.38, 0.6, float( 1 ).sub( normal.y ).add( mediumPatch.sub( 0.5 ).mul( 0.22 ) ) );
+	const rockBaked = smoothstep( 0.25, 0.75, rockExposure.add( mediumPatch.sub( 0.5 ).mul( 0.3 ) ) );
+	const rock = mix( rockBySlope, rockBaked, uniforms.bakedSurface.mul( uniforms.insideCore( vec3( worldXZ.x, 0, worldXZ.y ) ) ) );
+	return { height, density: blended.y.mul( inside ).mul( float( 1 ).sub( smoothstep( 0.1, 0.45, rock ) ) ), normal };
+
+}
+
+// 烘焙地形的"适合长树"（surface-b 的 A 通道：缓坡、不在岩石和水里、汇水多的地方高）；没有烘焙时 1
+function bakedForestAt( x, z ) {
+
+	const bake = state.ctx.terrainBake;
+	if ( ! bake || ! bake.surfaceB || ! bake.grid ) return 1;
+	const grid = bake.grid;
+	const i = Math.round( ( x - grid.minX ) / grid.spacing );
+	const j = Math.round( ( z - grid.minZ ) / grid.spacing );
+	if ( i < 0 || j < 0 || i >= grid.width || j >= grid.height ) return 1;
+	return bake.surfaceB[ ( j * grid.width + i ) * 4 + 3 ] / 255;
+
+}
+
 // 不种树的地方：每个地点脚下 150 米（地点自己有近景）、小镇的每座房子，以及几条要留出来的视线
 // （落日回身看崖上的哥特城堡和花园城堡、星月夜看湖和小镇、哥特机位看城堡、花园看城堡），视线两侧各 30 米
 function treeClearings( world ) {
 
 	const locations = world.locations;
-	const circles = Object.values( locations ).map( ( location ) => [ location.origin[ 0 ], location.origin[ 2 ], 150 ] );
+	// 每个地点只让开自己脚下和朝向的扇形（见 config.trees.clearRadius；原来一律 150 米整圈清空，站在花园里四周什么都没有）
+	const clearRadius = state.ctx.config.trees.clearRadius;
+	const circles = [];
+	const sectors = [];
+	for ( const [ key, location ] of Object.entries( locations ) ) {
+
+		const setting = clearRadius[ key ] ?? 150;
+		if ( typeof setting === 'number' ) {
+
+			circles.push( [ location.origin[ 0 ], location.origin[ 2 ], setting ] );
+			continue;
+
+		}
+
+		circles.push( [ location.origin[ 0 ], location.origin[ 2 ], setting.around ] );
+		// 朝向：本地 −z 在世界里的方位角 yaw（从北顺时针）→ 世界 (sin, −cos)
+		const yaw = location.yaw * degree;
+		sectors.push( { x: location.origin[ 0 ], z: location.origin[ 2 ], radius: setting.ahead, directionX: Math.sin( yaw ), directionZ: - Math.cos( yaw ), cosine: Math.cos( setting.halfAngle * degree ) } );
+
+	}
+
 	for ( const [ houseX, houseZ, radius ] of state.houseFootprints ) circles.push( [ houseX, houseZ, radius + 4 ] );
+	// 哥特城堡的地基（城堡约 150 米长、横着摆）：台顶上城堡那一块不种
+	circles.push( [ locations.gothic.landmark[ 0 ], locations.gothic.landmark[ 2 ], 78 ] );
+	for ( const corridor of state.corridors ) circles.push( corridor );
 	const lakeCenter = [ world.config.lake.center[ 0 ], world.config.lake.level, world.config.lake.center[ 1 ] ];
 	const sightlines = [
 		[ locations.sunset.origin, locations.gothic.landmark ],
@@ -1665,11 +2993,57 @@ function treeClearings( world ) {
 		length: valleyLength + 60,
 		halfWidth: 100,
 	} );
-	return { circles, sightlines };
+	// 花园：水池两边的正式园林（中轴 ±gardenHalf + 8 米，从出生点前 30 米到台基后面）不种，外面的草地种花树；
+	// 出洞那段路（洞的内口 → 出生点，两边各 22 米）留出来，出洞时一眼看到秘境
+	const gardenConfig = state.ctx.config.garden;
+	const gardenLocation = locations.garden;
+	const gardenYaw = - gardenLocation.yaw * degree;
+	const castleLocal = world.toLocal( new THREE.Vector3().fromArray( gardenLocation.landmark ), 'garden', new THREE.Vector3() );
+	const caveInner = world.config.cave.inner;
+	const caveLength = Math.hypot( caveInner[ 0 ] - gardenLocation.origin[ 0 ], caveInner[ 2 ] - gardenLocation.origin[ 2 ] );
+	sightlines.push( {
+		startX: gardenLocation.origin[ 0 ], startZ: gardenLocation.origin[ 2 ],
+		directionX: ( caveInner[ 0 ] - gardenLocation.origin[ 0 ] ) / caveLength, directionZ: ( caveInner[ 2 ] - gardenLocation.origin[ 2 ] ) / caveLength,
+		length: caveLength, halfWidth: 22,
+	} );
+	// 出洞以后镜头先顺着洞的方向往前、往上飘到俯瞰点（花园 buildIntro：内口往前 45 米、升 36 米），这一段两边各 14 米也不种
+	// （原来镜头从一棵阔叶树的树冠里穿过去，满屏叶子）
+	const innerMouth = world.cave.at( world.cave.length, {} );
+	sightlines.push( {
+		startX: innerMouth.position.x, startZ: innerMouth.position.z,
+		directionX: innerMouth.tangent.x / Math.hypot( innerMouth.tangent.x, innerMouth.tangent.z ), directionZ: innerMouth.tangent.z / Math.hypot( innerMouth.tangent.x, innerMouth.tangent.z ),
+		length: 70, halfWidth: 14,
+	} );
+	const garden = {
+		originX: gardenLocation.origin[ 0 ], originZ: gardenLocation.origin[ 2 ], cosine: Math.cos( gardenYaw ), sine: Math.sin( gardenYaw ),
+		axisX: castleLocal.x, halfWidth: gardenConfig.gardenHalf + 8, minZ: castleLocal.z - 48 * gardenConfig.castleScale - 20, maxZ: 30,
+	};
+	return { circles, sectors, sightlines, garden };
+
+}
+
+// 世界坐标 → 花园本地（和 world.toLocal 一样：绕 y 转回去），落在正式园林那一条里
+function insideGardenFormal( garden, x, z ) {
+
+	const dx = x - garden.originX;
+	const dz = z - garden.originZ;
+	const localX = dx * garden.cosine - dz * garden.sine;
+	const localZ = dx * garden.sine + dz * garden.cosine;
+	return Math.abs( localX - garden.axisX ) < garden.halfWidth && localZ > garden.minZ && localZ < garden.maxZ;
 
 }
 
 function insideClearing( clearings, x, z ) {
+
+	if ( clearings.garden && insideGardenFormal( clearings.garden, x, z ) ) return true;
+	for ( const sector of clearings.sectors || [] ) {
+
+		const offsetX = x - sector.x;
+		const offsetZ = z - sector.z;
+		const distance = Math.hypot( offsetX, offsetZ );
+		if ( distance < sector.radius && offsetX * sector.directionX + offsetZ * sector.directionZ > distance * sector.cosine ) return true;
+
+	}
 
 	for ( const [ centerX, centerZ, radius ] of clearings.circles ) {
 
@@ -1693,67 +3067,175 @@ function insideClearing( clearings, x, z ) {
 async function buildForest( tier, slice ) {
 
 	const core = state.core;
-	const spacing = tier === 'lo' ? 18 : 11;
+	const treeConfig = state.ctx.config.trees;
+	// 候选格距：hi 9 米、其余 12 米（阶段 12 CP3 返工：原来 11 / 18 米，谷底又不长林，整个世界空）
+	const spacing = tier === 'hi' ? 9 : 12;
 	const random = createRandom( 20261001 );
 	// 二十面体不细分（12 个顶点，ForestGenerator 的默认做法）：3 万多棵树，顶点数是主要开销；树都在几百米外，看不出棱角。
 	// 三种树：阔叶（圆）、针叶（高、尖、平底）、桃树（矮、粉）；半径、高（米）直接烘进几何体
+	// 阶段 12 CP3：近处换成 3D 树以后，树团只在几百米以外画；二十面体细分一次（42 个顶点）再按噪声鼓包，轮廓是一团团的，不是六边形。
+	// 针叶分成松（高处平顶、一团团）和冷杉（尖塔），和近处的 3D 树对得上。
+	// 树团是顶点开销（实测 hi 开场：细分一次 0.72 ms、不细分 0.2 ms），mid / lo 档不细分，轮廓的差别在核显的分辨率下看不出
+	const blobDetail = tier === 'hi' ? 1 : 0;
 	const kinds = {
-		broadleaf: { geometry: blobGeometry( 0, 4.2, 10, 0.45, 0.35, false ), items: [], colors: [ '#4a6b3e', '#62803f' ] },
-		conifer: { geometry: blobGeometry( 0, 2.6, 15, 0.85, 0.15, true ), items: [], colors: [ '#2b4636', '#3a553c' ] },
-		peach: { geometry: blobGeometry( 0, 3, 5.5, 0.35, 0.3, false ), items: [], colors: [ '#f0b0c4', '#f9d6e0' ] },
+		broadleaf: { geometry: blobGeometry( blobDetail, 4.2, 10, 0.45, 0.42, false ), items: [], colors: [ '#3d6234', '#5e8040' ] },
+		pine: { geometry: blobGeometry( blobDetail, 3.3, 14, 0.35, 0.4, false ), items: [], colors: [ '#2a4632', '#3d5a3c' ] },
+		fir: { geometry: blobGeometry( blobDetail, 2.6, 15, 0.85, 0.2, true ), items: [], colors: [ '#233d30', '#345038' ] },
+		peach: { geometry: blobGeometry( blobDetail, 3, 5.5, 0.35, 0.35, false ), items: [], colors: [ '#f0b0c4', '#f9d6e0' ] },
+		blossom: { geometry: blobGeometry( blobDetail, 3.4, 6.5, 0.35, 0.35, false ), items: [], colors: [ '#f2bccd', '#fbe0e8' ] },
 	};
 	const tintFirst = new THREE.Color();
 	const tintSecond = new THREE.Color();
+	const hueShift = new THREE.Color();
 	const clearings = treeClearings( state.world );
 
-	for ( let z = core.minZ + spacing; z < core.minZ + core.sizeZ - spacing; z += spacing ) {
+	// 布点规则在 src/core/forest.js（阶段 12 CP3 返工）：成片的林子、林缘、河岸、草甸孤树、花树林；地点只让开自己脚下
+	const gardenLayoutInfo = gardenLayout( state.ctx );
+	const gardenRect = gardenLayoutInfo.rect;
+	const gardenOrigin = state.world.locations.garden.origin;
+	const toGarden = new THREE.Vector3();
+	const gardenLocal = ( x, z ) => state.world.toLocal( toGarden.set( x, 0, z ), 'garden', toGarden );
+	const nearestIndex = ( x, z ) => Math.round( ( z - core.minZ ) / core.spacing ) * core.countX + Math.round( ( x - core.minX ) / core.spacing );
+	// 哥特岩台：两侧的平台、台顶城堡后面加密成松林（阶段 12 CP4，"那种魔法学校的城堡"：崖上的城堡、旁边一片黑森林）
+	const mesa = state.world.config.terrainShape.gothicMesa;
+	if ( mesa ) {
 
-		for ( let x = core.minX + spacing; x < core.minX + core.sizeX - spacing; x += spacing ) {
+		const ring = [];
+		const ringRadius = mesa.radius + mesa.falloff * 0.45;
+		for ( let angle = 0; angle < Math.PI * 2; angle += 6 / ringRadius ) ring.push( { x: mesa.center[ 0 ] + Math.cos( angle ) * ringRadius, z: mesa.center[ 1 ] + Math.sin( angle ) * ringRadius } );
+		state.forestBoosts = [ ...( state.forestBoosts || [] ), { samples: ring, radius: mesa.falloff * 0.7, species: 'pine' } ];
 
-			const jitterX = x + ( random() - 0.5 ) * spacing * 0.9;
-			const jitterZ = z + ( random() - 0.5 ) * spacing * 0.9;
-			if ( insideClearing( clearings, jitterX, jitterZ ) ) {
+	}
+	// 加密的地方（窄处、哥特岩台）：先算好每一条的包围盒（外扩 radius）
+	const boosts = ( state.forestBoosts || [] ).map( ( boost ) => {
 
-				random();
-				random();
-				continue;
+		const xs = boost.samples.map( ( sample ) => sample.x );
+		const zs = boost.samples.map( ( sample ) => sample.z );
+		return { ...boost, minX: Math.min( ...xs ) - boost.radius, maxX: Math.max( ...xs ) + boost.radius, minZ: Math.min( ...zs ) - boost.radius, maxZ: Math.max( ...zs ) + boost.radius };
+
+	} );
+	const noiseChannel = { large: 0, medium: 1, small: 0 };
+	const sample = {
+		height: ( x, z ) => gridHeight( core, x, z ),
+		// 坡度：抖动后的位置上用网格高度中心差分（不能拿最近格点的法线：崖上会对不上）
+		slope: ( x, z ) => {
+
+			const slopeX = ( gridHeight( core, x + 2, z ) - gridHeight( core, x - 2, z ) ) / 4;
+			const slopeZ = ( gridHeight( core, x, z + 2 ) - gridHeight( core, x, z - 2 ) ) / 4;
+			return 1 - 1 / Math.hypot( slopeX, 1, slopeZ );
+
+		},
+		water: ( x, z ) => core.depths[ nearestIndex( x, z ) ] > - 1 || biomeAt( x, z, 0 ) > 0.4 || state.world.lakeRadius( x, z ) < 1.05,
+		waterEdge: ( x, z ) => biomeAt( x, z, 0 ),
+		peach: ( x, z ) => biomeAt( x, z, 1 ),
+		flowers: ( x, z ) => biomeAt( x, z, 2 ),
+		wet: ( x, z ) => bakedForestAt( x, z ),
+		noise: ( name, x, z ) => noiseValueJs( name, x, z, noiseChannel[ name ] ),
+		// 花园两侧的草地（中轴 100~430 米、花园前后再各多 80 米）是花树林
+		// 窄处要的老林、松林（林间小路两边、冰碛岗上）：离那条线 radius 米以内加密，边上 40% 渐变
+		boost: ( x, z ) => {
+
+			let amount = 0;
+			let species = null;
+			for ( const boost of boosts ) {
+
+				// 包围盒外的直接跳过（14 万个候选点 × 几百个样本，不剪枝要多花一秒多）
+				if ( x < boost.minX || x > boost.maxX || z < boost.minZ || z > boost.maxZ ) continue;
+				let nearest = Infinity;
+				for ( const sample of boost.samples ) {
+
+					const distance = Math.abs( sample.x - x ) + Math.abs( sample.z - z ) < boost.radius * 1.5 ? Math.hypot( sample.x - x, sample.z - z ) : Infinity;
+					if ( distance < nearest ) nearest = distance;
+
+				}
+
+				const value = smoothJs( boost.radius, boost.radius * 0.6, nearest );
+				if ( value > amount ) {
+
+					amount = value;
+					species = boost.species;
+
+				}
 
 			}
 
-			const height = gridHeight( core, jitterX, jitterZ );
-			const nearestIndex = Math.round( ( jitterZ - core.minZ ) / core.spacing ) * core.countX + Math.round( ( jitterX - core.minX ) / core.spacing );
-			if ( core.depths[ nearestIndex ] > - 1 ) continue;                    // 海里、湖面上不长
-			if ( biomeAt( jitterX, jitterZ, 0 ) > 0.4 ) continue;                // 湖边、河边留出来（R 通道 0.5 是水边）
-			// 坡度在抖动后的位置上用网格高度做中心差分（不能拿最近格点的法线：崖上会对不上）
-			const slopeX = ( gridHeight( core, jitterX + 2, jitterZ ) - gridHeight( core, jitterX - 2, jitterZ ) ) / 4;
-			const slopeZ = ( gridHeight( core, jitterX, jitterZ + 2 ) - gridHeight( core, jitterX, jitterZ - 2 ) ) / 4;
-			const slope = 1 - 1 / Math.hypot( slopeX, 1, slopeZ );
-			if ( ! ( slope < 0.25 ) ) continue;
-			const flowers = biomeAt( jitterX, jitterZ, 2 );
-			const peach = biomeAt( jitterX, jitterZ, 1 );
-			const roll = random();
+			return { amount, species };
 
-			let kind = null;
-			if ( peach > 0.25 && roll < peach * 0.9 ) {
+		},
+		blossomZone: ( x, z ) => {
 
-				kind = 'peach';
+			const local = gardenLocal( x, z );
+			const across = Math.abs( local.x - gardenLayoutInfo.axisX );
+			return smoothJs( 100, 118, across ) * ( 1 - smoothJs( 380, 440, across ) ) * smoothJs( gardenRect.minZ - 90, gardenRect.minZ - 30, local.z ) * ( 1 - smoothJs( gardenRect.maxZ + 60, gardenRect.maxZ + 140, local.z ) );
 
-			} else if ( roll < forestMaskJs( jitterX, jitterZ, height, slope, flowers, peach ) * 0.95 ) {
+		},
+	};
+	// 树根高度：花园块里画的是花园自己的地面（远景在块里被挖掉），按花园的地面公式；其余按远景（带窄处的地形补丁）
+	const groundAt = ( x, z ) => {
 
-				// 低处阔叶为主，高处针叶为主
-				kind = random() < smoothJs( 120, 300, height ) * 0.9 + 0.05 ? 'conifer' : 'broadleaf';
+		const local = gardenLocal( x, z );
+		if ( local.x > gardenRect.minX && local.x < gardenRect.maxX && local.z > gardenRect.minZ && local.z < gardenRect.maxZ ) return gardenGroundLocal( state.ctx, gardenLayoutInfo, local.x, local.z ) + gardenOrigin[ 1 ];
+		return terrainHeightAt( x, z );
 
-			}
+	};
+	const variants = Object.fromEntries( Object.entries( treeConfig.species ).map( ( [ name, spec ] ) => [ name, Array.isArray( spec.forms ) ? spec.forms.length : treeConfig.variants ] ) );
 
-			if ( ! kind ) continue;
-			const size = 0.7 + random() * random() * 0.55;   // 大多数中等，少数大一些
-			// 树根往下沉一点，坡上沉得多一些，免得下坡那一侧悬空
-			const sink = 0.6 + 4 * size * slope;
-			kinds[ kind ].items.push( { x: jitterX, y: height - sink, z: jitterZ, size, tint: random(), yaw: random() * Math.PI * 2, cull: random() } );
+	// 布点结果先找离线烘焙的（scripts/bake-forest.mjs，assets/opt/forest，带指纹）；没有或对不上就当场算（约 2 秒）
+	const forestKey = tier === 'hi' ? 'hi' : 'lo';
+	let planned = await loadBakedForest( forestKey, speciesNamesOf( treeConfig ) );
+	if ( ! planned ) {
 
-		}
+		const started = performance.now();
+		planned = await planForest( {
+			bounds: { minX: core.minX, minZ: core.minZ, maxX: core.minX + core.sizeX, maxZ: core.minZ + core.sizeZ },
+			spacing,
+			random,
+			sample,
+			clearing: ( x, z ) => insideClearing( clearings, x, z ),
+			groundAt,
+			settings: { conifer: treeConfig.coniferAltitude, firAltitude: treeConfig.firAltitude, meadowChance: treeConfig.meadowChance, variants },
+			yieldIfBusy: () => yieldIfBusy( slice ),
+		} );
+		console.log( `远景：树林当场布点（${ forestKey }），${ planned.length } 棵，用时 ${ ( performance.now() - started ).toFixed( 0 ) } ms` );
 
-		await yieldIfBusy( slice );
+	}
+
+	state.plannedForest = { key: forestKey, items: planned };
+	for ( const item of planned ) kinds[ item.species ].items.push( item );
+
+	// 窄处要种的树（岩丘裂隙顶上几棵被海风吹歪的松，阶段 12 CP3 返工）：不走林地遮罩和空地，照给的位置种
+	for ( const extra of state.extraTrees || [] ) {
+
+		const height = terrainHeightAt( extra.x, extra.z );
+		if ( ! Number.isFinite( height ) ) continue;
+		const item = { x: extra.x, y: height - 0.8, z: extra.z, size: extra.size, tint: random(), yaw: random() * Math.PI * 2, cull: random(), species: extra.species || 'pine' };
+		item.variant = Math.min( variants[ item.species ] - 1, Math.floor( item.tint * variants[ item.species ] ) );
+		// 往 leanAngle（方位角，度）那边歪 leanDegrees 度：绕水平轴转，轴和歪的方向垂直
+		const leanRadians = ( extra.leanAngle || 0 ) * Math.PI / 180;
+		const tilt = ( extra.leanDegrees || 0 ) * Math.PI / 180;
+		item.tiltX = - Math.cos( leanRadians ) * tilt;
+		item.tiltZ = - Math.sin( leanRadians ) * tilt;
+		kinds[ item.species ].items.push( item );
+
+	}
+
+	state.forestItems = Object.values( kinds ).flatMap( ( kind ) => kind.items );
+	// 焦点樱花树：照配置的位置种（树种 focal，变体 = 第几个模型）；树根按花园的地面
+	for ( const place of treeConfig.focal ? treeConfig.focal.places : [] ) {
+
+		const local = new THREE.Vector3( gardenLayoutInfo.axisX + place.x, 0, place.z );
+		const worldPoint = state.world.toWorld( local, place.location, new THREE.Vector3() );
+		state.forestItems.push( { x: worldPoint.x, y: groundAt( worldPoint.x, worldPoint.z ) - 0.3, z: worldPoint.z, size: place.size, tint: 0.5, yaw: ( place.yaw - state.world.locations[ place.location ].yaw ) * degree, cull: 0.02, species: 'focal', variant: place.model } );
+
+	}
+
+	// 远处画替身卡片（阶段 12 CP3 返工）；图集没烘、和树种配置对不上、或者读不出来，退回原来的树团
+	const impostor = await buildImpostorForest( state.forestItems );
+	if ( impostor ) {
+
+		for ( const kind of Object.values( kinds ) ) state.disposables.push( kind.geometry );
+		console.log( `远景：树林 阔叶 ${ kinds.broadleaf.items.length }、松 ${ kinds.pine.items.length }、冷杉 ${ kinds.fir.items.length }、桃树 ${ kinds.peach.items.length }、花树 ${ kinds.blossom.items.length } 棵（远处画替身卡片）` );
+		return [ impostor ];
 
 	}
 
@@ -1782,11 +3264,14 @@ async function buildForest( tier, slice ) {
 		kind.items.forEach( ( item, index ) => {
 
 			placement.position.set( item.x, item.y, item.z );
-			placement.rotation.set( 0, item.yaw, 0 );
+			placement.rotation.set( item.tiltX || 0, item.yaw, item.tiltZ || 0, 'XZY' );
 			placement.scale.setScalar( item.size );
 			placement.updateMatrix();
 			mesh.setMatrixAt( index, placement.matrix );
+			// 色相和近处的 3D 树一样偏一点（有的嫩黄绿、有的老蓝绿），交接时颜色对得上
 			const tint = tintFirst.clone().lerp( tintSecond, item.tint );
+			const hue = ( item.tint * 7.31 ) % 1;
+			tint.multiply( hueShift.setRGB( 1 + ( 0.86 + 0.3 * hue - 1 ) * 0.6, 1 + ( 0.97 + 0.09 * hue - 1 ) * 0.6, 1 + ( 1.12 - 0.4 * hue - 1 ) * 0.6 ) );
 			treeData.set( [ tint.r, tint.g, tint.b, item.cull ], index * 4 );
 			treeBase.set( [ item.x, item.y, item.z ], index * 3 );
 
@@ -1801,7 +3286,7 @@ async function buildForest( tier, slice ) {
 
 	}
 
-	console.log( `远景：树林 阔叶 ${ kinds.broadleaf.items.length }、针叶 ${ kinds.conifer.items.length }、桃树 ${ kinds.peach.items.length } 棵` );
+	console.log( `远景：树林 阔叶 ${ kinds.broadleaf.items.length }、松 ${ kinds.pine.items.length }、冷杉 ${ kinds.fir.items.length }、桃树 ${ kinds.peach.items.length }、花树 ${ kinds.blossom.items.length } 棵（远处画树团）` );
 	return meshes;
 
 }
@@ -1996,6 +3481,168 @@ function buildGardenCastle( world ) {
 
 // ===================== 替身：哥特城堡（崖顶，尖塔林立，规格书 11.1）=====================
 
+// 哥特城堡的替身：和哥特场景里同一座零件包拼的城堡（scripts/blender/gothic-castle.py 的远景一级：体素重建的外壳 + 每间屋一块窗片），
+// 摆在同一个位置、同一个朝向、同一个放大（config.gothic.modelScale）。外壳刷成城堡的深蓝灰、乘烘好的 AO；窗片换成远景窗灯的窗户表
+// （整晚不亮的房间不要，和哥特场景里同一条规则）。模型没读到返回 null，退回程序化的替身
+// 花园城堡的替身：和花园里同一个模型（Taj mahal）的第三级（约 1 万三角），起飞、降落时不跳。
+// 摆法和花园场景里一样：模型原点放在城堡的位置，绕竖轴转 −yaw（花园场景本地坐标到世界的转角）；大理石按 AO 刷色，银顶反射天空
+async function buildGardenProxyModel( world ) {
+
+	const model = await loadModel( 'models', 'taj-castle-lod2' );
+	if ( ! model ) {
+
+		console.warn( '远景：花园城堡替身模型 taj-castle-lod2 没读到，用程序化的替身' );
+		return null;
+
+	}
+
+	const garden = world.locations.garden;
+	const castleLocal = world.toLocal( new THREE.Vector3().fromArray( garden.landmark ), 'garden', new THREE.Vector3() );
+	const castleWorld = world.toWorld( new THREE.Vector3( castleLocal.x, 0, castleLocal.z ), 'garden', new THREE.Vector3() );
+	const placement = new THREE.Matrix4().makeTranslation( castleWorld.x, garden.origin[ 1 ], castleWorld.z ).multiply( new THREE.Matrix4().makeRotationY( - garden.yaw * degree ) );
+	model.updateMatrixWorld( true );
+	const geometries = [];
+	const point = new THREE.Vector3();
+	const marbleColor = new THREE.Color( '#f1ede6' );
+	model.traverse( ( child ) => {
+
+		if ( ! child.isMesh ) return;
+		const source = child.geometry;
+		const matrix = placement.clone().multiply( child.matrixWorld );
+		const positions = source.getAttribute( 'position' );
+		const flat = new THREE.BufferGeometry();
+		const floats = new Float32Array( positions.count * 3 );
+		for ( let i = 0; i < positions.count; i ++ ) {
+
+			point.fromBufferAttribute( positions, i ).applyMatrix4( matrix );
+			floats.set( [ point.x, point.y, point.z ], i * 3 );
+
+		}
+
+		flat.setAttribute( 'position', new THREE.BufferAttribute( floats, 3 ) );
+		if ( source.index ) flat.setIndex( Array.from( source.index.array ) );
+		const isSilver = /银/.test( child.material && child.material.name || '' );
+		const painted = paint( flat, isSilver ? '#e6ecf4' : '#f1ede6', isSilver ? 1 : 0 );
+		const occlusion = source.getAttribute( 'color' );
+		if ( occlusion && ! isSilver ) {
+
+			const surface = painted.getAttribute( 'surface' );
+			const order = source.index ? source.index.array : null;
+			for ( let i = 0; i < surface.count; i ++ ) {
+
+				const ao = occlusion.getX( order ? order[ i ] : i );
+				surface.setXYZ( i, marbleColor.r * ( 0.45 + 0.55 * ao ), marbleColor.g * ( 0.47 + 0.53 * ao ), marbleColor.b * ( 0.52 + 0.48 * ao ) );
+
+			}
+
+		}
+
+		geometries.push( painted );
+
+	} );
+	disposeModel( model );
+	return geometries.length ? geometries : null;
+
+}
+
+async function buildGothicProxyModel( world, windows ) {
+
+	const model = await loadModel( 'models', 'gothic-castle-lod2' );
+	if ( ! model ) {
+
+		console.warn( '远景：哥特城堡替身模型 gothic-castle-lod2 没读到，用程序化的替身' );
+		return null;
+
+	}
+
+	const gothic = world.locations.gothic;
+	const [ castleX, , castleZ ] = gothic.landmark;
+	const groundY = world.worldHeight( castleX, castleZ );
+	const facing = Math.atan2( gothic.origin[ 0 ] - castleX, gothic.origin[ 2 ] - castleZ );
+	const gothicConfig = state.ctx.config.gothic;
+	const placement = new THREE.Matrix4().makeTranslation( castleX, groundY, castleZ )
+		.multiply( new THREE.Matrix4().makeRotationY( facing ) )
+		.multiply( new THREE.Matrix4().makeScale( gothicConfig.modelScale, gothicConfig.modelScale, gothicConfig.modelScale ) );
+	model.updateMatrixWorld( true );
+	const stoneColor = new THREE.Color( '#4a5064' );
+	const geometries = [];
+	const point = new THREE.Vector3();
+	const corner = new THREE.Vector3();
+	model.traverse( ( child ) => {
+
+		if ( ! child.isMesh ) return;
+		const source = child.geometry;
+		const matrix = placement.clone().multiply( child.matrixWorld );
+		const positions = source.getAttribute( 'position' );
+		const info = source.getAttribute( '_window' );
+		if ( info ) {
+
+			// 窗片：四个顶点一块
+			for ( let first = 0; first + 3 < positions.count; first += 4 ) {
+
+				const random = info.getW( first );
+				if ( ( random * 7.31 ) % 1 < gothicConfig.windows.darkRooms ) continue;
+				point.set( 0, 0, 0 );
+				for ( let k = 0; k < 4; k ++ ) point.add( corner.fromBufferAttribute( positions, first + k ).applyMatrix4( matrix ) );
+				point.multiplyScalar( 0.25 );
+				const a = new THREE.Vector3().fromBufferAttribute( positions, first ).applyMatrix4( matrix );
+				const b = new THREE.Vector3().fromBufferAttribute( positions, first + 1 ).applyMatrix4( matrix );
+				const c = new THREE.Vector3().fromBufferAttribute( positions, first + 2 ).applyMatrix4( matrix );
+				const normal = new THREE.Vector3().subVectors( b, a ).cross( new THREE.Vector3().subVectors( c, a ) );
+				normal.y = 0;
+				if ( normal.lengthSq() < 1e-8 ) continue;
+				normal.normalize();
+				windows.push( { x: point.x, y: point.y, z: point.z, normalX: normal.x, normalZ: normal.z, width: a.distanceTo( b ), height: b.distanceTo( c ), floor: info.getZ( first ), random } );
+
+			}
+
+			return;
+
+		}
+
+		// 外壳：量化的属性先转成 32 位浮点再变换（KHR_mesh_quantization 的整数直接变换会被截断）
+		const flat = new THREE.BufferGeometry();
+		const floats = new Float32Array( positions.count * 3 );
+		for ( let i = 0; i < positions.count; i ++ ) {
+
+			point.fromBufferAttribute( positions, i ).applyMatrix4( matrix );
+			floats.set( [ point.x, point.y, point.z ], i * 3 );
+
+		}
+
+		flat.setAttribute( 'position', new THREE.BufferAttribute( floats, 3 ) );
+		if ( source.index ) flat.setIndex( Array.from( source.index.array ) );
+		const occlusion = source.getAttribute( 'color' );
+		const painted = paint( flat, '#4a5064' );
+		// paint 刷的是一种颜色；按顶点乘烘好的 AO（toNonIndexed 以后顶点顺序是按三角形展开的，从原索引取）
+		if ( occlusion ) {
+
+			const surface = painted.getAttribute( 'surface' );
+			const order = source.index ? source.index.array : null;
+			for ( let i = 0; i < surface.count; i ++ ) {
+
+				const ao = occlusion.getX( order ? order[ i ] : i );
+				surface.setXYZ( i, stoneColor.r * ( 0.3 + 0.7 * ao ), stoneColor.g * ( 0.3 + 0.7 * ao ), stoneColor.b * ( 0.3 + 0.7 * ao ) );
+
+			}
+
+		}
+
+		geometries.push( painted );
+
+	} );
+	disposeModel( model );
+	if ( geometries.length === 0 ) {
+
+		console.warn( '远景：哥特城堡替身模型里没有外壳网格，用程序化的替身' );
+		return null;
+
+	}
+
+	return geometries;
+
+}
+
 function buildGothicCastle( world, windows ) {
 
 	const gothic = world.locations.gothic;
@@ -2114,6 +3761,8 @@ function buildTown( world, windows ) {
 	const [ centerX, , centerZ ] = starry.landmark;
 	const stream = world.getRiver( 'townStream' );
 	const random = createRandom( 1889 );
+	// 每栋房子再多开一两扇窗（审查 R30：飞过小镇时房子是一个个白盒子，看不出亮窗）。用另一串随机数，房子的位置不变（树林布点按房子让开）
+	const extraRandom = createRandom( 4242 );
 	const walls = [ '#d9c9a8', '#cbb79a', '#b9a68c', '#a7aab2', '#c7b08a' ];
 	const roofs = [ '#6e3b2e', '#5a3a30', '#4a4f63', '#7a4a35' ];
 	const parts = [];
@@ -2137,6 +3786,8 @@ function buildTown( world, windows ) {
 		const wallHeight = height + Math.max( ...corners ) - Math.min( ...corners );
 		parts.push( paint( placeLocal( new THREE.BoxGeometry( width, wallHeight, depth ), x, base + wallHeight / 2, z, yaw ), wallHex ) );
 		parts.push( paint( placeLocal( gableRoof( width + 0.6, depth + 0.8, Math.min( width, depth ) * 0.45 ), x, base + wallHeight, z, yaw ), roofHex ) );
+		// 盒子：本地 x 方向长 width、z 方向深 depth，绕 y 转 yaw；屋脊沿本地 x，屋顶比墙每边宽出 0.3 / 0.4 米
+		state.townHouses.push( { kind: 'house', x, z, base, width, depth, wallHeight, yaw, roofLength: width + 0.6, roofWidth: depth + 0.8, roofHeight: Math.min( width, depth ) * 0.45, wall: wallHex, roof: roofHex } );
 		for ( let k = 0; k < windowCount; k ++ ) {
 
 			// 窗开在长边上，前后随机
@@ -2148,7 +3799,24 @@ function buildTown( world, windows ) {
 				y: base + wallHeight - height + 1.6 + random() * Math.max( 0, height - 3.2 ),
 				z: z - along * Math.sin( yaw ) + localZ * Math.cos( yaw ),
 				normalX: side * Math.sin( yaw ), normalZ: side * Math.cos( yaw ),
-				width: 0.9, height: 1.2, floor: random() * 0.6, random: random(),
+				width: 1.3, height: 1.7, floor: random() * 0.6, random: random(),
+			} );
+
+		}
+
+		// 多开的窗：前后两面各一扇的机会，窗比真实的大一点（远处也是一个暖点）
+		const extraCount = 1 + Math.floor( extraRandom() * 2 );
+		for ( let k = 0; k < extraCount; k ++ ) {
+
+			const side = k % 2 === 0 ? 1 : - 1;
+			const along = ( extraRandom() - 0.5 ) * width * 0.6;
+			const localZ = side * ( depth / 2 + 0.3 );
+			windows.push( {
+				x: x + along * Math.cos( yaw ) + localZ * Math.sin( yaw ),
+				y: base + wallHeight - height + 1.6 + extraRandom() * Math.max( 0, height - 3.2 ),
+				z: z - along * Math.sin( yaw ) + localZ * Math.cos( yaw ),
+				normalX: side * Math.sin( yaw ), normalZ: side * Math.cos( yaw ),
+				width: 1.3, height: 1.7, floor: extraRandom() * 0.6, random: extraRandom() * 0.9,
 			} );
 
 		}
@@ -2157,10 +3825,11 @@ function buildTown( world, windows ) {
 
 	}
 
-	// 教堂：中殿 + 方塔 + 四棱尖顶（原画里那座细高的教堂尖塔）；放在机位视线左边约 50 米，不挡城堡
-	const leftAzimuth = keepClearAzimuths[ 0 ] - Math.PI / 2;
-	const churchX = centerX + Math.sin( leftAzimuth ) * 50;
-	const churchZ = centerZ - Math.cos( leftAzimuth ) * 50;
+	// 教堂：中殿 + 方塔 + 四棱尖顶（原画里那座细高的教堂尖塔）；放在小镇中心往机位视线右边约 36 米：
+	// 星月夜画面里尖塔在柏树右边、城堡右边一点（和原画一样），不挡城堡（原来在左边 50 米，正好藏在柏树后面）
+	const rightAzimuth = keepClearAzimuths[ 0 ] + Math.PI / 2;
+	const churchX = centerX + Math.sin( rightAzimuth ) * 36;
+	const churchZ = centerZ - Math.cos( rightAzimuth ) * 36;
 	const churchYaw = 0.4;
 	addHouse( churchX + 6, churchZ - 4, 22, 10, 11, churchYaw, '#c9bfae', '#4a4f63', 6 );
 	const towerX = churchX - 6;
@@ -2168,6 +3837,8 @@ function buildTown( world, windows ) {
 	const towerBase = world.worldHeight( towerX, towerZ ) - 0.5;
 	parts.push( paint( placeLocal( new THREE.BoxGeometry( 5, 22, 5 ), towerX, towerBase + 11, towerZ, churchYaw ), '#c9bfae' ) );
 	parts.push( paint( placeLocal( new THREE.ConeGeometry( 3.6, 20, 4 ), towerX, towerBase + 32, towerZ, churchYaw + Math.PI / 4 ), '#3c4256' ) );
+	// 钟楼：5 × 5 米、22 米高的方塔；尖顶是四棱锥（底的外接圆半径 3.6、高 20），四个角对着塔的四个面（多转了 45°）
+	state.townHouses.push( { kind: 'tower', x: towerX, z: towerZ, base: towerBase, width: 5, depth: 5, wallHeight: 22, yaw: churchYaw, spireRadius: 3.6, spireHeight: 20, wall: '#c9bfae', roof: '#3c4256' } );
 	state.houseFootprints.push( [ towerX, towerZ, 4 ] );
 	placed.push( [ churchX + 6, churchZ - 4, 16 ], [ towerX, towerZ, 6 ] );
 
@@ -2324,7 +3995,8 @@ function buildWindowGeometry( windows ) {
 
 }
 
-function createWindowMaterial() {
+// amount：这个地点替身窗灯的亮度倍数（uniform）
+function createWindowMaterial( amount ) {
 
 	const sky = state.world.uniforms;
 	const uniforms = state.uniforms;
@@ -2375,7 +4047,7 @@ function createWindowMaterial() {
 
 		// 方片里一个软边的窗口形状；画成一两个像素时就是一个柔和的光点
 		const shape = fadeOut( 0.55, 1.0, max( abs( cornerVarying.x ), abs( cornerVarying.y ) ) );
-		return uniforms.windowColor.mul( uniforms.windowIntensity ).mul( brightness ).mul( shape ).mul( state.toggles.窗灯 );
+		return uniforms.windowColor.mul( uniforms.windowIntensity ).mul( brightness ).mul( shape ).mul( state.toggles.窗灯 ).mul( amount );
 
 	} )();
 
@@ -2423,6 +4095,7 @@ async function build( ctx ) {
 	state.ctx = ctx;
 	state.world = ctx.world;
 	state.houseFootprints = [];
+	state.townHouses = [];
 	const world = ctx.world;
 	const worldConfig = world.config;
 	const terrainConfig = worldConfig.terrain;
@@ -2437,7 +4110,7 @@ async function build( ctx ) {
 	state.core = await sampleGrid( world, coreMinX, coreMinZ, coreCountX, coreCountZ, coreSpacing, slice );
 
 	// 外圈：格子线从核心区的角往外数整格，核心区的四条边正好落在外圈的格子线上；核心区边上的高度和外圈的边对齐
-	const outerSpacing = terrainConfig.outerSpacing;
+	const outerSpacing = typeof terrainConfig.outerSpacing === 'number' ? terrainConfig.outerSpacing : ( terrainConfig.outerSpacing[ tier ] || terrainConfig.outerSpacing.mid );
 	const cellsWest = Math.round( ( terrainConfig.outerSize / 2 - terrainConfig.coreSize[ 0 ] / 2 ) / outerSpacing );
 	const cellsNorth = Math.round( ( terrainConfig.outerSize / 2 - terrainConfig.coreSize[ 1 ] / 2 ) / outerSpacing );
 	const outerCountX = cellsWest * 2 + Math.round( terrainConfig.coreSize[ 0 ] / outerSpacing ) + 1;
@@ -2466,7 +4139,15 @@ async function build( ctx ) {
 	state.textures.horizon = state.horizon;
 	state.textures.biome = await buildBiomeMap( world, worldConfig, slice );
 	markStep( '地表图' );
-	state.disposables.push( state.horizon.texture, state.textures.biome.texture );
+	state.textures.surface = createSurfaceTexture( ctx.terrainBake );
+	state.disposables.push( state.horizon.texture, state.textures.biome.texture, state.textures.surface.texture, state.textures.surface.textureB );
+	// 地表贴图（远景和各地点的地面共用，常驻）
+	state.ground = await loadGroundTextures( ctx.config.ground, tier === 'hi' ? 8 : 4 );
+	if ( state.ground ) state.disposables.push( state.ground );
+	markStep( '地表贴图' );
+	state.grassGround = await buildGrassGround( slice );
+	state.disposables.push( state.grassGround.texture );
+	markStep( '草地图' );
 
 	// ---------- uniform 和效果层开关 ----------
 	const core = state.core;
@@ -2493,6 +4174,10 @@ async function build( ctx ) {
 		// 关掉时 start = 1e8、end = 2e8（范围不能是 0：float32 里 1e8 + 1 就是 1e8，0/0 会出 NaN 把顶点甩飞）
 		compressStart: uniform( 1e8 ),
 		compressEnd: uniform( 2e8 ),
+		// 烘焙地形的遮罩：有没有（1/0）、世界 xz → 贴图坐标的缩放和偏移（对准贴图像素中心）
+		bakedSurface: uniform( state.textures.surface.grid ? 1 : 0 ),
+		surfaceScale: uniform( state.textures.surface.scale ),
+		surfaceOffset: uniform( state.textures.surface.offset ),
 		coreMin: uniform( new THREE.Vector2( core.minX, core.minZ ) ),
 		coreSize: uniform( new THREE.Vector2( core.sizeX, core.sizeZ ) ),
 		outerCenter: uniform( new THREE.Vector2( terrainConfig.coreCenter[ 0 ], terrainConfig.coreCenter[ 1 ] ) ),
@@ -2503,6 +4188,9 @@ async function build( ctx ) {
 		sunHorizon: horizonSelector(),
 		moonHorizon: horizonSelector(),
 		ambientStrength: uniform( 1 ),
+		nightFill: uniform( 1 ),         // 月光补光的倍数（地点设，见 setNightFill）
+		bounceDirection: uniform( new THREE.Vector3( 0, 1, 0 ) ),   // 反射补光从哪个方向来（世界，指向光）
+		bounceColor: uniform( new THREE.Color( 0, 0, 0 ) ),         // 反射补光的颜色 × 强度（默认黑，不起作用）
 		cloudHeight: uniform( cloudConfig.height ),
 		cloudCoverage: uniform( cloudConfig.coverage ),
 		cloudScale: uniform( cloudConfig.scale ),
@@ -2513,6 +4201,13 @@ async function build( ctx ) {
 		windowIntensity: uniform( worldConfig.windowIntensity ),
 		forestFrom: uniform( tier === 'lo' ? 900 : 2000 ),
 		forestTo: uniform( tier === 'lo' ? 1600 : 3500 ),
+		groundNear: uniform( ctx.config.ground.near[ tier ] || ctx.config.ground.near.mid ),
+		treeNear: uniform( ctx.config.trees.near[ tier ] || ctx.config.trees.near.mid ),
+		treeNearBase: ctx.config.trees.near[ tier ] || ctx.config.trees.near.mid,
+		treeBand: uniform( ctx.config.trees.band ),
+		treeNearOn: uniform( 0 ),    // 近处的 3D 树建好了才是 1（没建好时树团照常全画）
+		understoryNear: uniform( ctx.config.trees.understory.near[ tier ] || ctx.config.trees.understory.near.mid ),
+		understoryNearBase: ctx.config.trees.understory.near[ tier ] || ctx.config.trees.understory.near.mid,
 		// 冰瀑：小镇溪源头那一段台地崖壁
 		iceFallX: uniform( iceSource.x ),
 		iceFallBottom: uniform( iceSource.y ),
@@ -2525,7 +4220,10 @@ async function build( ctx ) {
 		seaCutDepth: uniform( 0 ),
 		holeMin: uniform( new THREE.Vector2( 1e7, 1e7 ) ),
 		holeMax: uniform( new THREE.Vector2( - 1e7, - 1e7 ) ),
-		holeDepth: uniform( 0 ),
+		sinkMin: uniform( new THREE.Vector2( 1e7, 1e7 ) ),
+		sinkMax: uniform( new THREE.Vector2( 1e7 + 1, 1e7 + 1 ) ),
+		sinkFade: uniform( 1 ),
+		sinkDepth: uniform( 0 ),
 		lakeCutDepth: uniform( 0 ),
 		locationFogDensity: uniform( 0 ),
 		locationFogFalloff: uniform( 10 ),
@@ -2535,8 +4233,26 @@ async function build( ctx ) {
 		locationFogLight: uniform( new THREE.Vector3( 0, 1, 0 ) ),
 		locationFogAnisotropy: uniform( 0.6 ),
 		locationFogAmount: uniform( 0 ),
+		// 草根融合（地点的草长到远景地面上时）：草的近环圆心（世界坐标）、半径（0 = 不画）、强度、草根色
+		grassUnderlayCenter: uniform( new THREE.Vector2() ),
+		grassUnderlayRadius: uniform( 0 ),
+		grassUnderlayAmount: uniform( 0 ),
+		grassUnderlayNear: uniform( 0 ),
+		grassUnderlayFar: uniform( 0 ),          // 远环半径（米）
+		grassUnderlayFarAmount: uniform( 0 ),
+		grassRootColor: uniform( new THREE.Color( '#2b4f17' ) ),
+		grassMiddleColor: uniform( new THREE.Color( '#3c6b20' ) ),
 		insideCore: ( point ) => insideCoreNode( point, 0.01 ),
 		insideCoreWide: ( point ) => insideCoreNode( point, 0.08 ),
+		// 哥特岩台一带（台心往外 半径 + 落差宽度 以内是 1，再往外 60 米淡掉）
+		mesaDark: ( point ) => {
+
+			const mesa = worldConfig.terrainShape.gothicMesa;
+			if ( ! mesa ) return float( 0 );
+			const reach = mesa.radius + mesa.edgeWander + mesa.falloff;
+			return float( 1 ).sub( smoothstep( reach, reach + 60, length( point.xz.sub( vec2( mesa.center[ 0 ], mesa.center[ 1 ] ) ) ) ) );
+
+		},
 	};
 	state.uniforms = uniforms;
 
@@ -2550,7 +4266,14 @@ async function build( ctx ) {
 		水面倒影: uniform( 1 ),
 		水面高光: uniform( 1 ),
 		薄云: uniform( 1 ),
+		云影: uniform( 1 ),
+		谷雾: uniform( 1 ),
+		云团: uniform( 1 ),
 		树林显示: uniform( 1 ),
+		近处树: uniform( 1 ),
+		林下灌木: uniform( 1 ),
+		笔触边缘: uniform( 1 ),
+		野花: uniform( 1 ),
 		窗灯: uniform( 1 ),
 		山洞: uniform( 1 ),
 	};
@@ -2582,6 +4305,9 @@ async function build( ctx ) {
 	state.caveMeshes = buildCave( world );
 	for ( const mesh of state.caveMeshes ) root.add( mesh );
 
+	// 窄处的地形补丁的位置（材质里要按它丢掉远景网格，先算好）
+	state.patches = patchFootprints( worldConfig );
+
 	// 地形：核心区（带 40 米裙边）+ 外圈（挖掉核心区）
 	const terrainMaterial = createTerrainMaterial();
 	const coreGeometry = buildGridGeometry( state.core, { skirt: 40 } );
@@ -2600,16 +4326,27 @@ async function build( ctx ) {
 	}
 
 	state.disposables.push( terrainMaterial, coreGeometry, outerGeometry );
+	for ( const patch of state.patches ) {
+
+		const geometry = await buildTerrainPatch( patch, tier, world, slice );
+		const mesh = new THREE.Mesh( geometry, terrainMaterial );
+		mesh.name = `远景地形·补丁·${ patch.name }`;
+		mesh.frustumCulled = false;
+		root.add( mesh );
+		state.terrainMeshes.push( mesh );
+		state.disposables.push( geometry );
+
+	}
+
 	markStep( '地形网格' );
 
 	// 替身和窗灯：每个地点一组，4b 交接时按地点显隐。先建替身（小镇的房子位置要给树林让开）。
 	// 替身不做视锥剔除：包围球是没压缩的世界坐标，4b 里压缩深度时会被 far 面错误地整个剔掉
 	const proxyMaterial = createProxyMaterial();
-	const windowMaterial = createWindowMaterial();
-	state.disposables.push( proxyMaterial, windowMaterial );
+	state.disposables.push( proxyMaterial );
 	const builders = {
-		garden: ( windows ) => buildGardenCastle( world, windows ),
-		gothic: ( windows ) => buildGothicCastle( world, windows ),
+		garden: async ( windows ) => ( await buildGardenProxyModel( world ) ) || buildGardenCastle( world, windows ),
+		gothic: async ( windows ) => ( await buildGothicProxyModel( world, windows ) ) || buildGothicCastle( world, windows ),
 		starry: ( windows ) => buildTown( world, windows ),
 		sunset: () => buildSeaStacks( world ),
 	};
@@ -2619,7 +4356,7 @@ async function build( ctx ) {
 		const group = new THREE.Group();
 		group.name = '替身·' + world.locations[ locationKey ].name;
 		const windows = [];
-		for ( const geometry of builder( windows ) ) {
+		for ( const geometry of await builder( windows ) ) {
 
 			const mesh = new THREE.Mesh( geometry, proxyMaterial );
 			mesh.name = group.name;
@@ -2633,7 +4370,11 @@ async function build( ctx ) {
 		if ( windows.length > 0 ) {
 
 			const chosen = limit !== undefined && windows.length > limit ? windows.slice( 0, limit ) : windows;
+			state.windowLists[ locationKey ] = chosen;
 			const geometry = buildWindowGeometry( chosen );
+			state.windowAmounts[ locationKey ] = uniform( 1 );
+			const windowMaterial = createWindowMaterial( state.windowAmounts[ locationKey ] );
+			state.disposables.push( windowMaterial );
 			const mesh = new THREE.Mesh( geometry, windowMaterial );
 			mesh.name = group.name + '·窗灯';
 			mesh.frustumCulled = false;
@@ -2651,10 +4392,71 @@ async function build( ctx ) {
 
 	markStep( '替身' );
 
+	// 先窄后豁然开朗的窄处（崖缝、林荫隧道、冰缝）：在树林之前建，树林要让开它们的走廊
+	const narrows = await buildNarrows( {
+		legs: worldConfig.legs,
+		terrainShape: worldConfig.terrainShape,
+		groundAt: ( x, z ) => {
+
+			// 远景网格画出来的高度（墙脚、树根贴着看得见的地面）
+			const drawn = terrainHeightAt( x, z );
+			return Number.isFinite( drawn ) ? drawn : world.sample( x, z ).height;
+
+		},
+		lighting: worldLighting,
+		atmosphere: worldAtmosphere,
+		sky: world.uniforms,
+		time: uniforms.time,
+		toWorldDirection: sceneDirectionToWorld,
+	} );
+	state.narrows = narrows.meshes;
+	state.corridors = narrows.corridors;
+	state.extraTrees = narrows.extraTrees;
+	state.forestBoosts = narrows.boosts;
+	state.trailPaths = narrows.paths;
+	for ( const mesh of narrows.meshes ) root.add( mesh );
+	state.disposables.push( ...narrows.disposables );
+	markStep( '窄处' );
+
 	// 树林
 	state.forest = await buildForest( tier, slice );
 	for ( const mesh of state.forest ) root.add( mesh );
+	// 谷雾、云团（阶段 12 CP5）
+	for ( const mesh of buildValleyMist() ) root.add( mesh );
+	for ( const mesh of buildCloudClusters( tier ) ) root.add( mesh );
 	markStep( '树林' );
+
+	// 近处的 3D 树（阶段 12 CP3）：每个树种几个变体的模板，按镜头位置挑实例
+	state.treeField = await buildNearTrees( ctx, tier, slice );
+	if ( state.treeField ) {
+
+		root.add( state.treeField.group );
+		uniforms.treeNearOn.value = 1;
+
+	}
+
+	markStep( '近处的树' );
+
+	// 引路的花瓣和光点：花瓣用远景的世界光照，逆光时透一点光，夜里带一点自己的微光（不至于在月光下成黑片）
+	const guideConfig = ctx.config.guide;
+	state.guide = createGuide( {
+		petalCount: guideConfig.petalCount[ tier ] || guideConfig.petalCount.mid,
+		moteCount: guideConfig.moteCount[ tier ] || guideConfig.moteCount.mid,
+		settings: guideConfig,
+		shadePetal: ( albedo, normal, point ) => {
+
+			const sky = world.uniforms;
+			const lit = worldLighting( albedo, normal, point, { wrap: 0.6 } );
+			// 朝太阳看过去、花瓣在中间时透光（方向换到世界坐标再和太阳方向比）
+			const awayFromViewer = sceneDirectionToWorld( point.sub( cameraPosition ) );
+			const backlit = pow( max( dot( awayFromViewer, sky.sunDirection ), 0 ), 3 ).mul( 0.6 );
+			const glow = albedo.mul( sky.sunLightColor.mul( backlit ).add( vec3( 0.025, 0.03, 0.045 ) ) );
+			return worldAtmosphere( lit.add( glow ), point );
+
+		},
+	} );
+	root.add( state.guide.group );
+	markStep( '引路' );
 
 	state.scene = scene;
 	state.root = root;
@@ -2694,6 +4496,13 @@ export function update( dt, time ) {
 	const camera = state.ctx.camera;
 	uniforms.time.value = time;
 
+	// 顶点压力（规格书 6.1）：场景比例降到底还超预算时林下半径跟着缩（下一次重挑近处的树时生效）
+	const pressure = state.ctx.quality && Number.isFinite( state.ctx.quality.vertexPressure ) ? state.ctx.quality.vertexPressure : 1;
+	uniforms.understoryNear.value = uniforms.understoryNearBase * pressure;
+	// 近处 3D 树的范围也跟着缩（2026-10-03 核显跑 hi）：哥特、开场转身对着密林时顶点大头是近处的树，缩到 0.8、0.6 倍，远处交给替身卡片；
+	// 替身的交接距离读的是同一个 uniform，不用重编着色器。独显上压力一直是 1，画面不变
+	uniforms.treeNear.value = uniforms.treeNearBase * pressure;
+
 	// root 的逆矩阵：场景坐标 → 世界坐标
 	state.root.updateMatrixWorld();
 	uniforms.sceneToWorld.value.copy( tempMatrix.copy( state.root.matrixWorld ).invert() );
@@ -2701,6 +4510,11 @@ export function update( dt, time ) {
 	// 天空球跟着相机，半径 0.9 × far
 	camera.updateMatrixWorld();
 	state.skyDome.position.copy( state.root.worldToLocal( tempVector.setFromMatrixPosition( camera.matrixWorld ) ) );
+	// 近处的 3D 树：镜头（世界坐标，就是 root 的本地坐标）挪远了就重挑；地点自己的花树也一样
+	// 也按镜头朝向挑：视锥的水平投影放宽一些以外的不画（倒影的虚拟相机水平投影一样，见 trees.js viewFromCamera）
+	viewFromCamera( camera, uniforms.sceneToWorld.value, state.treeView );
+	if ( state.treeField ) state.treeField.update( state.skyDome.position, false, state.treeView );
+	for ( const field of state.locationTrees ) field.update( state.skyDome.position, false, state.treeView );
 	state.skyDome.scale.setScalar( camera.far * 0.9 );
 
 	const sun = world.getSunAngles();
@@ -2715,6 +4529,13 @@ export function update( dt, time ) {
 	const cloudElevation = sun.elevation + 2.2;
 	const warmth = smoothJs( 14, 0, sun.elevation );
 	uniforms.cloudSunColor.value.copy( cloudSunWhite ).lerp( cloudSunWarm, warmth ).multiplyScalar( 2.4 * smoothJs( - 1.2, 5, cloudElevation ) );
+
+	// 谷雾：镜头在雾层以下时着色器里的透明度正好是 0（viewerAbove 从雾层 + 4 米起才大于 0），整层不画，省掉近乎半屏的透明叠层；
+	// 云团：天光弱到 0.08 以下（入夜）时透明度也正好是 0（dayAmount），同样不画。
+	// 预编译时 compileScene 会把所有子物体临时设成可见，所以这里藏起来的不会漏编
+	const viewerHeight = state.skyDome.position.y;
+	for ( const layer of state.mistLayers ) layer.mesh.visible = viewerHeight > layer.height + 4;
+	if ( state.cloudClusterMesh ) state.cloudClusterMesh.visible = world.uniforms.skyIntensity.value > 0.08;
 
 }
 
@@ -2766,6 +4587,49 @@ export function setProxyVisible( locationKey, visible ) {
 
 }
 
+// 某个地点替身窗灯的亮度倍数（0~1）：飞往哥特时先不亮，穿出林荫隧道以后真窗灯一扇扇亮（规格书 5.3 阶段 12）
+export function setProxyWindows( locationKey, amount ) {
+
+	const value = state.windowAmounts[ locationKey ];
+	if ( value ) value.value = Number.isFinite( amount ) ? Math.min( 1, Math.max( 0, amount ) ) : 1;
+
+}
+
+// 地表贴图（tsl/terrain.js 的 loadGroundTextures 结果）：各地点的地面也用它，接缝两边同一套贴图；没读到是 null
+export function getGround() {
+
+	return state.ready ? state.ground : null;
+
+}
+
+// 地面贴图采样的距离（uniform，米）
+export function getGroundNear() {
+
+	return state.uniforms ? state.uniforms.groundNear : null;
+
+}
+
+// 引路（tsl/guide.js 建的那一份）；远景没建时是 null
+export function getGuide() {
+
+	return state.ready ? state.guide : null;
+
+}
+
+// 小镇房子的尺寸表（世界坐标，见 buildTown 里 townHouses 的说明）；星月夜按面画笔触用
+export function getTownHouses() {
+
+	return state.townHouses;
+
+}
+
+// 某个地点替身的窗户表（世界坐标 x、y、z，朝外的水平法线 normalX、normalZ，宽、高，楼层比例 floor，随机数 random）；没有是空数组
+export function getWindows( locationKey ) {
+
+	return state.windowLists[ locationKey ] || [];
+
+}
+
 export function getProxyKeys() {
 
 	return Object.keys( state.proxyGroups );
@@ -2811,23 +4675,41 @@ export function setSeaCut( cut ) {
 
 }
 
-// 内容挖洞：当前锚点（地点）局部坐标的矩形 [minX, maxX] × [minZ, maxZ] 里，远景地形压低 depth 米；传 null 关掉
+// 内容挖洞：当前锚点（地点）局部坐标的矩形 [minX, maxX] × [minZ, maxZ] 里，远景地形逐像素不画；传 null 关掉。
+// （阶段 12 以前是把顶点压低 depth 米，边外会出沟；现在 depth 不再起作用，地点那边传了也不报错）
+// 藏起某一种窄处的摆件（kind：frame.kind，比如 'trough'）；雪原的内容显出来时藏冰槽的冰凌、冰块、融水（审查 R8）
+export function setNarrowsHidden( kind, hidden ) {
+
+	// kind 传 'all'：所有窄处一起藏（开场在南岭外面，一处窄处都看不见，"外人不见"）
+	for ( const mesh of state.narrows || [] ) if ( kind === 'all' || mesh.userData.narrowsKind === kind ) mesh.userData.hiddenByLocation = hidden;
+	for ( const mesh of state.narrows || [] ) mesh.visible = state.narrowsEnabled !== false && ! mesh.userData.hiddenByLocation;
+
+}
+
 export function setContentHole( hole ) {
 
 	if ( ! state.ready ) return;
 	const uniforms = state.uniforms;
+	uniforms.sinkDepth.value = 0;
 	if ( ! hole ) {
 
 		uniforms.holeMin.value.set( 1e7, 1e7 );
 		uniforms.holeMax.value.set( - 1e7, - 1e7 );
-		uniforms.holeDepth.value = 0;
 		return;
 
 	}
 
 	uniforms.holeMin.value.set( hole.minX, hole.minZ );
 	uniforms.holeMax.value.set( hole.maxX, hole.maxZ );
-	uniforms.holeDepth.value = hole.depth;
+	// 可选的下压带 sink：{ minX, maxX, minZ, maxZ, depth（米）, fade（边上渐变米数）}，地点坐标
+	if ( hole.sink ) {
+
+		uniforms.sinkMin.value.set( hole.sink.minX, hole.sink.minZ );
+		uniforms.sinkMax.value.set( hole.sink.maxX, hole.sink.maxZ );
+		uniforms.sinkFade.value = Math.max( 0.1, hole.sink.fade );
+		uniforms.sinkDepth.value = hole.sink.depth;
+
+	}
 
 }
 
@@ -2862,6 +4744,39 @@ export function setSurfaceGain( gain ) {
 
 }
 
+// 反射补光：湖面、雪地把月光反到对面的崖上（哥特：月亮在城堡背后，朝湖的崖面整面背光，只靠天光是死黑的；
+// 月光正铺在崖前的湖面上，反上去一点，朝湖的面亮、侧面暗，石柱和冲沟的起伏才看得出）。
+// direction：世界方向（指向光），color：THREE.Color（已乘强度）；传 null 关掉
+export function setBounceLight( light ) {
+
+	if ( ! state.ready ) return;
+	if ( ! light ) {
+
+		state.uniforms.bounceColor.value.setRGB( 0, 0, 0 );
+		return;
+
+	}
+
+	state.uniforms.bounceDirection.value.copy( light.direction ).normalize();
+	state.uniforms.bounceColor.value.copy( light.color );
+
+}
+
+// 月光补光（天上一大片被月亮照亮的天和雾反下来的光）的倍数：背着月亮的崖、城堡不再死黑，看得出石头和起伏。
+// 只抬补光这一项，被月亮直接照到的地方不会跟着变亮（哥特设 3 左右）
+export function setNightFill( amount ) {
+
+	if ( state.ready ) state.uniforms.nightFill.value = Number.isFinite( amount ) ? amount : 1;
+
+}
+
+// 天光环境项的倍数（夜里飞行时抬，地面不至于全黑；地点退出时还原成 1）
+export function setAmbientStrength( amount ) {
+
+	if ( state.ready ) state.uniforms.ambientStrength.value = Number.isFinite( amount ) ? amount : 1;
+
+}
+
 // 把上面几项对接设置全部还原（地点退出时调）
 // 湖面下沉：depth 米（0 关掉）
 export function setLakeCut( depth ) {
@@ -2878,7 +4793,11 @@ export function resetLocationSettings() {
 	setContentHole( null );
 	setLocationFog( null );
 	setSurfaceGain( 1 );
+	setNightFill( 1 );
+	setAmbientStrength( 1 );
+	setBounceLight( null );
 	setSkyVisible( true );
+	setGrassUnderlay( null );
 
 }
 
@@ -2897,7 +4816,89 @@ export function worldLighting( albedo, normal, point, { skyView = float( 1 ), wr
 
 }
 
+// 薄的东西（草叶、花瓣、叶片）：正面光照 + 背面透过来的一部分 + 逆着太阳 / 月亮看时的前向透射（pow 6 的瓣）+ 叶面高光（Blinn-Phong 28）。
+// 地形阴影只查一次（worldLighting 调两次的话地平线图要多查一遍）。point、normal、toViewer 是场景坐标；scatter、specular 是节点
+export function worldLightingThin( albedo, normal, point, toViewer, { wrap = 0.4, back = 0.4, scatter = float( 0 ), specular = float( 0 ), skyView = float( 1 ) } = {} ) {
+
+	const uniforms = state.uniforms;
+	const sky = state.world.uniforms;
+	const worldPoint = uniforms.sceneToWorld.mul( vec4( point, 1 ) ).xyz;
+	const worldNormal = normalize( uniforms.sceneToWorld.mul( vec4( normal, 0 ) ).xyz );
+	const worldToViewer = normalize( uniforms.sceneToWorld.mul( vec4( toViewer, 0 ) ).xyz );
+	const sunShadow = terrainShadow( worldPoint, uniforms.sunHorizon, sky.sunElevation, 1.3 );
+	const moonShadow = terrainShadow( worldPoint, uniforms.moonHorizon, sky.moonElevation, 3 );
+	const front = lightAt( worldNormal, sunShadow, moonShadow, skyView, wrap );
+	const behind = lightAt( worldNormal.negate(), sunShadow, moonShadow, skyView, wrap ).mul( back );
+	const throughSun = sky.sunLightColor.mul( sunShadow ).mul( pow( max( dot( worldToViewer.negate(), sky.sunDirection ), 0 ), 6 ) );
+	const throughMoon = sky.moonLightColor.mul( moonShadow ).mul( pow( max( dot( worldToViewer.negate(), sky.moonDirection ), 0 ), 6 ) );
+	const halfVector = normalize( sky.sunDirection.add( worldToViewer ) );
+	const glint = sky.sunLightColor.mul( sunShadow ).mul( pow( max( dot( worldNormal, halfVector ), 0 ), 28 ) ).mul( specular );
+	return nightAlbedo( albedo ).mul( front.add( behind ).add( throughSun.add( throughMoon ).mul( scatter ) ) ).add( glint );
+
+}
+
+// 山洞挖空的那截地形上不长草：sceneXZ、sceneHeight 是场景坐标（地点局部）节点，返回 0（在洞的体积里）或 1。
+// 地形在洞里按像素丢了，长在上面的草原来还在，从洞里看出口像草从天上倒挂下来、出洞时镜头穿过一片悬空的草（2026-10-02 自查）
+export function caveKeep( sceneXZ, sceneHeight ) {
+
+	const worldPoint = state.uniforms.sceneToWorld.mul( vec4( sceneXZ.x, sceneHeight, sceneXZ.y, 1 ) ).xyz;
+	return float( 1 ).sub( caveCutout( worldPoint ) );
+
+}
+
+// 草落在远景地面上的那部分（阶段 12 CP3 返工）：sceneXZ 是场景坐标（地点局部）节点，返回场景坐标里的
+// { height（局部高度）, density（0~1）, normal（场景坐标的地面法线）}。地点只绕竖直轴转（原点 + yaw），所以换算只差一个平移和一个转角
+export function grassGround( sceneXZ ) {
+
+	const toWorld = state.uniforms.sceneToWorld;
+	const worldXZ = toWorld.mul( vec4( sceneXZ.x, 0, sceneXZ.y, 1 ) ).xz;
+	const sceneOriginY = toWorld.mul( vec4( 0, 0, 0, 1 ) ).y;
+	const ground = grassGroundAtWorld( worldXZ );
+	// 世界法线转回场景：乘旋转的转置（和场景两根水平轴各点乘一次，竖直分量不变）
+	const axisX = toWorld.mul( vec4( 1, 0, 0, 0 ) ).xyz;
+	const axisZ = toWorld.mul( vec4( 0, 0, 1, 0 ) ).xyz;
+	const normal = vec3( dot( ground.normal, axisX ), ground.normal.y, dot( ground.normal, axisZ ) );
+	return { height: ground.height.sub( sceneOriginY ), density: ground.density, normal };
+
+}
+
+// 地点的草每帧告诉远景：近环圆心（世界坐标）、近环半径（0 不画）、远环半径、强度（总的、近、远）、草根色、草的中段色（线性）
+export function setGrassUnderlay( underlay ) {
+
+	const uniforms = state.uniforms;
+	if ( ! uniforms ) return;
+	if ( ! underlay ) {
+
+		uniforms.grassUnderlayRadius.value = 0;
+		uniforms.grassUnderlayAmount.value = 0;
+		return;
+
+	}
+
+	uniforms.grassUnderlayCenter.value.set( underlay.x, underlay.z );
+	uniforms.grassUnderlayRadius.value = underlay.radius;
+	uniforms.grassUnderlayFar.value = underlay.farRadius || 0;
+	uniforms.grassUnderlayAmount.value = underlay.amount;
+	uniforms.grassUnderlayNear.value = underlay.nearAmount ?? 1;
+	uniforms.grassUnderlayFarAmount.value = underlay.farAmount ?? 1;
+	if ( underlay.rootColor ) uniforms.grassRootColor.value.set( underlay.rootColor );
+	if ( underlay.middleColor ) uniforms.grassMiddleColor.value.set( underlay.middleColor );
+
+}
+
 // 大气透视 + 贴地薄雾 + 地点的雾（同远景）；point 是场景坐标
+// 远景地表图在某个场景坐标点的值：R 到水边的距离、G 桃林、B 花海（核心区外 0）、A 天光遮蔽（核心区外 0.85，和远景地面一样过渡）。
+// 地点自己的地面要和远景接得上时用（花园块边上原来是一条直线：块里亮绿、块外花海加山谷里的天光遮蔽，出洞俯瞰时一眼看得到）
+export function groundBiomeAt( scenePoint ) {
+
+	const uniforms = state.uniforms;
+	const worldPoint = uniforms.sceneToWorld.mul( vec4( scenePoint, 1 ) ).xyz;
+	const coreUv = worldPoint.xz.sub( uniforms.coreMin ).div( uniforms.coreSize );
+	const biome = texture( state.textures.biome.texture, coreUv ).level( 0 );
+	return vec4( biome.rgb.mul( uniforms.insideCore( worldPoint ) ), mix( float( 0.85 ), biome.a, uniforms.insideCoreWide( worldPoint ) ) );
+
+}
+
 export function worldAtmosphere( surface, point ) {
 
 	const worldPoint = state.uniforms.sceneToWorld.mul( vec4( point, 1 ) ).xyz;
@@ -2936,6 +4937,14 @@ export function dispose() {
 	}
 
 	for ( const mesh of state.forest ) mesh.dispose();
+	if ( state.guide ) state.guide.dispose();
+	state.guide = null;
+	state.treeField = null;
+	state.forestItems = [];
+	state.narrows = [];
+	state.corridors = [];
+	state.windowAmounts = {};
+	state.windowLists = {};
 	state.disposables = [];
 	state.scene.clear();
 	state.scene = null;
@@ -2947,6 +4956,8 @@ export function dispose() {
 	state.caveUniforms = null;
 	state.proxyGroups = {};
 	state.houseFootprints = [];
+	state.townHouses = [];
+	state.patches = [];
 	state.core = null;
 	state.outer = null;
 	state.horizon = null;
@@ -2965,6 +4976,29 @@ export function getLayers() {
 	if ( ! state.toggles ) return {};
 	return {
 		...state.toggles,
+		...( state.ground ? state.ground.toggles : {} ),
+		// 规格书 6.3：烘焙出来的法线、岩石外露、凹凸遮蔽、分色和崖面遮罩；关掉退回网格法线加坡度阈值（高度和树的位置不归它管）
+		烘焙地形细节: ( enabled ) => {
+
+			state.uniforms.bakedSurface.value = enabled && state.textures.surface.grid ? 1 : 0;
+
+		},
+		// 远处的替身卡片（远景树林现在就是替身卡片那一个网格；没烘图集时是原来的树团）
+		树替身: ( enabled ) => {
+
+			for ( const mesh of state.forest ) mesh.visible = enabled;
+
+		},
+		// 焦点樱花树（近处的 3D 树里树种是 focal 的那几个网格）
+		焦点树: ( enabled ) => {
+
+			if ( state.treeField ) state.treeField.group.traverse( ( object ) => {
+
+				if ( object.isMesh && object.name.includes( '·focal·' ) ) object.visible = enabled;
+
+			} );
+
+		},
 		替身: ( enabled ) => {
 
 			for ( const group of Object.values( state.proxyGroups ) ) group.visible = enabled;
@@ -2989,6 +5023,22 @@ export function getLayers() {
 		山洞网格: ( enabled ) => {
 
 			for ( const mesh of state.caveMeshes ) mesh.visible = enabled;
+
+		},
+		窄处: ( enabled ) => {
+
+			state.narrowsEnabled = enabled;
+			for ( const mesh of state.narrows ) mesh.visible = enabled && ! mesh.userData.hiddenByLocation;
+
+		},
+		引路花瓣: ( enabled ) => {
+
+			if ( state.guide ) state.guide.petals.visible = enabled;
+
+		},
+		引路光点: ( enabled ) => {
+
+			if ( state.guide ) state.guide.motes.visible = enabled;
 
 		},
 		// 整个远景都不画（量后期链本身的开销用）

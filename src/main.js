@@ -12,6 +12,7 @@ import { createTimeline } from './core/timeline.js';
 import { createAudio } from './core/audio.js';
 import { createDebug } from './core/debug.js';
 import { createWorld, directionFromAngles } from './core/world.js';
+import { getManifest, blobOf, gunzipToArrayBuffer } from './core/assets.js';
 import * as backdrop from './scenes/backdrop.js';
 import * as overture from './scenes/overture.js';
 import * as garden from './scenes/garden.js';
@@ -80,6 +81,7 @@ const elements = {
 	cardProgress: document.getElementById( 'cardProgress' ),
 	cardStatus: document.getElementById( 'cardStatus' ),
 	ending: document.getElementById( 'ending' ),
+	hint: document.getElementById( 'hint' ),
 	creditsButton: document.getElementById( 'creditsButton' ),
 	creditsPanel: document.getElementById( 'creditsPanel' ),
 	replayButton: document.getElementById( 'replayButton' ),
@@ -409,6 +411,65 @@ function startCssFallback( reason ) {
 }
 
 // ===== 主逻辑 =====
+// 烘焙的地形：解压核心区、外圈的高度（Int16，0.1 米一档）和核心区的两张遮罩，高度挂到 world 上（之后 world.sample 按网格插值）；
+// 返回 { grid, surfaceA, surfaceB } 给常驻远景建遮罩贴图。没有烘焙数据、或者和现在的地形配置对不上，警告并返回 null（用解析公式）
+async function loadTerrainBake( world ) {
+
+	const manifest = getManifest( 'terrain' );
+	if ( ! manifest ) {
+
+		console.warn( '秘境：没有烘焙的地形（assets/opt/terrain），用解析公式；跑一下 node scripts/bake-terrain.mjs' );
+		return null;
+
+	}
+
+	const currentHash = world.terrainConfigHash();
+	if ( manifest.hash !== currentHash ) {
+
+		console.warn( `秘境：烘焙的地形和现在的地形配置对不上（烘焙时 ${ manifest.hash }，现在 ${ currentHash }），先用解析公式；重跑 node scripts/bake-terrain.mjs` );
+		return null;
+
+	}
+
+	const started = performance.now();
+	const unpack = async ( id ) => {
+
+		const blob = await blobOf( 'terrain', id );
+		if ( ! blob ) throw new Error( `烘焙的地形缺数据块：${ id }` );
+		return gunzipToArrayBuffer( blob );
+
+	};
+	const decodeHeights = async ( id, grid ) => {
+
+		const encoded = new Int16Array( await unpack( id ) );
+		if ( encoded.length !== grid.width * grid.height ) throw new Error( `烘焙的地形 ${ id } 大小不对：${ encoded.length }，应该是 ${ grid.width * grid.height }` );
+		const heights = new Float32Array( encoded.length );
+		for ( let i = 0; i < encoded.length; i ++ ) heights[ i ] = encoded[ i ] * manifest.heightScale;
+		return { ...grid, heights };
+
+	};
+
+	try {
+
+		const [ core, outer, surfaceA, surfaceB ] = await Promise.all( [
+			decodeHeights( 'height-core', manifest.grids.core ),
+			decodeHeights( 'height-outer', manifest.grids.outer ),
+			unpack( 'surface-a' ).then( ( buffer ) => new Uint8Array( buffer ) ),
+			unpack( 'surface-b' ).then( ( buffer ) => new Uint8Array( buffer ) ),
+		] );
+		world.attachTerrainBake( { core, outer } );
+		console.log( `秘境：烘焙的地形挂上了（核心区 ${ core.width }×${ core.height }、外圈 ${ outer.width }×${ outer.height }，解压用时 ${ ( performance.now() - started ).toFixed( 0 ) } ms）` );
+		return { grid: manifest.grids.core, surfaceA, surfaceB };
+
+	} catch ( error ) {
+
+		console.error( '秘境：烘焙的地形解不开，用解析公式：', error );
+		return null;
+
+	}
+
+}
+
 async function boot() {
 
 	fillCard();
@@ -506,6 +567,8 @@ async function boot() {
 	};
 
 	ctx.world = createWorld( config );
+	// 烘焙的地形（scripts/bake-terrain.mjs）在后台解压，建常驻远景之前等它（timeline.prepareWorld、俯瞰模式）
+	ctx.terrainBakePromise = loadTerrainBake( ctx.world );
 	// 环境光贴图生成器整个程序共用一个（每个地点各建一个的话，每次都要同步编一遍模糊着色器）
 	ctx.pmrem = new THREE.PMREMGenerator( renderer );
 	ctx.quality = createQuality( ctx, forcedTier );
@@ -563,6 +626,7 @@ async function boot() {
 
 			timeline.update( dt );
 			updateEnding( dt );
+			updateHints();
 
 		}
 
@@ -583,6 +647,44 @@ async function boot() {
 		timer.update();
 		ctx.director.update( 0 );
 		ctx.pipeline.render();
+
+	}
+
+	// ===== 小提示（config.hints）：换地点时清"拖过没有"，停留到 at 秒、她还没动过就淡入，duration 秒后淡出；每轮每条只出一次 =====
+	const hintState = { sceneKey: null, shown: new Set(), hideAt: - 1 };
+	function updateHints() {
+
+		const sceneKey = timeline.state.phase === 'playing' ? timeline.getSceneKey() : null;
+		if ( sceneKey !== hintState.sceneKey ) {
+
+			hintState.sceneKey = sceneKey;
+			ctx.director.resetInteracted();
+			elements.hint.classList.remove( 'visible' );
+			hintState.hideAt = - 1;
+			// 回到开场（再走一遍）时这一轮重新算
+			if ( sceneKey === config.scenes[ 0 ].key ) hintState.shown.clear();
+
+		}
+
+		if ( ! sceneKey || isShotMode || bakeMode ) return;
+		const time = timeline.getTime();
+		if ( hintState.hideAt >= 0 && time >= hintState.hideAt ) {
+
+			elements.hint.classList.remove( 'visible' );
+			hintState.hideAt = - 1;
+
+		}
+
+		for ( const hint of config.hints || [] ) {
+
+			if ( hint.scene !== sceneKey || hintState.shown.has( hint ) || time < hint.at ) continue;
+			hintState.shown.add( hint );
+			if ( ctx.director.hasInteracted() ) continue;
+			elements.hint.textContent = hint.text;
+			elements.hint.classList.add( 'visible' );
+			hintState.hideAt = time + hint.duration;
+
+		}
 
 	}
 
@@ -674,6 +776,8 @@ async function boot() {
 
 			}
 
+			// 场景 MSAA 采样数按判档结果定（研究开关，默认不变），必须在预编译之前：采样数是管线的一部分
+			if ( typeof ctx.pipeline.setSceneSamples === 'function' ) ctx.pipeline.setSceneSamples( ctx.quality.sceneSamples );
 			// 输出链各画一帧编掉，运行中切换不卡（pano 档只用全景链，软件渲染下别的链编起来要好几秒）
 			ctx.pipeline.prepareChains( ctx.quality.tier === 'pano' ? [ 'pano' ] : undefined );
 			setProgress( 0.3, '正在铺开秘境' );
@@ -834,6 +938,7 @@ async function boot() {
 
 		ctx.world.setDayTime( overviewConfig.startTime );
 		const overviewBuildStart = performance.now();
+		ctx.terrainBake = await ctx.terrainBakePromise;
 		const result = await backdrop.init( ctx );
 		await ctx.pipeline.compileScene( result.scene, camera );
 		backdrop.enter();
@@ -980,6 +1085,19 @@ async function boot() {
 	// 远景自己的层、当前地点的模块（调试、截图排查用）
 	gift.backdropLayers = () => backdrop.getLayers();
 	gift.currentModule = () => timeline.getCurrentModule();
+	// 远景在世界坐标某点的地面高度（调试：和地点自己的地面比）
+	gift.terrainAt = ( x, z ) => backdrop.getTerrainHeight( x, z );
+	// 树林布点（scripts/bake-forest.mjs 用）：{ key, hash, base64 }
+	gift.dumpForest = () => {
+
+		const dump = backdrop.dumpForest();
+		if ( ! dump ) return null;
+		const bytes = new Uint8Array( dump.data.buffer );
+		let binary = '';
+		for ( let i = 0; i < bytes.length; i += 32768 ) binary += String.fromCharCode( ...bytes.subarray( i, i + 32768 ) );
+		return { key: dump.key, hash: dump.hash, base64: btoa( binary ), count: dump.data.length / 10 };
+
+	};
 	// 相机在世界里的位置和朝向（方位角从北顺时针、俯仰，度）；交接、飞行连续性自查用
 	gift.cameraWorld = () => {
 
@@ -1016,6 +1134,30 @@ async function boot() {
 		return true;
 
 	};
+	// 调试：当前画面里材质名含 namePart 的第一个物体，取它的着色器源码（{ vertexShader, fragmentShader }）
+	gift.dumpShader = async ( namePart ) => {
+
+		const scene = ctx.pipeline.getScene();
+		let found = null;
+		scene.traverse( ( object ) => {
+
+			if ( ! found && object.material && ! Array.isArray( object.material ) && ( object.material.name || '' ).includes( namePart ) ) found = object;
+
+		} );
+		if ( ! found ) throw new Error( `当前画面里没有材质名含「${ namePart }」的物体` );
+		return ctx.renderer.debug.getShaderAsync( scene, ctx.camera, found );
+
+	};
+	// 远景的效果层（地点里也能开关，排查地点和远景接缝用）
+	gift.setBackdropLayer = ( label, enabled ) => {
+
+		const target = backdrop.getLayers()[ label ];
+		if ( target === undefined ) throw new Error( `远景没有叫「${ label }」的效果层` );
+		if ( typeof target === 'function' ) target( Boolean( enabled ) );
+		else target.value = enabled ? 1 : 0;
+		return true;
+
+	};
 	// 秘境：设时刻、摆机位、列出地点、改相机远近裁剪面、远景深度压缩（只在俯瞰模式下有意义）
 	// 截图脚本：飞到第 toIndex 个地点那段航线的某个进度（0~1）
 	gift.flightTo = async ( toIndex, progress ) => {
@@ -1028,6 +1170,8 @@ async function boot() {
 	// 长任务和时间线阶段记录（时间都是 performance.now 的毫秒）
 	gift.longTasks = () => ( { tasks: longTasks.slice(), phases: timeline.getPhaseLog(), now: performance.now() } );
 	gift.preloadNext = () => timeline.preloadNext();
+	// 再走一遍（和结尾的按钮一样：先起花瓣风暴，再薄雾回到溪口）
+	gift.restart = () => timeline.restart();
 	// 秘境时刻：俯瞰模式下随便设；地点和飞行里时间线每帧会按自己的规则设回去（暂停时保留）
 	// ===== 全景烘焙接口（只在 ?bake=1 时有）=====
 	if ( bakeMode ) {
@@ -1140,6 +1284,31 @@ async function boot() {
 		return { median: samples[ Math.floor( samples.length / 2 ) ], max: samples[ samples.length - 1 ], count: samples.length };
 
 	};
+	// 性能探针用：下一帧的每个绘制调用按"网格名 · 画进哪个目标"汇总三角数和实例数（找顶点大户：倒影、阴影各算一遍）
+	gift.drawStats = async ( limit = 40 ) => {
+
+		const info = renderer.info;
+		const originalUpdate = info.update;
+		const totals = new Map();
+		info.update = function ( object, count, instanceCount ) {
+
+			const target = renderer.getRenderTarget();
+			const where = target ? ( target.texture && target.texture.name ) || `${ target.width }×${ target.height }` : '画布';
+			const name = `${ object.name || ( object.material && object.material.name ) || object.type } · ${ where }`;
+			const item = totals.get( name ) || { triangles: 0, calls: 0, instances: 0 };
+			if ( object.isMesh || object.isSprite ) item.triangles += instanceCount * count / 3;
+			item.calls ++;
+			item.instances += instanceCount;
+			totals.set( name, item );
+			return originalUpdate.call( this, object, count, instanceCount );
+
+		};
+
+		await new Promise( ( resolve ) => requestAnimationFrame( resolve ) );
+		info.update = originalUpdate;
+		return [ ...totals.entries() ].sort( ( first, second ) => second[ 1 ].triangles - first[ 1 ].triangles ).slice( 0, limit ).map( ( [ name, item ] ) => ( { name, ...item } ) );
+
+	};
 	gift.info = () => {
 
 		const info = renderer.info;
@@ -1148,6 +1317,10 @@ async function boot() {
 			gpuName,
 			tier: ctx.quality.tier,
 			renderScale: ctx.quality.renderScale,
+			vertexPressure: ctx.quality.vertexPressure,
+			frameTarget: ctx.quality.frameTarget,
+			budgetMs: ctx.quality.budgetMs,
+			pendingTier: ctx.quality.pendingTier,
 			gpuMs: ctx.quality.gpuMs,
 			dayTime: ctx.world.getDayTime(),
 			sceneKey: timeline.getSceneKey(),
@@ -1165,11 +1338,13 @@ async function boot() {
 			chain: ctx.pipeline.getChain(),
 			loadStates: timeline.getLoadStates(),
 			cameraPosition: camera.position.toArray().map( ( value ) => Math.round( value * 100 ) / 100 ),
+			cameraLayers: camera.layers.mask,
 			geometries: info.memory.geometries,
 			textures: info.memory.textures,
 			renderTargets: info.memory.renderTargets,
 			programs: info.memory.programs,
 			drawCalls: info.render.drawCalls,
+			triangles: info.render.triangles,
 		};
 
 	};

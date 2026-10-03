@@ -1,0 +1,20 @@
+{
+	"note": "树林布点（scripts/bake-forest.mjs 生成）：每棵 10 个 32 位浮点 x、y、z、size、tint、yaw、cull、树种序号、变体、种类",
+	"hash": "8d2e77a8",
+	"files": [
+		{
+			"id": "forest-hi",
+			"file": "forest-hi.f32.gz",
+			"mime": "application/gzip",
+			"bytes": 1493113,
+			"count": 53787
+		},
+		{
+			"id": "forest-lo",
+			"file": "forest-lo.f32.gz",
+			"mime": "application/gzip",
+			"bytes": 843458,
+			"count": 30320
+		}
+	]
+}

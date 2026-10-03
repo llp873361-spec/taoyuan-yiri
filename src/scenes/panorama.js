@@ -2,7 +2,7 @@
 // 再叠一层实时的轻量动态。
 //
 // 素材（scripts/bake-pano.mjs 烘焙，清单 assets/opt/pano/manifest.json）：每个文件是 HTML 末尾一个 <script type="application/octet-stream">
-// 数据块（base64，见 vite.config.js），用到时才读、才解码；只解当前和下一个地点的。
+// 数据块（base64，id 是 data-pano-<编号>，见 vite.config.js；读取、解码在 src/core/assets.js），用到时才读、才解码；只解当前和下一个地点的。
 //   每个烘焙点：全景图（等距柱状，sRGB，宽 8192）、遮罩（R 天空、G 闪光密度、B 窗户编号、A 水面）、夜空高精度渐变（半精度，消色带）
 //   每段飞行：1080p 视频，飞行时盖在画布上面播放，首尾和全景交叉淡化
 //
@@ -17,6 +17,7 @@ import {
 	normalize, atan, asin, clamp, fract, floor, mix, smoothstep, max, abs, dot, length, exp, sin, cos, pow, luminance, step, cross,
 } from 'three/tsl';
 import manifest from '../../assets/opt/pano/manifest.json';
+import { blobOf as dataBlobOf, hasData, gunzipToArrayBuffer } from '../core/assets.js';
 import { hash33 } from '../tsl/noise.js';
 import { createAuroraPass, hemisphereUV } from './aurora.js';
 
@@ -46,13 +47,11 @@ export function flightVideoOf( fromKey, toKey ) {
 
 }
 
-// HTML 数据块 → Blob（data: 地址交给 fetch 解 base64，比 atob 快得多；data: 不是网络请求）
+// HTML 数据块 → Blob（读数据块、解 base64 在 src/core/assets.js）。全景缺素材照旧直接抛错，由调用方切兜底
 export async function blobOf( id ) {
 
-	const element = document.getElementById( 'pano-data-' + id );
-	if ( ! element ) throw new Error( `全景：页面里没有素材「${ id }」（重新构建，或重跑 scripts/bake-pano.mjs）` );
-	const response = await fetch( 'data:' + element.dataset.mime + ';base64,' + element.textContent.trim() );
-	return response.blob();
+	if ( ! hasData( 'pano', id ) ) throw new Error( `全景：页面里没有素材「${ id }」（重新构建，或重跑 scripts/bake-pano.mjs）` );
+	return dataBlobOf( 'pano', id );
 
 }
 
@@ -77,8 +76,7 @@ async function imageTextureOf( id, colorSpace ) {
 // 宽、高写在清单里，第一行在下。这里解压、逐行累加回原值、补上 alpha = 1
 async function halfTextureOf( id, width, height ) {
 
-	const stream = ( await blobOf( id ) ).stream().pipeThrough( new DecompressionStream( 'gzip' ) );
-	const delta = new Uint16Array( await new Response( stream ).arrayBuffer() );
+	const delta = new Uint16Array( await gunzipToArrayBuffer( await blobOf( id ) ) );
 	if ( delta.length !== width * height * 3 ) throw new Error( `全景：夜空渐变「${ id }」长度不对（${ delta.length }，应为 ${ width * height * 3 }），重跑 scripts/bake-pano.mjs` );
 	const data = new Uint16Array( width * height * 4 );
 	const halfOne = 0x3c00;
@@ -656,7 +654,7 @@ export function createFlightVideo( host ) {
 	video.muted = true;
 	video.playsInline = true;
 	video.preload = 'auto';
-	video.style.cssText = 'position:fixed;inset:0;width:100%;height:100%;object-fit:cover;pointer-events:none;opacity:0;z-index:1;background:#000;';
+	video.style.cssText = 'position:fixed;inset:0;width:100%;height:100%;object-fit:cover;pointer-events:none;opacity:0;z-index:1;background:transparent;';
 	host.appendChild( video );
 	const urls = new Map();
 	let currentKey = '';
@@ -683,7 +681,10 @@ export function createFlightVideo( host ) {
 		// 每帧：按飞行时间同步（差得多才跳，平时让它自己播）、设不透明度；paused 时停住
 		sync( time, opacity, paused ) {
 
-			video.style.opacity = String( Math.max( 0, Math.min( 1, opacity ) ) );
+			// 视频还没解出这一帧（刚换源、跳转中，软件渲染下几十兆的视频要等一会儿）时先不盖上去，下面的画面照常显示；
+			// 原来 <video> 底色是黑的，跳到飞行 25% 那一下整屏黑（软件渲染回归里的"可疑纯色"）
+			const decoded = video.readyState >= 2 && ! video.seeking;
+			video.style.opacity = String( decoded ? Math.max( 0, Math.min( 1, opacity ) ) : 0 );
 			if ( opacity <= 0 ) {
 
 				if ( ! video.paused ) video.pause();

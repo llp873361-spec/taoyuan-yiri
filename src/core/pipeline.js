@@ -48,10 +48,13 @@ function toneMappingFromName( name ) {
 
 }
 
-// 场景画进去的目标：和 pass() 原来的目标同一种格式（HalfFloat 颜色 + 深度纹理），画面和以前一样
+// 场景画进去的目标：和 pass() 原来的目标同一种格式（HalfFloat 颜色 + 深度纹理），画面和以前一样。
+// MSAA 的多重采样颜色不回写显存（storeMultisampledColorBuffer: false）：后期只读解析后的那张，4 个采样的 RGBA16F 每像素 32 字节白写。
+// r186 只在 WebGPU 上生效（storeOp 设成 discard，loadOp 被强制成 clear——场景每帧只画一遍、本来就清屏）；WebGL2 只在 Oculus 浏览器上 invalidate。
+// 深度的多重采样要留着：WebGPU 上后期直接读多重采样的深度纹理
 function createSceneTarget( renderer, width, height ) {
 
-	const target = new THREE.RenderTarget( width, height, { type: THREE.HalfFloatType, samples: renderer.samples } );
+	const target = new THREE.RenderTarget( width, height, { type: THREE.HalfFloatType, samples: renderer.samples, storeMultisampledColorBuffer: false } );
 	target.texture.name = '场景';
 	const depthTexture = new THREE.DepthTexture();
 	depthTexture.isRenderTargetTexture = true;
@@ -129,8 +132,8 @@ export function createPipeline( ctx ) {
 	const upscaleBloomNode = bloom( sceneColor, bloomNode.strength, bloomNode.radius, bloomNode.threshold );
 	// ===== 光束（规格书 10.2：晨雾里的体积光；屏幕空间径向模糊，GPU Gems 3 第 13 章）=====
 	// 光源：只取天空里（深度是远平面）太阳附近的亮处，按到太阳的屏幕距离衰减，半分辨率画进一张图；
-	// 再朝太阳在屏幕上的位置径向模糊 48 次（three 自带的 radialBlur），也是半分辨率；加回 HDR，再一起泛光、调色。
-	// 太阳在相机背后、或者地点不要光束时（amount = 0）两张图都不更新，不花时间
+	// 再朝太阳在屏幕上的位置径向模糊 32 次（three 自带的 radialBlur；原来 48 次），也是半分辨率；加回 HDR，再一起泛光、调色。
+	// 太阳在相机背后、或者地点不要光束时（amount = 0）两张图都不更新、合成时也不取（uniform 分支），不花时间
 	const shaftAmount = uniform( 0 );
 	const shaftSun = uniform( new THREE.Vector2( 0.5, 0.5 ) );   // 太阳在屏幕上的位置（screenUV，左上角是 0）
 	const shaftColor = uniform( new THREE.Color( 1, 1, 1 ) );
@@ -146,16 +149,36 @@ export function createPipeline( ctx ) {
 		return vec4( sceneColor.sample( screenUV ).rgb.mul( sky ).mul( near ), 1 );
 
 	} )(), null, null, { resolutionScale: 0.5 } );
-	const shaftBlur = rtt( radialBlur( shaftSource, { center: shaftSun, weight: float( 0.9 ), decay: float( 0.965 ), count: int( 48 ), exposure: float( 2.2 ) } ), null, null, { resolutionScale: 0.5 } );
+	// 采样次数 N 换了以后保持原来 48 次时的样子：radialBlur 第 i 个采样在去太阳路上 i/N 处，权重 weight·decay^(i−1)，总和除以 N。
+	// 沿光线的衰减曲线 decay^(N·t) 不变 → decay = 0.965^(48/N)；均匀光源时的总亮度 weight/N·(1 − decay^N)/(1 − decay) 不变
+	// → weight = 0.9 · (N/48) · (1 − decay)/(1 − 0.965)。N = 32 时 decay ≈ 0.948、weight ≈ 0.892
+	const shaftSamples = Math.max( 16, Math.min( 64, Math.round( ( config.post.lightShafts && config.post.lightShafts.samples ) || 48 ) ) );
+	const shaftDecay = Math.pow( 0.965, 48 / shaftSamples );
+	const shaftWeight = 0.9 * ( shaftSamples / 48 ) * ( 1 - shaftDecay ) / ( 1 - 0.965 );
+	const shaftBlur = rtt( radialBlur( shaftSource, { center: shaftSun, weight: float( shaftWeight ), decay: float( shaftDecay ), count: int( shaftSamples ), exposure: float( 2.2 ) } ), null, null, { resolutionScale: 0.5 } );
 	const shaftVisible = uniform( 0 );
-	const shafts = shaftBlur.rgb.mul( shaftColor ).mul( shaftAmount ).mul( shaftVisible ).mul( layerToggles.光束 );
+	// 光束不画的时候（除了花园清晨朝着太阳，几乎一直是这样）合成里也不取那张图：整帧一致的 uniform 分支，分支里显式取第 0 级
+	const shafts = Fn( () => {
+
+		const result = vec3( 0 ).toVar();
+		If( shaftVisible.mul( shaftAmount ).greaterThan( 0 ), () => {
+
+			result.assign( shaftBlur.level( 0 ).rgb.mul( shaftColor ).mul( shaftAmount ).mul( shaftVisible ).mul( layerToggles.光束 ) );
+
+		} );
+		return result;
+
+	} )();
 
 	// ===== 油画（规格书 9.2：结构张量 + 各向异性 Kuwahara，Kyprianidis 等 2009 的做法，自己重写）=====
 	// 先把 HDR 压到 0~1（c / (1 + c)，星星这种 10 倍亮的点不会把一个扇区的平均拉爆），全分辨率存一张；
 	// 结构张量：亮度的 Sobel 梯度 (gx², gy², gx·gy)，半分辨率存（双线性取回来就是一次模糊）；
 	// Kuwahara：按张量的主方向把采样圆拉成椭圆、转到边的方向，分 8 个扇区，每个扇区 3 圈 × 3 个角度取 9 个点，
 	// 算平均和方差，方差小的扇区权重大（权重 1 / (1 + σ)^8），加权平均 —— 笔触顺着边走，平的地方抹成一块块颜料。
-	// 只在地点要的时候（星月夜、hi 档）画这三张图
+	// 只在地点要的时候（星月夜、hi 档）画这三张图。
+	// config.starry.kuwahara 是 0（重做以后画面全是笔触，见规格书 9.2）时整层不接进合成：原来 amount 恒为 0 也要每像素白读一次
+	// Kuwahara 图（RGBA16F 全分辨率）和深度，现在合成里只剩场景色。调回 > 0 就照原样接上（调试开关"油画"还在）
+	const painterlyEnabled = Boolean( config.starry && config.starry.kuwahara > 0 );
 	const painterlyAmount = uniform( 0 );
 	let painterlyActive = false;
 	// 笔触多大按视角算，不按像素：视场 50° 时 1080 像素高的那个大小是 1。烘全景时一面 120°，不换算的话笔触、Kuwahara 半径
@@ -231,7 +254,12 @@ export function createPipeline( ctx ) {
 	tensorTarget.autoUpdate = false;
 	kuwaharaTarget.autoUpdate = false;
 	const painted = kuwaharaTarget.rgb.div( max( float( 1 ).sub( kuwaharaTarget.rgb ), 1e-3 ) );
-	const paintedScene = mix( sceneColor, vec4( painted, sceneColor.a ), painterlyAmount.mul( layerToggles.油画 ) );
+	// 天空像素（深度在远平面）的油画强度再乘 painterlySky：天空有自己的笔触层，全强的 Kuwahara 会把 4 像素宽的高光细笔、流光抹掉
+	const painterlySky = uniform( 1 );
+	const skyPixel = step( 0.99999, sceneDepth.sample( screenUV ).r );
+	const paintedScene = painterlyEnabled
+		? mix( sceneColor, vec4( painted, sceneColor.a ), painterlyAmount.mul( layerToggles.油画 ).mul( mix( float( 1 ), painterlySky, skyPixel ) ) )
+		: sceneColor;
 
 
 	// ===== 调色 uniform =====
@@ -255,6 +283,9 @@ export function createPipeline( ctx ) {
 	const veilConfig = config.world.flight.veil;
 	const veilNear = uniform( veilConfig.near );
 	const veilFar = uniform( veilConfig.far );
+	// 引路的花瓣、光点（tsl/guide.js）离镜头很近的那些往场景目标的 alpha 里写了"别吞我"（alpha 变小），
+	// 薄雾按 1 − alpha 让开；guideKeep 是这个让开的程度（时间线在有引路时给 1）
+	const guideKeep = uniform( 0 );
 
 	// ===== 暗角 uniform =====
 	const vignetteAmount = uniform( config.post.vignette.amount );
@@ -283,14 +314,27 @@ export function createPipeline( ctx ) {
 
 	};
 
-	// 画布蔓延的遮罩：reveal 0 时全不覆盖，1 时全覆盖；中间从边缘向中心蔓延，边宽 0.35
-	const canvasMaskAt = () => {
+	// 画布蔓延的遮罩：reveal 0 时全不覆盖，1 时全覆盖；中间从边缘向中心蔓延，边宽 0.3。
+	// 原来按到最近屏幕边的距离算，没盖到的那块是个直边长方形（飞进星月夜时中间一块黑长方形，2026-10-02 自查）：
+	// 改成圆角（超椭圆，4 次方）再用两层噪声把边咬成笔刷蘸过的毛边，像颜料从画框往里刷
+	// 画布盖满（reveal ≥ 0.999）时直接给 1：星月夜每个笔触片元、每个后期像素都要调它，盖满以后两层噪声算出来也恒为 1
+	// （reveal = 1 时 1.45 − 最大边距 1.15 = 0.3，smoothstep 正好到顶）。整帧一致的 uniform 分支
+	const canvasMaskAt = () => Fn( () => {
 
-		// 到最近屏幕边的归一化距离：边 0、中心 1
-		const edgeDistance = min( min( screenUV.x, float( 1 ).sub( screenUV.x ) ), min( screenUV.y, float( 1 ).sub( screenUV.y ) ) ).mul( 2.0 );
-		return smoothstep( 0.0, 0.35, canvasReveal.mul( 1.35 ).sub( edgeDistance ) );
+		const mask = float( 1 ).toVar();
+		If( canvasReveal.lessThan( 0.999 ), () => {
 
-	};
+			const centered = screenUV.sub( 0.5 ).mul( 2 ).abs();
+			const roundness = pow( pow( centered.x, 4 ).add( pow( centered.y, 4 ) ), 0.25 );
+			const brush = valueNoise2D( screenUV.mul( vec2( 7, 4 ) ) ).sub( 0.5 ).mul( 0.22 ).add( valueNoise2D( screenUV.mul( vec2( 31, 19 ) ).add( 7.3 ) ).sub( 0.5 ).mul( 0.08 ) );
+			// 边 0、中心 1
+			const edgeDistance = max( float( 1 ).sub( roundness ).add( brush ), 0 );
+			mask.assign( smoothstep( 0.0, 0.3, canvasReveal.mul( 1.45 ).sub( edgeDistance ) ) );
+
+		} );
+		return mask;
+
+	} )();
 
 	// 画布蔓延：程序化亚麻布，从屏幕边缘向中心覆盖（三条链共用）
 	const canvasLayer = ( color ) => {
@@ -312,7 +356,16 @@ export function createPipeline( ctx ) {
 		// 米白画布底色（线性空间，很淡；0.06 时暗处整片被抬成灰，像蒙了一层雾）
 		const creamColor = vec3( 0.92, 0.88, 0.80 ).mul( 0.012 );
 		const canvasLook = color.mul( linenShade ).add( creamColor );
-		return mix( color, canvasLook, canvasMaskAt().mul( layerToggles.画布 ) );
+		const mask = canvasMaskAt();
+		// 画布还没盖到的地方（飞进星月夜、画从四周往中间刷的那几秒）：深夜实景很暗，中间一大块黑（2026-10-02 审查 R5）。
+		// 跟着画布盖上来的程度把没盖到的实景抬亮（最多 2.6 倍），像眼睛跟着画亮起来
+		const uncoveredAmount = canvasReveal.mul( float( 1 ).sub( mask ) ).mul( layerToggles.画布 );
+		const uncoveredLift = float( 1 ).add( uncoveredAmount.mul( 1.6 ) );
+		// 抬亮对黑的天和树剪影没用（黑乘几倍还是黑）：再往原画的深群青底色上垫一层（不超过画布的暗部），
+		// 中间没盖到的那块是深蓝的夜，不是一个黑洞（2026-10-02 自查，审查 R5 的后续）
+		const nightBase = vec3( 0.012, 0.03, 0.11 ).mul( uncoveredAmount );
+		// 起飞的薄雾盖住画面时布纹也跟着淡掉（不然雾上留一圈米白的框）
+		return mix( max( color.mul( uncoveredLift ), nightBase ), canvasLook, mask.mul( layerToggles.画布 ).mul( float( 1 ).sub( veilAmount ) ) );
 
 	};
 
@@ -322,6 +375,7 @@ export function createPipeline( ctx ) {
 	// ① 换成原画夜里的配色：按亮度在 深群青 → 普蓝 → 蓝绿 → 灰绿 → 淡黄绿 几个色标里取，暖色的灯窗保留原色；
 	// ② 笔触：每个像素沿"顺着边"的方向（亮度梯度转 90°；平的地方按慢慢变的噪声给一个偏水平的方向）取 9 个点的噪声平均
 	//    （直线上的线积分卷积），得到一道道约 5 像素宽、30 像素长的条纹（按 1080 像素高换算，各档一样大），调深浅和蓝绿的色相；
+//    再叠一层粗笔触（约 9 像素宽、50 像素长，9 个点），山丘上偏横向、成波浪形，调深浅；
 	// ③ 深度不连续的地方描一道深蓝的轮廓（原画里房子、山丘、柏树都有深色勾边）
 	const brushNoiseData = createNoiseTextureData( 256, 64, 41 );
 	const brushNoise = new THREE.DataTexture( brushNoiseData.data, brushNoiseData.size, brushNoiseData.size, THREE.RGBAFormat, THREE.UnsignedByteType );
@@ -336,8 +390,14 @@ export function createPipeline( ctx ) {
 
 		const source = input.toVar();
 		const result = source.rgb.toVar();
-		const depth = sceneDepth.sample( screenUV ).r;
-		const amount = canvasMaskAt().mul( float( 1 ).sub( step( 0.99999, depth ) ) ).mul( layerToggles.前景笔触 ).toVar();
+		// 画布没在蔓延（reveal = 0，星月夜以外的地点一直是这样）时遮罩恒为 0：深度、遮罩的两层噪声都不用算（整帧一致的 uniform 分支）
+		const amount = float( 0 ).toVar();
+		If( canvasReveal.greaterThan( 0 ), () => {
+
+			const depth = sceneDepth.sample( screenUV ).r;
+			amount.assign( canvasMaskAt().mul( float( 1 ).sub( step( 0.99999, depth ) ) ).mul( layerToggles.前景笔触 ) );
+
+		} );
 		If( amount.greaterThan( 0.001 ), () => {
 
 			const aspect = screenSize.x.div( screenSize.y );
@@ -367,6 +427,16 @@ export function createPipeline( ctx ) {
 			}
 
 			const stroke = streak.div( 9 ).sub( 0.5 ).mul( 3.2 ).add( 0.5 ).clamp( 0, 1 );
+			// 粗笔触：一格噪声 9 像素宽，沿方向取 9 个点、间距 5.5 像素，一笔约 50 像素长。山丘上的方向偏横向、成波浪形
+			// （角度 = 0.35 · sin(横向位置 + 噪声)，原画的山丘是一道道横着起伏的笔），有边的地方（房子、柏树轮廓）顺着边
+			const coarseBase = screenUV.mul( vec2( aspect, 1 ) ).mul( 1080 ).div( paintScale ).div( 9 * 64 );
+			const waveAngle = sin( coarseBase.x.mul( Math.PI * 2 * 1.7 ).add( flatAngle.mul( 4 ) ) ).mul( 0.35 );
+			const waveDirection = vec2( cos( waveAngle ), sin( waveAngle ) );
+			const coarseDirection = normalize( mix( waveDirection, select( dot( along, waveDirection ).lessThan( 0 ), along.negate(), along ).normalize(), edgeWeight ) );
+			const coarseStep = coarseDirection.mul( 5.5 / ( 9 * 64 ) );
+			const coarseSum = float( 0 ).toVar();
+			for ( let k = - 4; k <= 4; k ++ ) coarseSum.addAssign( brushNoiseMap.sample( coarseBase.add( coarseStep.mul( k ) ).add( vec2( 0.37, 0.61 ) ) ).r );
+			const coarse = coarseSum.div( 9 ).sub( 0.5 ).mul( 3.4 ).add( 0.5 ).clamp( 0, 1 );
 			const hue = tint.div( 9 ).sub( 0.5 ).mul( 3 ).add( 0.5 ).clamp( 0, 1 );
 			// 配色：亮度先压到 0~1（l / (l + 0.04)），再取色标；整体亮度按原来的亮度走（大约保持明暗关系）
 			const tone = luma.div( luma.add( 0.03 ) );
@@ -377,7 +447,7 @@ export function createPipeline( ctx ) {
 			// 勾边、配色都要视线距离：近处（柏树）留它自己的颜色（墨绿），只加笔触；远处的山、小镇换成原画的配色
 			const viewDistanceAt = ( dx, dy ) => perspectiveDepthToViewZ( sceneDepth.sample( screenUV.add( pixel.mul( vec2( dx, dy ) ) ) ).r, cameraNear, cameraFar ).negate();
 			const center = viewDistanceAt( 0, 0 );
-			const strokeShade = mix( float( 0.7 ), float( 1.35 ), stroke );
+			const strokeShade = mix( float( 0.7 ), float( 1.35 ), stroke ).mul( mix( float( 0.78 ), float( 1.22 ), coarse ) );
 			const remapWeight = smoothstep( 60, 160, center ).mul( 0.85 ).add( 0.15 );
 			const painted = mix( source.rgb.mul( strokeShade ), palette.mul( 0.5 ).mul( strokeShade ), remapWeight ).toVar();
 			// 暖色的灯窗（明显偏红黄、又亮的）保留原色
@@ -402,22 +472,37 @@ export function createPipeline( ctx ) {
 	const postChain = ( hdrInput, withGrain ) => Fn( () => {
 
 		const input = hdrInput.toVar();
-		const alpha = input.a;
 		let color = input.rgb.toVar();
 
 		// --- 薄雾：在调色之前（雾和场景一起被调色，调色插值时雾的亮度跟着走），在泛光之后（泛光也被雾盖住）---
-		// 深度在分支外面先取好（TSL 按第一次用到的位置生成代码）
-		const viewDistance = perspectiveDepthToViewZ( sceneDepth.r, cameraNear, cameraFar ).negate().toVar();
+		// 深度、场景 alpha 只有雾里用，放进分支：没有薄雾（停留时一直是这样）就每像素少读一次深度（TSL 按第一次用到的位置生成代码，
+		// 这两个变量只在分支里用，所以声明在分支里没问题）
 		If( veilAmount.greaterThan( 0.0005 ), () => {
 
+			const viewDistance = perspectiveDepthToViewZ( sceneDepth.r, cameraNear, cameraFar ).negate().toVar();
+			const sceneAlpha = sceneColor.sample( screenUV ).a.toVar();
 			const depthFactor = smoothstep( veilNear, veilFar, viewDistance );
-			const pixelVeil = float( 1 ).sub( pow( max( float( 1 ).sub( veilAmount ), 0 ), depthFactor.mul( 3 ).add( 1 ) ) );
+			const guideMask = float( 1 ).sub( sceneAlpha.clamp( 0, 1 ) ).mul( guideKeep );
+			const pixelVeil = float( 1 ).sub( pow( max( float( 1 ).sub( veilAmount ), 0 ), depthFactor.mul( 3 ).add( 1 ) ) ).mul( float( 1 ).sub( guideMask ) );
 			const ndc = vec2( screenUV.x.mul( 2 ).sub( 1 ), float( 1 ).sub( screenUV.y.mul( 2 ) ) );
 			const viewDirection = normalize( vec3( ndc.mul( veilTanHalf ), - 1 ) );
 			const worldDirection = normalize( veilViewToWorld.mul( vec4( viewDirection, 0 ) ).xyz );
 			// 一点很淡的云絮起伏（±2.5%），不是一块平的颜色
 			const cloudiness = valueNoise2D( screenUV.mul( vec2( 3, 2 ) ).add( vec2( veilDrift, veilDrift.mul( 0.37 ) ) ) ).sub( 0.5 ).mul( 0.05 ).add( 1 );
-			const mist = dayAerialColor( worldDirection, ctx.world.uniforms ).mul( cloudiness );
+			// 夜里的雾：大气色本身几乎是黑的，起飞那两秒整屏发黑像卡住了（2026-10-02 自查哥特、星月夜起飞）。
+			// 夜里把雾抬亮成月光下的深蓝（最多 2.6 倍），像飞进夜色而不是黑屏
+			const nightness = float( 1 ).sub( smoothstep( 0.15, 0.6, ctx.world.uniforms.skyIntensity ) );
+			// 夜里雾色按水平方向取（地平线那圈月光雾霭），抬头看天顶时不跟着变黑
+			const mistDirection = normalize( vec3( worldDirection.x, mix( worldDirection.y, 0.04, nightness ), worldDirection.z ) );
+			// 深夜（00:30 地平线色 × 强度 0.07）抬 2.6 倍也还是黑的，再给一个月光深蓝的下限（哥特起飞时看着合适的亮度），
+			// 并抵掉各地点调色的曝光差（星月夜 0.8、哥特 1.3），不然星月夜那边的雾被压成黑的
+			const exposureFix = mix( float( 1 ), float( 1.3 ).div( max( grading.exposure, 0.2 ) ), nightness );
+			const nightFloor = vec3( 0.0035, 0.0075, 0.03 ).mul( nightness ).mul( exposureFix );
+			// 雾色六成五取画面正中那个方向的（审查 R36：落日起飞时太阳那边粉、背着太阳那边蓝，雾成了左粉右蓝的竖向分屏）
+			const centerWorld = normalize( veilViewToWorld.mul( vec4( 0, 0, - 1, 0 ) ).xyz );
+			const centerMistDirection = normalize( vec3( centerWorld.x, mix( centerWorld.y, 0.04, nightness ), centerWorld.z ) );
+			const aerial = mix( dayAerialColor( mistDirection, ctx.world.uniforms ), dayAerialColor( centerMistDirection, ctx.world.uniforms ), 0.65 );
+			const mist = max( aerial.mul( nightness.mul( 1.6 ).add( 1 ) ), nightFloor ).mul( cloudiness );
 			color.assign( mix( color, mist, pixelVeil.mul( layerToggles.薄雾 ) ) );
 
 		} );
@@ -440,20 +525,32 @@ export function createPipeline( ctx ) {
 		const vignette = float( 1 ).sub( vignetteAmount.mul( smoothstep( vignetteSoftness, 1.0, cornerDistance ) ) );
 		color.assign( mix( color, color.mul( vignette ), layerToggles.暗角 ) );
 
-		color.assign( canvasLayer( color ) );
+		// 画布：没在蔓延（reveal = 0，星月夜以外）时整层跳过，只留它原来就有的 max(·, 0)（夜里垫底色那一步会把负值截掉），逐像素和以前一样
+		If( canvasReveal.greaterThan( 0 ), () => {
+
+			color.assign( canvasLayer( color ) );
+
+		} ).Else( () => {
+
+			color.assign( max( color, vec3( 0 ) ) );
+
+		} );
 
 		// --- 颗粒：线性空间加性噪声（放大链在放大以后加）---
-		if ( withGrain ) color.assign( color.add( grainAt( grainAmount ) ) );
+		// 按亮度调制：暗部只留一成半。原来固定幅度，夜里（哥特、雪原、开场黎明）暗部像高感光度照片的噪点（2026-10-02 审查 R12）
+		if ( withGrain ) color.assign( color.add( grainAt( grainAmount ).mul( smoothstep( 0.0, 0.3, luminance( color ) ).mul( 0.85 ).add( 0.15 ) ) ) );
 
-		return vec4( color, alpha );
+		// 输出的 alpha 一律 1：场景目标的 alpha 被引路粒子拿去当遮罩了（画布本身是带 alpha 的，不能透出网页底色）
+		return vec4( color, 1 );
 
 	} )();
 
 	// 色调映射 + 转 sRGB 不传参，取 renderer 上的设置（RenderOutputNode.js:119-121），
 	// 这样改 renderer.toneMapping 时 RenderPipeline 自己 needsUpdate 重建
 	const outputNode = renderOutput( postChain( hdrColor, true ), null, THREE.SRGBColorSpace );
-	// FXAA 必须吃 sRGB，放链尾
-	renderPipeline.outputNode = fxaa( outputNode );
+	// FXAA 必须吃 sRGB，放链尾。给它的中间目标用 RGBA8（默认是 RGBA16F）：色调映射、转 sRGB 之后的值本来就要写进 8 位的画布，
+	// 颗粒在色调映射之前加过（已经抖动过），8 位存不会多出色带；每像素写 4 字节、FXAA 读 4 字节，原来各 8 字节
+	renderPipeline.outputNode = fxaa( rtt( outputNode, null, null, { type: THREE.UnsignedByteType } ) );
 	renderPipeline.needsUpdate = true;
 
 	// 放大链：低分辨率上做到色调映射，画进显式按场景比例缩小的目标（rtt 的 resolutionScale，每帧跟着场景比例改），
@@ -464,7 +561,8 @@ export function createPipeline( ctx ) {
 	upscalePipeline.outputNode = Fn( () => {
 
 		const color = upscaled.toVar();
-		return vec4( color.rgb.add( grainAt( grainAmount.mul( 0.8 ) ) ), 1 );
+		// 显示空间里加，同样按亮度调制（暗部一成半）
+		return vec4( color.rgb.add( grainAt( grainAmount.mul( 0.8 ) ).mul( smoothstep( 0.05, 0.5, luminance( color.rgb ) ).mul( 0.85 ).add( 0.15 ) ) ), 1 );
 
 	} )();
 	upscalePipeline.needsUpdate = true;
@@ -614,11 +712,13 @@ export function createPipeline( ctx ) {
 	}
 
 	// 光束：settings = { amount, direction（太阳方向，当前渲染场景的坐标）, color }；null 或 amount 0 关掉
-	// 油画：amount 0~1（0 关掉，三张图都不更新）
-	function setPainterly( amount ) {
+	// 油画：amount 0~1（0 关掉，三张图都不更新）；skyScale 是天空像素再乘的强度（0~1，不传就是 1）
+	function setPainterly( amount, skyScale = 1 ) {
 
 		painterlyAmount.value = Number.isFinite( amount ) ? Math.min( 1, Math.max( 0, amount ) ) : 0;
-		const active = painterlyAmount.value > 0;
+		painterlySky.value = Number.isFinite( skyScale ) ? Math.min( 1, Math.max( 0, skyScale ) ) : 1;
+		// 油画层没接进合成（config.starry.kuwahara 是 0）时三张图都不画
+		const active = painterlyEnabled && painterlyAmount.value > 0;
 		painterSource.autoUpdate = active;
 		tensorTarget.autoUpdate = active;
 		kuwaharaTarget.autoUpdate = active;
@@ -683,6 +783,13 @@ export function createPipeline( ctx ) {
 
 	}
 
+	// 引路粒子让开薄雾的程度 0~1
+	function setGuideKeep( amount ) {
+
+		guideKeep.value = Number.isFinite( amount ) ? Math.min( 1, Math.max( 0, amount ) ) : 0;
+
+	}
+
 	function setAdaptation( amount ) {
 
 		adaptation.value = Number.isFinite( amount ) && amount > 0 ? amount : 1;
@@ -729,6 +836,18 @@ export function createPipeline( ctx ) {
 	function setForcedChain( chain ) {
 
 		forcedChain = chain || null;
+
+	}
+
+	// 场景目标的 MSAA 采样数（研究开关 config.post.msaaOffForSlowHi、?msaa=，quality.sceneSamples 定）。
+	// 只能在开场卡判完档、prepareChains 和各地点预编译之前调：采样数是渲染管线的一部分，之后再改，所有场景着色器都要重编
+	function setSceneSamples( samples ) {
+
+		const value = Number.isInteger( samples ) && samples > 1 ? samples : 0;
+		if ( sceneTarget.samples === value ) return;
+		sceneTarget.samples = value;
+		warmTarget.samples = value;
+		console.log( `后期：场景目标的 MSAA 采样数改成 ${ value }${ value === 0 ? '（原生链只靠 FXAA）' : '' }` );
 
 	}
 
@@ -781,12 +900,18 @@ export function createPipeline( ctx ) {
 	// 开场卡阶段：每条链各画一帧，把它们的着色器编掉（同步的，开场卡上有进度粒子），运行中切换不卡
 	function prepareChains( chains = [ 'pano', 'upscale', 'native' ] ) {
 
-		// 光束、油画的几张图平时不更新：这里各画一次，把它们的着色器也编掉
+		// 光束、油画的几张图平时不更新：这里各画一次，把它们的着色器也编掉。
+		// 光束在合成里是 uniform 分支，分支没进也已经编在合成的着色器里了；那两张图本身的着色器要真画一次才编
 		shaftSource.textureNeedsUpdate = true;
 		shaftBlur.textureNeedsUpdate = true;
-		painterSource.textureNeedsUpdate = true;
-		tensorTarget.textureNeedsUpdate = true;
-		kuwaharaTarget.textureNeedsUpdate = true;
+		if ( painterlyEnabled ) {
+
+			painterSource.textureNeedsUpdate = true;
+			tensorTarget.textureNeedsUpdate = true;
+			kuwaharaTarget.textureNeedsUpdate = true;
+
+		}
+
 		for ( const chain of chains ) {
 
 			forcedChain = chain;
@@ -952,6 +1077,7 @@ export function createPipeline( ctx ) {
 		prepareChains,
 		getChain: currentChain,
 		setForcedChain,
+		setSceneSamples,
 		panoTarget,
 		bloomNode,
 		layerToggles,
@@ -965,10 +1091,13 @@ export function createPipeline( ctx ) {
 		setCanvasReveal,
 		setAdaptation,
 		getAdaptation: () => adaptation.value,
+		setGuideKeep,
 		setLightShafts,
 		setPainterly,
 		getLightShafts: () => ( { amount: shaftAmount.value, visible: shaftVisible.value, sun: shaftSun.value.toArray() } ),
 		getCanvasReveal: () => canvasReveal.value,
+		// 画布蔓延的遮罩（节点，按 screenUV 算）：场景材质里用，星月夜的笔触只在画布盖到的地方出现
+		canvasMaskNode: canvasMaskAt,
 		addPrePass,
 		removePrePass,
 		compileScene,

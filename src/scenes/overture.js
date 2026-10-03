@@ -11,18 +11,20 @@
 import * as THREE from 'three/webgpu';
 import {
 	Fn, float, vec2, vec3, vec4, uniform, attribute, texture, color, select,
-	positionWorld, positionGeometry, normalGeometry, cameraPosition,
-	normalize, length, dot, max, min, mix, smoothstep, pow, abs, sin, cos, floor, fract, reflect, fwidth, Discard,
+	positionWorld, positionGeometry, normalGeometry, normalWorld, frontFacing, modelWorldMatrix, cameraPosition,
+	normalize, length, dot, max, min, mix, smoothstep, pow, abs, sin, cos, floor, fract, reflect, fwidth, Discard, step, sqrt, If, dFdx, dFdy,
 } from 'three/tsl';
 import { reflector } from 'three/tsl';
 import { mergeGeometries, mergeVertices } from 'three/addons/utils/BufferGeometryUtils.js';
 import { NodeUpdateType } from 'three/webgpu';
 import { createPetals } from '../tsl/petals.js';
-import { createGrass } from '../tsl/grass.js';
+import { createGrassField, buildGroundField, resolveRings, blendGround } from '../tsl/grass.js';
 import { hash33, valueNoise2D, jsFbm2D, createNoiseTextureData } from '../tsl/noise.js';
 import { daySkyColor } from '../tsl/sky.js';
 import { monotoneCurve, resampleCurve, pointOnCurve } from '../core/route.js';
+import { isMeshInView, prepareMeshView } from '../core/camera.js';
 import { blossomTemplate, instanceTrunks, blossomCards, createBlossomMaterial, createBarkMaterial } from '../tsl/blossom.js';
+import { groundDetailInScene } from '../tsl/terrain.js';
 
 export const key = 'overture';
 
@@ -33,6 +35,8 @@ const terrainRect = { minX: - 95, maxX: 95, minZ: - 312, maxZ: 45 };
 const terrainSpacing = 1.25;
 // 草和地形查询用的高度、密度图：0.5 米一个像素
 const fieldSpacing = 0.5;
+// 溪面"平水"的坡度上限：溪水着色器里跌水的碎波从 0.02 起、白沫从 0.025 起，留一点余量（插值的舍入）
+const calmSlope = 0.019;
 
 const state = {
 	ctx: null,
@@ -51,6 +55,9 @@ const state = {
 	water: null,
 	reflectorNode: null,
 	reflectionPass: null,
+	reflectionScale: 0,
+	caveHidden: false,      // 进洞以后藏起了开场自己的草、溪水（perf.scenesA.caveHide）
+	caveSaved: null,        // 藏之前它们各自的 visible（出洞方向跳回来时还原）
 	duration: 62,
 	caveSample: {},
 };
@@ -371,60 +378,27 @@ function groundHeight( x, z ) {
 
 }
 
-// 草的高度、密度图（半精度 RG：地面高度、密度）：水里、水边 0.4 米以内、陡坡、崖上没有草
+// 草地图（半精度 RGBA：地面高度、长草的密度、地面法线 x、z；grass.js 的 buildGroundField）：水里、水边 0.4 米以内、陡坡、崖上没有草。
+// 块边不收草：块外由远景的草地图接上（backdrop.grassGround）
 async function buildField() {
 
-	const world = state.ctx.world;
-	const width = Math.round( ( terrainRect.maxX - terrainRect.minX ) / fieldSpacing ) + 1;
-	const height = Math.round( ( terrainRect.maxZ - terrainRect.minZ ) / fieldSpacing ) + 1;
-	const data = new Uint16Array( width * height * 4 );
-	const values = new Float32Array( width * height * 2 );
-	let sliceStart = performance.now();
-	for ( let j = 0; j < height; j ++ ) {
+	state.field = await buildGroundField( {
+		rect: terrainRect,
+		spacing: fieldSpacing,
+		heightAt: groundHeight,
+		// slope = 1 − 法线 y：0.07（约 22°）以下全长，0.2（约 37°）以上不长
+		densityAt: ( x, z, slope ) => smoothJs( 0.1, 0.45, gridValue( state.heights.aboveWater, x, z ) ) * smoothJs( 0.2, 0.07, slope ),
+		name: '开场草地图',
+		yieldToBrowser,
+	} );
+	state.disposables.push( ...state.field.textures );
 
-		const z = terrainRect.minZ + j * fieldSpacing;
-		for ( let i = 0; i < width; i ++ ) {
+}
 
-			const x = terrainRect.minX + i * fieldSpacing;
-			const ground = groundHeight( x, z );
-			const slopeX = groundHeight( x + 0.6, z ) - groundHeight( x - 0.6, z );
-			const slopeZ = groundHeight( x, z + 0.6 ) - groundHeight( x, z - 0.6 );
-			const slope = Math.hypot( slopeX, slopeZ ) / 1.2;
-			const aboveWater = gridValue( state.heights.aboveWater, x, z );
-			let density = smoothJs( 0.1, 0.45, aboveWater ) * smoothJs( 0.75, 0.4, slope );
-			// 草地上有疏有密，一块一块的
-			density *= 0.55 + 0.45 * smoothJs( 0.3, 0.6, jsFbm2D( x / 7 + 1.3, z / 7 - 5.2, 3 ) );
-			// 块边上收掉（远景接管）
-			const edge = Math.min( x - terrainRect.minX, terrainRect.maxX - x, z - terrainRect.minZ, terrainRect.maxZ - z );
-			density *= smoothJs( 4, 14, edge );
-			const index = j * width + i;
-			values[ index * 2 ] = ground;
-			values[ index * 2 + 1 ] = density;
-			data[ index * 4 ] = THREE.DataUtils.toHalfFloat( ground );
-			data[ index * 4 + 1 ] = THREE.DataUtils.toHalfFloat( density );
-			data[ index * 4 + 2 ] = 0;
-			data[ index * 4 + 3 ] = THREE.DataUtils.toHalfFloat( 1 );
+// 草落地：块里用开场自己的草地图，块外用远景的（grass.js 的 blendGround：密度在块边 10 米里交叉过渡）
+function grassGroundAt( xz ) {
 
-		}
-
-		if ( performance.now() - sliceStart > 12 ) {
-
-			await yieldToBrowser();
-			sliceStart = performance.now();
-
-		}
-
-	}
-
-	const fieldTexture = new THREE.DataTexture( data, width, height, THREE.RGBAFormat, THREE.HalfFloatType );
-	fieldTexture.magFilter = THREE.LinearFilter;
-	fieldTexture.minFilter = THREE.LinearFilter;
-	fieldTexture.generateMipmaps = false;
-	fieldTexture.needsUpdate = true;
-	fieldTexture.name = '开场草地图';
-	state.disposables.push( fieldTexture );
-	state.field = { values, width, height, texture: fieldTexture };
-	return fieldTexture;
+	return blendGround( state.field, state.ctx.backdrop, xz );
 
 }
 
@@ -483,70 +457,146 @@ function createTerrainMaterial( noiseTexture ) {
 		const triplanar = ( scale, angle, offset ) => texture( noiseTexture, rotate( point.zy.div( scale ), angle ).add( offset ) ).mul( weights.x )
 			.add( texture( noiseTexture, rotate( point.xz.div( scale ), angle ).add( offset ) ).mul( weights.y ) )
 			.add( texture( noiseTexture, rotate( point.xy.div( scale ), angle ).add( offset ) ).mul( weights.z ) ).div( weightSum );
+		// 岸上的草地（rockAmount = 0，草地上大部分像素）不算下面岩石那一大段（perf.scenesA.skipHiddenShading）：岩石那段的采样在分支里，
+		// 不能用隐式导数，改用分支外先算好的 point 屏幕导数（.grad，导数按投影、缩放、转角换算过去，和隐式采样取同一级 mip）。
+		// 只落 point 的两个导数（6 个数）跨过分支；把 12 组坐标和导数都落地也试过（2026-10-02）：寄存器多占几十个，仍差几个轮廓上的像素，不划算
+		const lean = state.ctx.config.perf.scenesA.skipHiddenShading;
+		const pointDx = lean ? dFdx( point ).toVar() : null;
+		const pointDy = lean ? dFdy( point ).toVar() : null;
+		// 岩石的中、小两层三向投影（scale 米一圈、转角、偏移）和三道竖纹（横向、竖向几米一圈、偏移）
+		const rockOctaves = { middle: [ 6.3, 1.3, vec2( 0.52, 0.27 ) ], small: [ 1.9, 2.4, vec2( 0.84, 0.38 ) ] };
+		const rockStreaks = {
+			crackWide: [ 26, 210, vec2( 0.17, 0.43 ) ],    // 横 0.8 米、竖 6.6 米一格
+			crackThin: [ 11, 90, vec2( 0.71, 0.29 ) ],     // 横 0.34 米、竖 2.8 米一格
+			waterStain: [ 40, 620, vec2( 0.52, 0.91 ) ],   // 1.25 米宽、十几米长的深色水渍
+		};
+		const projections = { zy: ( vector ) => vector.zy, xz: ( vector ) => vector.xz, xy: ( vector ) => vector.xy };
+		const octaveSample = ( name, projection ) => {
+
+			const [ scale, angle, offset ] = rockOctaves[ name ];
+			const project = projections[ projection ];
+			const coordinate = rotate( project( point ).div( scale ), angle ).add( offset );
+			if ( ! lean ) return texture( noiseTexture, coordinate );
+			return texture( noiseTexture, coordinate ).grad( rotate( project( pointDx ).div( scale ), angle ), rotate( project( pointDy ).div( scale ), angle ) );
+
+		};
+		const rockTriplanar = ( name ) => octaveSample( name, 'zy' ).mul( weights.x )
+			.add( octaveSample( name, 'xz' ).mul( weights.y ) )
+			.add( octaveSample( name, 'xy' ).mul( weights.z ) ).div( weightSum );
+		// 竖纹只在崖的侧面投影（x、z 两个朝向）上取：朝 x 的面按 z 横向取，朝 z 的面按 x 横向取、偏移两分量对调
+		const streakSample = ( name, axis ) => {
+
+			const [ across, upward, offset ] = rockStreaks[ name ];
+			const pick = ( vector ) => ( axis === 'z' ? vector.z : vector.x );
+			const coordinate = vec2( pick( point ).div( across ), point.y.div( upward ) ).add( axis === 'z' ? offset : offset.yx );
+			if ( ! lean ) return texture( noiseTexture, coordinate );
+			return texture( noiseTexture, coordinate ).grad( vec2( pick( pointDx ).div( across ), pointDx.y.div( upward ) ), vec2( pick( pointDy ).div( across ), pointDy.y.div( upward ) ) );
+
+		};
 		// 噪声贴图一圈 32 格：scale 米一圈，一格是 scale / 32 米。近处的细节（0.06~0.7 米一格）照旧；
 		// 崖面远看要有十几米、几米一块的结构，不然几十米外是一整片均匀的灰色迷彩（原来最大一层才 0.7 米一格）
-		const octaveLarge = triplanar( 21, 0.4, vec2( 0.13, 0.71 ) );
-		const octaveMiddle = triplanar( 6.3, 1.3, vec2( 0.52, 0.27 ) );
-		const octaveSmall = triplanar( 1.9, 2.4, vec2( 0.84, 0.38 ) );
 		const macro = triplanar( 384, 0.7, vec2( 0.31, 0.58 ) );     // 12 米一格
 		const medium = triplanar( 96, 1.9, vec2( 0.66, 0.12 ) );     // 3 米一格
-		const rockNoise = octaveMiddle.r.mul( 0.6 ).add( octaveSmall.r.mul( 0.4 ) );
-		const rockFine = octaveSmall.g;
-		const footprint = max( length( fwidth( point ) ), 0.001 );
-
-		// ① 岩层台阶（国画的"折带皴"）：5.5 米一层，层高被大、中两层噪声扭弯；每层下暗上亮，层顶是朝天的台面（长草长苔），
-		// 台面上方紧贴着一条暗缝（上一层压出来的檐下阴影）
-		// 层线不能是一圈圈等高线：层厚按大块噪声在 3.5~7.5 米之间变，台面、檐下暗缝按中块噪声断成一截一截的
-		const layerThickness = mix( float( 3.5 ), float( 7.5 ), macro.g );
-		const layerCoordinate = point.y.add( macro.r.sub( 0.5 ).mul( 11 ) ).add( medium.g.sub( 0.5 ).mul( 3.2 ) ).div( layerThickness );
-		const layerFraction = fract( layerCoordinate );
-		const layerBreak = smoothstep( 0.4, 0.62, medium.r.mul( 0.7 ).add( rockNoise.mul( 0.3 ) ) );
-		const layerShade = mix( float( 1 ), mix( float( 0.72 ), float( 1.08 ), smoothstep( 0.04, 0.88, layerFraction ) ), layerBreak.mul( 0.7 ).add( 0.3 ) );
-		const ledge = smoothstep( 0.84, 0.94, layerFraction ).mul( layerBreak );
-		const undercut = float( 1 ).sub( smoothstep( 0, 0.08, layerFraction ) ).mul( layerBreak );
-		// ② 竖向的裂纹和水渍（"披麻皴"）：只在崖的侧面投影（x、z 两个朝向）上取竖着拉长的噪声；
-		// 裂纹是噪声 0.5 等值线（一条条弯弯的竖线），细线随距离淡掉，远处不闪
-		const sideTotal = weights.x.add( weights.z ).add( 1e-4 );
-		const streakAt = ( across, upward, offset ) => texture( noiseTexture, vec2( point.z.div( across ), point.y.div( upward ) ).add( offset ) ).r.mul( weights.x )
-			.add( texture( noiseTexture, vec2( point.x.div( across ), point.y.div( upward ) ).add( offset.yx ) ).r.mul( weights.z ) ).div( sideTotal );
-		const crackWide = streakAt( 26, 210, vec2( 0.17, 0.43 ) );    // 横 0.8 米、竖 6.6 米一格
-		const crackThin = streakAt( 11, 90, vec2( 0.71, 0.29 ) );     // 横 0.34 米、竖 2.8 米一格
-		// 竖纹成片出现（大块噪声），不是满墙一样密的木纹
-		const crackPatch = smoothstep( 0.42, 0.66, macro.g.mul( 0.5 ).add( medium.g.mul( 0.5 ) ) );
-		const crack = float( 1 ).sub( smoothstep( 0.02, 0.09, abs( crackWide.sub( 0.5 ) ) ) ).mul( crackPatch.mul( 0.4 ).add( 0.15 ) )
-			.add( float( 1 ).sub( smoothstep( 0.01, 0.06, abs( crackThin.sub( 0.5 ) ) ) ).mul( float( 1 ).sub( smoothstep( 0.04, 0.14, footprint ) ) ).mul( 0.35 ) )
-			.mul( crackPatch.mul( 0.6 ).add( 0.4 ) ).mul( float( 1 ).sub( smoothstep( 0.12, 0.35, footprint ) ) );
-		const waterStain = smoothstep( 0.55, 0.78, streakAt( 40, 620, vec2( 0.52, 0.91 ) ) );   // 1.25 米宽、十几米长的深色水渍
-		// ③ 颜色：偏冷的青灰，大块地深浅交替，夹着赭黄的锈斑
-		const rockTone = mix( color( '#3a3836' ), color( '#857f76' ), smoothstep( 0.28, 0.72, macro.r.mul( 0.55 ).add( medium.r.mul( 0.3 ) ).add( rockNoise.mul( 0.15 ) ) ) ).toVar();
-		rockTone.assign( mix( rockTone, color( '#76654f' ), smoothstep( 0.56, 0.74, macro.g ).mul( 0.45 ) ) );
-		rockTone.assign( rockTone.mul( layerShade ).mul( float( 1 ).sub( waterStain.mul( 0.3 ) ) ).mul( float( 1 ).sub( crack.mul( 0.55 ) ) ) );
-		rockTone.assign( mix( rockTone, rockTone.mul( 0.45 ), undercut.mul( 0.7 ) ) );
-		// ④ 草木：台面上一丛丛（按大、中两层噪声成片），缓一点的坡面上也长苔
-		const greenPatch = smoothstep( 0.34, 0.58, macro.g.mul( 0.6 ).add( medium.r.mul( 0.4 ) ) );
-		const mossCover = smoothstep( 0.5, 0.8, broadNormal.y.add( macro.r.sub( 0.5 ).mul( 0.3 ) ) ).mul( 0.85 )
-			.max( ledge.mul( greenPatch ).mul( 0.9 ) )
-			.max( smoothstep( 0.62, 0.8, medium.g ).mul( greenPatch ).mul( 0.5 ) );
-		const vegetation = mix( color( '#2f4127' ), color( '#56683a' ), rockFine.mul( 0.5 ).add( medium.g.mul( 0.5 ) ) );
-		const rock = mix( rockTone, vegetation, mossCover ).mul( rockFine.mul( 0.12 ).add( 0.93 ) ).toVar();
-		// ⑤ 凹处暗、棱上亮（建网格时算的曲率，±0.5 米就到头）
-		const cavity = attribute( 'cavity', 'float' );
-		rock.assign( rock.mul( cavity.mul( 0.7 ).clamp( - 0.32, 0.14 ).add( 1 ) ) );
+		// 屏幕导数在分支外面先落地成变量（裂纹随距离淡掉要用）
+		const footprint = max( length( fwidth( point ) ), 0.001 ).toVar();
 		const albedo = mix( mud, meadow, smoothstep( 0.05, 0.5, aboveWater ) ).toVar();
 		// 草地到岩石的过渡要利落：草地的颜色按 xz 采样，在陡坡上会拉成竖条，所以陡一点就全是岩石（岩石是三向投影）
 		const rockSlope = mix( attribute( 'wideSlope', 'float' ), slope, 0.3 );
 		// 草和岩石的分界按 3 米、12 米两层噪声上下错开：草顺着沟往崖上爬一截，崖脚不是一条水平线
 		const rockEdge = rockSlope.add( patch.sub( 0.5 ).mul( 0.06 ) ).add( medium.r.sub( 0.5 ).mul( 0.16 ) ).add( macro.g.sub( 0.5 ).mul( 0.12 ) );
-		albedo.assign( mix( albedo, rock, smoothstep( 0.26, 0.36, rockEdge ) ) );
+		const rockAmount = smoothstep( 0.26, 0.36, rockEdge ).toVar();
 		// 岩石的起伏：中、小两层的梯度当作表面斜率，在平滑法线的切线框架里加回法线（只在陡的地方，草地上不加）；
 		// 台面往上翻、檐下往下扣，天光从上面来，台面亮、檐下暗
-		const rockAmount = smoothstep( 0.26, 0.36, rockEdge );
 		normal.assign( normalize( mix( broadNormal, normal, rockAmount.mul( 0.7 ).add( 0.3 ) ) ) );
-		const tangent = normalize( vec3( broadNormal.z, 0, broadNormal.x.negate() ).add( vec3( 1e-4, 0, 0 ) ) );
-		const bitangent = normalize( broadNormal.cross( tangent ) );
-		const gradient = octaveMiddle.ba.sub( 0.5 ).mul( 1.2 ).add( octaveSmall.ba.sub( 0.5 ).mul( 0.7 ) );
-		normal.assign( normalize( normal.sub( tangent.mul( gradient.x ).add( bitangent.mul( gradient.y ) ).mul( rockAmount ) ) ) );
-		normal.assign( normalize( normal.add( vec3( 0, ledge.mul( 0.9 ).sub( undercut.mul( 0.6 ) ), 0 ).mul( rockAmount ) ) ) );
+		const rockPart = () => {
+
+			const octaveMiddle = rockTriplanar( 'middle' );
+			const octaveSmall = rockTriplanar( 'small' );
+			const rockNoise = octaveMiddle.r.mul( 0.6 ).add( octaveSmall.r.mul( 0.4 ) );
+			const rockFine = octaveSmall.g;
+			// ① 岩层台阶（国画的"折带皴"）：5.5 米一层，层高被大、中两层噪声扭弯；每层下暗上亮，层顶是朝天的台面（长草长苔），
+			// 台面上方紧贴着一条暗缝（上一层压出来的檐下阴影）
+			// 层线不能是一圈圈等高线：层厚按大块噪声在 3.5~7.5 米之间变，台面、檐下暗缝按中块噪声断成一截一截的
+			const layerThickness = mix( float( 3.5 ), float( 7.5 ), macro.g );
+			const layerCoordinate = point.y.add( macro.r.sub( 0.5 ).mul( 11 ) ).add( medium.g.sub( 0.5 ).mul( 3.2 ) ).div( layerThickness );
+			const layerFraction = fract( layerCoordinate );
+			// 断得更碎、层的明暗收一点（审查 R41：远看还是一层层横向的弧线，像等高线）
+			const layerBreak = smoothstep( 0.48, 0.7, medium.r.mul( 0.7 ).add( rockNoise.mul( 0.3 ) ) );
+			const layerShade = mix( float( 1 ), mix( float( 0.8 ), float( 1.06 ), smoothstep( 0.04, 0.88, layerFraction ) ), layerBreak.mul( 0.75 ).add( 0.1 ) );
+			const ledge = smoothstep( 0.84, 0.94, layerFraction ).mul( layerBreak );
+			const undercut = float( 1 ).sub( smoothstep( 0, 0.08, layerFraction ) ).mul( layerBreak );
+			// ② 竖向的裂纹和水渍（"披麻皴"）：只在崖的侧面投影（x、z 两个朝向）上取竖着拉长的噪声；
+			// 裂纹是噪声 0.5 等值线（一条条弯弯的竖线），细线随距离淡掉，远处不闪
+			const sideTotal = weights.x.add( weights.z ).add( 1e-4 );
+			const streakAt = ( name ) => streakSample( name, 'z' ).r.mul( weights.x ).add( streakSample( name, 'x' ).r.mul( weights.z ) ).div( sideTotal );
+			const crackWide = streakAt( 'crackWide' );
+			const crackThin = streakAt( 'crackThin' );
+			// 竖纹成片出现（大块噪声），不是满墙一样密的木纹
+			const crackPatch = smoothstep( 0.42, 0.66, macro.g.mul( 0.5 ).add( medium.g.mul( 0.5 ) ) );
+			const crack = float( 1 ).sub( smoothstep( 0.02, 0.09, abs( crackWide.sub( 0.5 ) ) ) ).mul( crackPatch.mul( 0.4 ).add( 0.15 ) )
+				.add( float( 1 ).sub( smoothstep( 0.01, 0.06, abs( crackThin.sub( 0.5 ) ) ) ).mul( float( 1 ).sub( smoothstep( 0.04, 0.14, footprint ) ) ).mul( 0.35 ) )
+				.mul( crackPatch.mul( 0.6 ).add( 0.4 ) ).mul( float( 1 ).sub( smoothstep( 0.12, 0.35, footprint ) ) );
+			const waterStain = smoothstep( 0.55, 0.78, streakAt( 'waterStain' ) );
+			// ③ 颜色：偏冷的青灰，大块地深浅交替，夹着赭黄的锈斑
+			const rockTone = mix( color( '#3a3836' ), color( '#857f76' ), smoothstep( 0.28, 0.72, macro.r.mul( 0.55 ).add( medium.r.mul( 0.3 ) ).add( rockNoise.mul( 0.15 ) ) ) ).toVar();
+			rockTone.assign( mix( rockTone, color( '#76654f' ), smoothstep( 0.56, 0.74, macro.g ).mul( 0.45 ) ) );
+			rockTone.assign( rockTone.mul( layerShade ).mul( float( 1 ).sub( waterStain.mul( 0.3 ) ) ).mul( float( 1 ).sub( crack.mul( 0.55 ) ) ) );
+			rockTone.assign( mix( rockTone, rockTone.mul( 0.45 ), undercut.mul( 0.7 ) ) );
+			// ④ 草木：台面上一丛丛（按大、中两层噪声成片），缓一点的坡面上也长苔
+			const greenPatch = smoothstep( 0.34, 0.58, macro.g.mul( 0.6 ).add( medium.r.mul( 0.4 ) ) );
+			const mossCover = smoothstep( 0.5, 0.8, broadNormal.y.add( macro.r.sub( 0.5 ).mul( 0.3 ) ) ).mul( 0.85 )
+				.max( ledge.mul( greenPatch ).mul( 0.9 ) )
+				.max( smoothstep( 0.62, 0.8, medium.g ).mul( greenPatch ).mul( 0.5 ) );
+			const vegetation = mix( color( '#2f4127' ), color( '#56683a' ), rockFine.mul( 0.5 ).add( medium.g.mul( 0.5 ) ) );
+			const rock = mix( rockTone, vegetation, mossCover ).mul( rockFine.mul( 0.12 ).add( 0.93 ) ).toVar();
+			// ⑤ 凹处暗、棱上亮（建网格时算的曲率，±0.5 米就到头）
+			const cavity = attribute( 'cavity', 'float' );
+			rock.assign( rock.mul( cavity.mul( 0.7 ).clamp( - 0.32, 0.14 ).add( 1 ) ) );
+			albedo.assign( mix( albedo, rock, rockAmount ) );
+			const tangent = normalize( vec3( broadNormal.z, 0, broadNormal.x.negate() ).add( vec3( 1e-4, 0, 0 ) ) );
+			const bitangent = normalize( broadNormal.cross( tangent ) );
+			const gradient = octaveMiddle.ba.sub( 0.5 ).mul( 1.2 ).add( octaveSmall.ba.sub( 0.5 ).mul( 0.7 ) );
+			normal.assign( normalize( normal.sub( tangent.mul( gradient.x ).add( bitangent.mul( gradient.y ) ).mul( rockAmount ) ) ) );
+			normal.assign( normalize( normal.add( vec3( 0, ledge.mul( 0.9 ).sub( undercut.mul( 0.6 ) ), 0 ).mul( rockAmount ) ) ) );
+
+		};
+		if ( lean ) {
+
+			// 草地上岩石那段乘 0：只剩原来那两次归一化（逐位一样）
+			If( rockAmount.greaterThan( 0 ), rockPart ).Else( () => {
+
+				normal.assign( normalize( normal ) );
+				normal.assign( normalize( normal ) );
+
+			} );
+
+		} else {
+
+			rockPart();
+
+		}
+
+		// 近处的真贴图（和远景同一套，阶段 12 CP3）：草地按草甸、水边的泥按沙土；岩石是自己画的岩层，不加
+		const ground = state.ctx.backdrop.getGround();
+		if ( ground ) {
+
+			const grassAmount = smoothstep( 0.05, 0.5, aboveWater );
+			const detail = groundDetailInScene( ground, uniforms.sceneToWorld, {
+				point, normal: broadNormal, weights: vec4( grassAmount, 0, 0, float( 1 ).sub( grassAmount ) ), near: state.ctx.backdrop.getGroundNear(), cameraPoint: cameraPosition,
+			} );
+			const soilAmount = float( 1 ).sub( rockAmount );
+			albedo.assign( albedo.mul( mix( vec3( 1 ), detail.shade, soilAmount ) ) );
+			normal.assign( normalize( mix( normal, detail.normal, soilAmount ) ) );
+
+		}
+
+		// 草根融合（阶段 12 CP3 返工）：草的近环里地面往草根色压，草缝里是暗的草根
+		if ( state.grass && state.field ) {
+
+			// 密度用回调传：草的半径外不取（省两张草地图的取样）
+			albedo.assign( state.grass.underlay( albedo, point.xz, () => grassGroundAt( point.xz ).density.mul( float( 1 ).sub( rockAmount ) ) ) );
+
+		}
 
 		// 地上的落花：桃林里地上一层碎粉白点，水边被冲走了
 		const petalSpot = smoothstep( 0.72, 0.8, texture( noiseTexture, point.xz.div( 0.9 ) ).r ).mul( smoothstep( 0.3, 1.2, aboveWater ) ).mul( float( 1 ).sub( smoothstep( 0.08, 0.2, slope ) ) ).mul( uniforms.groundPetals );
@@ -657,14 +707,19 @@ function buildWaterGeometry( line ) {
 
 	}
 
-	const indices = [];
+	// 三角形分两段：平水（这一格两头的坡度都 ≤ 0.019，着色器里跌水的碎波、白沫、假倒影的混入都是 0）在前，跌水在后，
+	// 各一个材质组（perf.scenesA.skipHiddenShading 开着时平水用省掉那几段的材质，见 createWaterMaterial 的 calm）
+	const calmIndices = [];
+	const steepIndices = [];
+	const slopeAt = ( row ) => streamInfo[ row * ( across + 1 ) * 4 + 3 ];
 	for ( let i = 0; i < count - 1; i ++ ) {
 
+		const target = Math.max( slopeAt( i ), slopeAt( i + 1 ) ) > calmSlope ? steepIndices : calmIndices;
 		for ( let k = 0; k < across; k ++ ) {
 
 			const a = i * ( across + 1 ) + k;
 			const b = a + across + 1;
-			indices.push( a, a + 1, b, a + 1, b + 1, b );
+			target.push( a, a + 1, b, a + 1, b + 1, b );
 
 		}
 
@@ -673,33 +728,37 @@ function buildWaterGeometry( line ) {
 	const geometry = new THREE.BufferGeometry();
 	geometry.setAttribute( 'position', new THREE.BufferAttribute( positions, 3 ) );
 	geometry.setAttribute( 'streamInfo', new THREE.BufferAttribute( streamInfo, 4 ) );
-	geometry.setIndex( indices );
+	geometry.setIndex( calmIndices.concat( steepIndices ) );
+	geometry.addGroup( 0, calmIndices.length, 0 );
+	geometry.addGroup( calmIndices.length, steepIndices.length, 1 );
 	geometry.computeBoundingSphere();
 	return geometry;
 
 }
 
-function createWaterMaterial( noiseTexture, useReflector ) {
+// 溪面的平面倒影：同落日，倒影不在画溪面时嵌套着画，改成后期管线每帧画主场景之前在最外层画一次
+function createWaterReflector() {
+
+	const mirror = reflector( { resolutionScale: state.reflectionScale, bounces: false } );
+	mirror.reflector.updateBeforeType = NodeUpdateType.NONE;
+	mirror.target.rotation.x = - Math.PI / 2;
+	mirror.target.position.y = state.uniforms.reflectionPlane.value;
+	state.reflectorNode = mirror;
+	return mirror;
+
+}
+
+// mirror：平面倒影节点（没有就传 null）。calm：只画平水那一段（三角形的坡度都 ≤ calmSlope，跌水的碎波、白沫、假倒影的混入都是 0）——
+// 白沫整段不生成；假倒影（天空 + 两岸桃林）在平面倒影开着时乘 0 被盖掉，放进只看 uniform 的分支；漂花的光照只在有花瓣的像素算。
+// 每个像素的结果和完整的那个材质一样（perf.scenesA.skipHiddenShading）
+function createWaterMaterial( noiseTexture, mirror, calm = false ) {
 
 	const uniforms = state.uniforms;
 	const sky = state.ctx.world.uniforms;
 	const backdrop = state.ctx.backdrop;
-	const overtureConfig = state.ctx.config.overture;
-
-	let mirror = null;
-	if ( useReflector ) {
-
-		mirror = reflector( { resolutionScale: state.ctx.quality.params.reflectionScale, bounces: false } );
-		// 同落日：倒影不在画溪面时嵌套着画，改成后期管线每帧画主场景之前在最外层画一次
-		mirror.reflector.updateBeforeType = NodeUpdateType.NONE;
-		mirror.target.rotation.x = - Math.PI / 2;
-		mirror.target.position.y = uniforms.reflectionPlane.value;
-		state.reflectorNode = mirror;
-
-	}
 
 	const material = new THREE.MeshBasicNodeMaterial();
-	material.name = useReflector ? '溪水（平面倒影）' : '溪水';
+	material.name = ( mirror ? '溪水（平面倒影）' : '溪水' ) + ( calm ? '·平水' : '' );
 	material.fog = false;
 	material.lights = false;
 
@@ -710,10 +769,11 @@ function createWaterMaterial( noiseTexture, useReflector ) {
 		const lateral = info.y;
 		const sideAngle = info.z;
 		const steep = info.w;
-		const side = vec3( cos( sideAngle ), 0, sin( sideAngle ) );
+		const side = vec3( cos( sideAngle ), 0, sin( sideAngle ) ).toVar();
 		const downstream = vec3( side.z, 0, side.x.negate() );
 		const point = positionGeometry;
-		const toViewer = normalize( cameraPosition.sub( point ) );
+		// 分支前后都要用的量先落成变量（TSL 按第一次用到的位置生成代码，不落地的话会生成进 If 里面，If 外读到的是 0）
+		const toViewer = normalize( cameraPosition.sub( point ) ).toVar();
 		const halfWidth = float( state.river.halfWidth );
 
 		// ---------- 微波：两层噪声贴图的梯度，顺水往下游流（流速 0.35 米/秒），跌水处流得快、波大 ----------
@@ -725,27 +785,36 @@ function createWaterMaterial( noiseTexture, useReflector ) {
 		const footprint = max( length( fwidth( point ) ), 0.001 );
 		const coarseFade = float( 1 ).sub( smoothstep( 0.25, 1.2, footprint ) );
 		const fineFade = float( 1 ).sub( smoothstep( 0.06, 0.3, footprint ) );
-		const gradient = coarse.ba.sub( 0.5 ).mul( 0.07 ).mul( coarseFade ).add( fineSample.ba.sub( 0.5 ).mul( 0.035 ).mul( fineFade ) ).mul( mix( float( 1 ), float( 4 ), smoothstep( 0.02, 0.08, steep ) ) ).mul( uniforms.rippleAmount );
-		const normal = normalize( vec3( 0, 1, 0 ).sub( downstream.mul( gradient.x ) ).sub( side.mul( gradient.y ) ) );
+		const gradient = coarse.ba.sub( 0.5 ).mul( 0.07 ).mul( coarseFade ).add( fineSample.ba.sub( 0.5 ).mul( 0.035 ).mul( fineFade ) ).mul( mix( float( 1 ), float( 4 ), smoothstep( 0.02, 0.08, steep ) ) ).mul( uniforms.rippleAmount ).toVar();
+		const normal = normalize( vec3( 0, 1, 0 ).sub( downstream.mul( gradient.x ) ).sub( side.mul( gradient.y ) ) ).toVar();
 
 		// ---------- 倒影 ----------
 		const reflected = reflect( toViewer.negate(), normal ).toVar();
 		reflected.y.assign( max( reflected.y, 0.005 ) );
-		// 天空（远景的统一天空，不画太阳圆盘、星星）
-		const worldReflected = backdrop.sceneDirectionToWorld( reflected );
-		const skyColor = daySkyColor( worldReflected, sky, uniforms.time, { sunDisc: false, stars: false } );
-		// 两岸的桃林倒在水里：反射光线往岸那边走，横向走到林边（离中线 halfWidth + 3 米）时升起的高度低于树冠（约 5.5 米，按沿溪的噪声起伏）就是树
-		const lateralRate = dot( reflected.xz, side.xz );
-		const gap = select( lateralRate.greaterThan( 0 ), halfWidth.add( 3 ).sub( lateral ), halfWidth.add( 3 ).add( lateral ) ).max( 0.5 );
-		const rise = reflected.y.mul( gap ).div( max( abs( lateralRate ), 0.02 ) );
-		const crown = valueNoise2D( vec2( along.mul( 0.11 ), select( lateralRate.greaterThan( 0 ), float( 3.7 ), float( 9.1 ) ) ) ).mul( 2.2 ).add( 4.4 );
-		const treeAmount = float( 1 ).sub( smoothstep( crown.sub( 0.6 ), crown.add( 0.4 ), rise ) ).mul( uniforms.bankReflection );
-		// 树的倒影：上面是花（粉），贴水那一截是岸和树干（暗）；光照按天光
-		const blossomTone = mix( color( '#d9a0b4' ), color( '#f2c8d6' ), valueNoise2D( vec2( along.mul( 0.6 ), rise.mul( 0.8 ) ) ) );
-		const bankTone = color( '#3d3a2c' );
-		const treeAlbedo = mix( bankTone, blossomTone, smoothstep( 0.25, 1.1, rise.add( valueNoise2D( vec2( along.mul( 0.9 ), 1.3 ) ).sub( 0.5 ).mul( 0.6 ) ) ) );
-		const treeColor = shade( treeAlbedo, vec3( 0, 1, 0 ), point.add( vec3( 0, 3, 0 ) ), { skyView: float( 0.85 ), wrap: 0.5 } );
-		const fakeReflection = mix( skyColor, treeColor, treeAmount ).toVar();
+		const fakeReflection = vec3( 0 ).toVar();
+		// If 的回调不能有返回值（TSL 会当成 return 语句），写成块
+		const fakePart = () => {
+
+			// 天空（远景的统一天空，不画太阳圆盘、星星）
+			const worldReflected = backdrop.sceneDirectionToWorld( reflected );
+			const skyColor = daySkyColor( worldReflected, sky, uniforms.time, { sunDisc: false, stars: false } );
+			// 两岸的桃林倒在水里：反射光线往岸那边走，横向走到林边（离中线 halfWidth + 3 米）时升起的高度低于树冠（约 5.5 米，按沿溪的噪声起伏）就是树
+			const lateralRate = dot( reflected.xz, side.xz );
+			const gap = select( lateralRate.greaterThan( 0 ), halfWidth.add( 3 ).sub( lateral ), halfWidth.add( 3 ).add( lateral ) ).max( 0.5 );
+			const rise = reflected.y.mul( gap ).div( max( abs( lateralRate ), 0.02 ) );
+			const crown = valueNoise2D( vec2( along.mul( 0.11 ), select( lateralRate.greaterThan( 0 ), float( 3.7 ), float( 9.1 ) ) ) ).mul( 2.2 ).add( 4.4 );
+			const treeAmount = float( 1 ).sub( smoothstep( crown.sub( 0.6 ), crown.add( 0.4 ), rise ) ).mul( uniforms.bankReflection );
+			// 树的倒影：上面是花（粉），贴水那一截是岸和树干（暗）；光照按天光
+			const blossomTone = mix( color( '#d9a0b4' ), color( '#f2c8d6' ), valueNoise2D( vec2( along.mul( 0.6 ), rise.mul( 0.8 ) ) ) );
+			const bankTone = color( '#3d3a2c' );
+			const treeAlbedo = mix( bankTone, blossomTone, smoothstep( 0.25, 1.1, rise.add( valueNoise2D( vec2( along.mul( 0.9 ), 1.3 ) ).sub( 0.5 ).mul( 0.6 ) ) ) );
+			const treeColor = shade( treeAlbedo, vec3( 0, 1, 0 ), point.add( vec3( 0, 3, 0 ) ), { skyView: float( 0.85 ), wrap: 0.5 } );
+			fakeReflection.assign( mix( skyColor, treeColor, treeAmount ) );
+
+		};
+		// 平水：平面倒影开着（mirrorAmount = 1）时假倒影乘 0，跌水的混入也是 0，整段不算（条件只看 uniform，整帧一致）
+		if ( calm && mirror ) If( uniforms.mirrorAmount.lessThan( 0.999 ), fakePart );
+		else fakePart();
 		const reflection = fakeReflection.toVar();
 		if ( mirror ) {
 
@@ -777,15 +846,34 @@ function createWaterMaterial( noiseTexture, useReflector ) {
 		const exists = random.x.lessThan( mix( float( 0.08 ), float( 0.42 ), nearBank ).mul( uniforms.floatingPetals ) );
 		const angle = random.y.mul( 6.28 );
 		const rotated = vec2( local.x.mul( cos( angle ) ).sub( local.y.mul( sin( angle ) ) ), local.x.mul( sin( angle ) ).add( local.y.mul( cos( angle ) ) ) ).sub( random.zx.sub( 0.5 ).mul( 0.4 ) );
-		const petalShape = float( 1 ).sub( smoothstep( 0.7, 1, length( rotated.div( vec2( 0.17, 0.11 ) ) ) ) );
-		const petalAmount = select( exists, petalShape, float( 0 ) ).mul( float( 1 ).sub( smoothstep( 0.03, 0.06, steep ) ) );
-		const petalColor = shadeThin( mix( color( '#f6cfdb' ), color( '#fff1f4' ), random.z ), vec3( 0, 1, 0 ), point, toViewer );
-		surface.assign( mix( surface, petalColor, petalAmount ) );
+		// 花瓣形（审查 R40：原来是一样大的白椭圆，像药片）：大小 0.6~1.2 倍；根部窄、瓣尖宽（水滴形），瓣尖一个小缺口（桃花瓣那样）；
+		// 颜色淡粉到粉白，根部深一点
+		const petalSize = random.z.mul( 0.6 ).add( 0.6 );
+		const petalLocal = rotated.div( petalSize );
+		const petalWidth = mix( float( 0.075 ), float( 0.12 ), smoothstep( - 0.17, 0.12, petalLocal.x ) );
+		const petalBody = float( 1 ).sub( smoothstep( 0.7, 1, length( vec2( petalLocal.x.div( 0.17 ), petalLocal.y.div( petalWidth ) ) ) ) );
+		const petalNotch = smoothstep( 0.035, 0.05, length( petalLocal.sub( vec2( 0.17, 0 ) ) ) );
+		const petalShape = petalBody.mul( petalNotch );
+		const petalAmount = select( exists, petalShape, float( 0 ) ).mul( float( 1 ).sub( smoothstep( 0.03, 0.06, steep ) ) ).toVar();
+		const petalPart = () => {
 
-		// ---------- 跌水的白沫（源头石缝流下来那一段）----------
-		const foamNoise = texture( noiseTexture, vec2( along.mul( 0.22 ).sub( uniforms.time.mul( 0.35 ) ), lateral.mul( 0.9 ) ) ).r.mul( 0.6 ).add( texture( noiseTexture, vec2( along.mul( 0.5 ).sub( uniforms.time.mul( 0.8 ) ), lateral.mul( 2.1 ).add( 0.3 ) ) ).g.mul( 0.4 ) );
-		const foam = smoothstep( 0.025, 0.08, steep ).mul( smoothstep( 0.52, 0.78, foamNoise ) );
-		surface.assign( mix( surface, shade( color( '#e2e8e6' ), vec3( 0, 1, 0 ), point, { wrap: 0.5 } ), foam.mul( 0.55 ) ) );
+			const petalTint = mix( color( '#f2b3c7' ), color( '#fde6ee' ), random.z ).mul( mix( float( 0.85 ), float( 1 ), smoothstep( - 0.17, 0, petalLocal.x ) ) );
+			const petalColor = shadeThin( petalTint, vec3( 0, 1, 0 ), point, toViewer );
+			surface.assign( mix( surface, petalColor, petalAmount ) );
+
+		};
+		// 平水：没花瓣的像素（大部分）不算花瓣的光照（mix 系数是 0）；光照里只有 .level(0) 的采样，放进分支没问题
+		if ( calm ) If( petalAmount.greaterThan( 0 ), petalPart );
+		else petalPart();
+
+		// ---------- 跌水的白沫（源头石缝流下来那一段）：平水那一段白沫是 0，不生成 ----------
+		if ( ! calm ) {
+
+			const foamNoise = texture( noiseTexture, vec2( along.mul( 0.22 ).sub( uniforms.time.mul( 0.35 ) ), lateral.mul( 0.9 ) ) ).r.mul( 0.6 ).add( texture( noiseTexture, vec2( along.mul( 0.5 ).sub( uniforms.time.mul( 0.8 ) ), lateral.mul( 2.1 ).add( 0.3 ) ) ).g.mul( 0.4 ) );
+			const foam = smoothstep( 0.025, 0.08, steep ).mul( smoothstep( 0.52, 0.78, foamNoise ) );
+			surface.assign( mix( surface, shade( color( '#e2e8e6' ), vec3( 0, 1, 0 ), point, { wrap: 0.5 } ), foam.mul( 0.55 ) ) );
+
+		}
 
 		return backdrop.worldAtmosphere( surface, point );
 
@@ -819,10 +907,13 @@ function plantTrees( line ) {
 			const forestEnd = smoothJs( 1668, 1715, worldZ );
 			const ground = groundHeight( treeX, treeZ );
 			const slope = Math.hypot( groundHeight( treeX + 1, treeZ ) - groundHeight( treeX - 1, treeZ ), groundHeight( treeX, treeZ + 1 ) - groundHeight( treeX, treeZ - 1 ) ) / 2;
-			// 靠溪的几排最密（"夹岸"），往外疏一些
-			const density = forestEnd * smoothJs( 0.5, 0.3, slope ) * ( distance < 22 ? 0.95 : 0.7 );
+			// 靠溪的几排最密（"夹岸"），往外疏一些；坡上按 22 米上下的噪声成丛、丛间留空（审查 R39：原来等距成排，像果园）
+			const clump = smoothJs( 0.32, 0.62, jsFbm2D( worldX / 22 + 3.1, worldZ / 22 - 1.7, 2 ) );
+			const density = forestEnd * smoothJs( 0.5, 0.3, slope ) * ( distance < 14 ? 0.95 : ( distance < 22 ? 0.95 : 0.7 ) * ( 0.35 + 0.8 * clump ) );
 			if ( random() > density ) continue;
-			trees.push( { x: treeX, z: treeZ, y: ground - 0.05, distance, yaw: random() * Math.PI * 2, scale: 0.85 + random() * 0.35, template: Math.floor( random() * overtureConfig.treeTemplates ) } );
+			// 近水的大、坡上远处的小，成丛的地方大一点（同一片林子里高矮错开）
+			const sizeBase = 0.7 + 0.4 * smoothJs( 40, 12, distance ) + 0.15 * clump;
+			trees.push( { x: treeX, z: treeZ, y: ground - 0.05, distance, yaw: random() * Math.PI * 2, scale: sizeBase + random() * 0.3, template: Math.floor( random() * overtureConfig.treeTemplates ) } );
 
 		}
 
@@ -974,21 +1065,35 @@ function createSpringRockMaterial( noiseTexture ) {
 
 function buildBoatGeometry() {
 
-	// 船身：横截面是一条 U 形，沿船长从船尾（z = 1.2）到船头（z = −2.6）收窄、船头翘起；船沿一圈木板
-	const positions = [];
-	const indices = [];
+	// 船身：横截面是一条 U 形（深 0.32 米），沿船长从船尾（z = 1.2）到船头（z = −2.6）收窄、船头翘起。
+	// 船沿在本地 y = 0（船头翘起 rise）；船里铺一层底板（y = −0.16），再横两条坐板，船尾封一块尾板：
+	// 船放在水上时船沿高出水面 freeboard 米、底板也在水面以上，从船里往下看看到的是底板，不会看到水面从船里穿出来
+	const hullDepth = 0.32;
+	const floorY = - 0.16;
 	const sections = 14;
 	const around = 9;
+	const parts = [];
+	const widthAt = ( along ) => 0.62 * Math.sqrt( Math.max( 0, 1 - Math.pow( Math.max( 0, along - 0.35 ) / 0.65, 2 ) ) ) + 0.02;
+	const riseAt = ( along ) => Math.pow( Math.max( 0, along - 0.55 ) / 0.45, 2 ) * 0.35;
+	const zAt = ( along ) => 1.2 - along * 3.8;
+	const withPart = ( geometry, part ) => {
+
+		geometry.computeVertexNormals();
+		geometry.setAttribute( 'boatPart', new THREE.Float32BufferAttribute( new Array( geometry.attributes.position.count ).fill( part ), 1 ) );
+		return geometry;
+
+	};
+
+	// 船身
+	const hullPositions = [];
+	const hullIndices = [];
 	for ( let i = 0; i <= sections; i ++ ) {
 
 		const along = i / sections;
-		const z = 1.2 - along * 3.8;
-		const width = 0.62 * Math.sqrt( Math.max( 0, 1 - Math.pow( Math.max( 0, along - 0.35 ) / 0.65, 2 ) ) ) + 0.02;
-		const rise = Math.pow( Math.max( 0, along - 0.55 ) / 0.45, 2 ) * 0.35;
 		for ( let k = 0; k <= around; k ++ ) {
 
 			const angle = Math.PI * ( k / around );
-			positions.push( Math.cos( angle ) * width, - Math.sin( angle ) * 0.32 + rise, z );
+			hullPositions.push( Math.cos( angle ) * widthAt( along ), - Math.sin( angle ) * hullDepth + riseAt( along ), zAt( along ) );
 
 		}
 
@@ -1000,17 +1105,78 @@ function buildBoatGeometry() {
 
 			const a = i * ( around + 1 ) + k;
 			const b = a + around + 1;
-			indices.push( a, b, a + 1, a + 1, b, b + 1 );
+			hullIndices.push( a, b, a + 1, a + 1, b, b + 1 );
 
 		}
 
 	}
 
-	const geometry = new THREE.BufferGeometry();
-	geometry.setAttribute( 'position', new THREE.Float32BufferAttribute( positions, 3 ) );
-	geometry.setIndex( indices );
-	geometry.computeVertexNormals();
-	return geometry;
+	const hull = new THREE.BufferGeometry();
+	hull.setAttribute( 'position', new THREE.Float32BufferAttribute( hullPositions, 3 ) );
+	hull.setIndex( hullIndices );
+	parts.push( withPart( hull, 0 ) );
+
+	// 底板：每一节在 floorY 那个高度上量出船身的半宽（U 形截面 y = −sin·深 + rise → 宽 = w·cos），船头翘起来、船底高过底板的那几节就没有
+	// 底板收窄到 5 厘米以下就停（宽度是 0 的三角形算不出法线，着色器里会变成 NaN，整块底板发黑）；三角形朝上绕（正面朝上）
+	const floorPositions = [];
+	const floorIndices = [];
+	let floorRows = 0;
+	for ( let i = 0; i <= sections; i ++ ) {
+
+		const along = i / sections;
+		const sine = Math.min( 1, Math.max( 0, ( riseAt( along ) - floorY ) / hullDepth ) );
+		const halfWidth = widthAt( along ) * Math.sqrt( 1 - sine * sine ) * 0.98;
+		if ( halfWidth < 0.05 ) break;
+		floorPositions.push( - halfWidth, floorY, zAt( along ), halfWidth, floorY, zAt( along ) );
+		if ( floorRows > 0 ) {
+
+			const a = ( floorRows - 1 ) * 2;
+			floorIndices.push( a, a + 1, a + 2, a + 1, a + 3, a + 2 );
+
+		}
+
+		floorRows ++;
+
+	}
+
+	const floorGeometry = new THREE.BufferGeometry();
+	floorGeometry.setAttribute( 'position', new THREE.Float32BufferAttribute( floorPositions, 3 ) );
+	floorGeometry.setIndex( floorIndices );
+	parts.push( withPart( floorGeometry, 1 ) );
+
+	// 尾板：船尾那一圈 U 形和船沿连线之间的半圆，从船沿中点扇形连过去
+	const sternPositions = [ 0, 0, zAt( 0 ) ];
+	const sternIndices = [];
+	for ( let k = 0; k <= around; k ++ ) {
+
+		const angle = Math.PI * ( k / around );
+		sternPositions.push( Math.cos( angle ) * widthAt( 0 ), - Math.sin( angle ) * hullDepth, zAt( 0 ) );
+		if ( k > 0 ) sternIndices.push( 0, k, k + 1 );
+
+	}
+
+	const stern = new THREE.BufferGeometry();
+	stern.setAttribute( 'position', new THREE.Float32BufferAttribute( sternPositions, 3 ) );
+	stern.setIndex( sternIndices );
+	parts.push( withPart( stern, 0 ) );
+
+	// 两条坐板：在船沿下面 4 厘米，横跨两舷
+	for ( const along of [ 0.18, 0.52 ] ) {
+
+		const seatY = - 0.04 + riseAt( along );
+		const sine = Math.min( 1, ( riseAt( along ) - seatY ) / hullDepth );
+		const span = widthAt( along ) * Math.sqrt( 1 - sine * sine ) * 2;
+		const seat = new THREE.BoxGeometry( span, 0.035, 0.22 );
+		seat.deleteAttribute( 'uv' );
+		seat.translate( 0, seatY, zAt( along ) );
+		parts.push( withPart( seat.toNonIndexed(), 2 ) );
+
+	}
+
+	const merged = mergeGeometries( parts.map( ( part ) => part.index ? part.toNonIndexed() : part ) );
+	for ( const part of parts ) part.dispose();
+	merged.computeBoundingSphere();
+	return merged;
 
 }
 
@@ -1024,11 +1190,20 @@ function createBoatMaterial( noiseTexture ) {
 	material.colorNode = Fn( () => {
 
 		const point = positionWorld;
-		const normal = normalize( normalGeometry );
-		// 木板：沿船长的条纹 + 噪声，旧木头的灰褐
-		const plank = sin( positionGeometry.y.mul( 38 ) ).mul( 0.5 ).add( 0.5 );
-		const grain = texture( noiseTexture, vec2( positionGeometry.z.mul( 0.4 ), positionGeometry.y.mul( 6 ) ) ).r;
-		const albedo = mix( color( '#4a3a2c' ), color( '#6e5844' ), grain.mul( 0.7 ).add( plank.mul( 0.3 ) ) );
+		// 船是转过、挪过的网格：法线要用世界法线（normalGeometry 是船自己的坐标，光照方向全错）；船里面那一面（背面）把法线翻过来
+		const part = attribute( 'boatPart', 'float' );
+		const outward = normalize( normalWorld );
+		// 底板的法线就是船的"上"（船本地 +y 转到场景里），不靠顶点法线
+		const boatUp = normalize( modelWorldMatrix.mul( vec4( 0, 1, 0, 0 ) ).xyz );
+		const normal = select( part.greaterThan( 0.5 ).and( part.lessThan( 1.5 ) ), boatUp, select( frontFacing, outward, outward.negate() ) );
+		// 木板：船身沿船长的条纹（板缝横着走），底板顺着船长铺（板缝顺着走），坐板颜色浅一点；再叠旧木头的纹理
+		const hullPlank = sin( positionGeometry.y.mul( 38 ) ).mul( 0.5 ).add( 0.5 );
+		const floorPlank = sin( positionGeometry.x.mul( 34 ) ).mul( 0.5 ).add( 0.5 );
+		const plank = select( part.greaterThan( 0.5 ), floorPlank, hullPlank );
+		const grain = texture( noiseTexture, vec2( positionGeometry.z.mul( 0.4 ), positionGeometry.y.mul( 6 ).add( positionGeometry.x.mul( 3 ) ) ) ).r;
+		// 旧木头晒得发白的暖灰褐（原来 #4a3a2c 太深，天还没亮时船是一团黑）
+		const albedo = mix( color( '#7d6650' ), color( '#a68e70' ), grain.mul( 0.7 ).add( plank.mul( 0.3 ) ) )
+			.mul( select( part.greaterThan( 1.5 ), float( 1.18 ), select( part.greaterThan( 0.5 ), float( 0.9 ), float( 1 ) ) ) );
 		return shade( albedo, normal, point, { skyView: float( 0.8 ), wrap: 0.4 } );
 
 	} )();
@@ -1273,28 +1448,47 @@ async function build( ctx ) {
 
 	// 溪水
 	const useReflector = params.reflectionScale > 0;
+	state.reflectionScale = params.reflectionScale;
+	state.caveHidden = false;
 	const waterGeometry = buildWaterGeometry( line );
-	const waterMaterial = createWaterMaterial( noiseTexture, useReflector );
-	const water = new THREE.Mesh( waterGeometry, waterMaterial );
+	const mirror = useReflector ? createWaterReflector() : null;
+	const waterMaterial = createWaterMaterial( noiseTexture, mirror );
+	// 平水那一段（几何体的第 0 组）用省掉跌水几段的材质（perf.scenesA.skipHiddenShading）；关掉时整条溪一个材质，分组不起作用
+	const calmMaterial = ctx.config.perf.scenesA.skipHiddenShading ? createWaterMaterial( noiseTexture, mirror, true ) : null;
+	const water = new THREE.Mesh( waterGeometry, calmMaterial ? [ calmMaterial, waterMaterial ] : waterMaterial );
 	water.name = '桃花溪';
 	water.frustumCulled = false;
 	scene.add( water );
 	state.water = water;
+	// 倒影跳过用的水面分块（camera.js 的 prepareMeshView），在这里取好点，不放进第一帧
+	prepareMeshView( water, { groundHeight: groundHeightAt } );
 	state.disposables.push( waterGeometry, waterMaterial );
+	if ( calmMaterial ) state.disposables.push( calmMaterial );
 	if ( state.reflectorNode ) {
 
 		scene.add( state.reflectorNode.target );
 		state.reflectionPass = () => {
 
 			if ( ! state.ready || ! state.reflectorNode || state.uniforms.mirrorAmount.value < 0.5 ) return;
+			// 进了洞、溪水藏起来了（见 updateCaveHide）：倒影没人看，不画
+			if ( state.caveHidden ) return;
+			// 水面不在视锥里（转身背对水面）这一帧不画倒影（camera.js 的 isMeshInView）
+			if ( ! isMeshInView( ctx.camera, state.water, { groundHeight: groundHeightAt } ) ) return;
+			// 倒影分辨率：放大模式下场景按 renderScale 画，倒影跟着乘（perf.scenesA.reflectionFollowScale）；满分辨率时就是配置值
+			const quality = ctx.quality;
+			const follow = ctx.config.perf.scenesA.reflectionFollowScale && quality.mode === 'upscale';
+			state.reflectorNode.reflector.resolutionScale = state.reflectionScale * ( follow ? quality.renderScale : 1 );
+			const waterVisible = state.water.visible;
 			state.water.visible = false;
+			if ( state.grass ) state.grass.beginReflection();
 			try {
 
 				state.reflectorNode.reflector.updateBefore( { scene: state.scene, camera: ctx.camera, renderer: ctx.renderer, material: waterMaterial } );
 
 			} finally {
 
-				state.water.visible = true;
+				state.water.visible = waterVisible;
+				if ( state.grass ) state.grass.endReflection();
 
 			}
 
@@ -1312,64 +1506,82 @@ async function build( ctx ) {
 
 	await yieldToBrowser();
 
-	// 桃树：几个模板，树干每个模板一个 InstancedMesh（见 tsl/blossom.js）
-	const random = createRandom( 512 );
-	const templates = [];
-	for ( let i = 0; i < overtureConfig.treeTemplates; i ++ ) templates.push( blossomTemplate( random ) );
+	// 桃树：和远景花树同一套樱花模型（backdrop.createLocationBlossoms；2026-10-02 用户："这种树全部换掉"——原来 tsl/blossom.js 的直棍树枝 +
+	// 散开的星形小花）。种在开场本地坐标（树根贴开场自己的地形），换成世界坐标交给远景画；花簇格子大一点、每团花卡少一点（夹岸几百棵），
+	// 颜色用桃花的粉。模型读不到退回原来的程序化桃树
 	const trees = plantTrees( line );
-	const barkMaterial = createBarkMaterial( { noiseTexture, shade, name: '桃树干' } );
-	state.disposables.push( barkMaterial );
-	const trunks = instanceTrunks( templates, trees, barkMaterial, '桃树干' );
-	for ( const mesh of trunks.meshes ) scene.add( mesh );
-	state.trunks = trunks.meshes;
-	state.disposables.push( ...trunks.geometries );
+	const worldPoint = new THREE.Vector3();
+	// 桃林在溪面倒影里照原样全画（不给 reflectWater）：镜头离水只有 1 米、溪面微波把倒影的采样错开好几度，按镜头位置保守地算，
+	// 挑中的桃树几乎每棵的倒影都可能落进溪面，省不下什么；按离溪中线 36 米一刀切会在 overture 20 秒的倒影里少几块（2026-10-02 自查）
+	const locationTrees = await ctx.backdrop.createLocationBlossoms( trees.map( ( tree ) => {
 
-	// 花枝卡片：近处的树每团 cardsPerCluster 张，远处少一些、卡片大一点
-	const cardRatio = content === 'hi' ? 1 : ( content === 'mid' ? 0.75 : 0.55 );
-	const blossom = blossomCards( trees, templates, {
-		random: createRandom( 7713 ),
-		perCluster: ( tree ) => overtureConfig.cardsPerCluster * ( tree.distance < 26 ? 1 : ( tree.distance < 48 ? 0.6 : 0.4 ) ) * cardRatio,
-		sizeScale: ( tree ) => ( tree.distance < 26 ? 1 : 1.25 ),
-	} );
-	const blossomMaterial = createBlossomMaterial( {
-		time: state.uniforms.time,
-		windAmount: state.uniforms.windAmount,
-		shadeThin,
-		colors: { heart: '#c9577a', inner: '#f2a9bf', outer: '#fde6ec' },
-		name: '桃花',
-	} );
-	const blossoms = new THREE.Mesh( blossom.geometry, blossomMaterial );
-	blossoms.name = '桃花';
-	blossoms.frustumCulled = false;
-	scene.add( blossoms );
-	state.blossoms = blossoms;
-	state.disposables.push( blossom.geometry, blossomMaterial );
+		ctx.world.toWorld( worldPoint.set( tree.x, tree.y, tree.z ), key, worldPoint );
+		return { x: worldPoint.x, y: worldPoint.y, z: worldPoint.z, size: tree.scale * overtureConfig.blossomTreeSize, yaw: tree.yaw, tint: ( tree.template + 0.5 ) / overtureConfig.treeTemplates };
+
+	} ), { near: content === 'hi' ? 600 : 220, colors: overtureConfig.blossomColors, cards: overtureConfig.blossomCards[ content ] || overtureConfig.blossomCards.mid, cell: overtureConfig.blossomCell, name: '开场的桃林' } );
+	if ( locationTrees ) {
+
+		state.locationTrees = locationTrees;
+		state.trunks = [];
+
+	} else {
+
+		const random = createRandom( 512 );
+		const templates = [];
+		for ( let i = 0; i < overtureConfig.treeTemplates; i ++ ) templates.push( blossomTemplate( random ) );
+		const barkMaterial = createBarkMaterial( { noiseTexture, shade, name: '桃树干' } );
+		state.disposables.push( barkMaterial );
+		const trunks = instanceTrunks( templates, trees, barkMaterial, '桃树干' );
+		for ( const mesh of trunks.meshes ) scene.add( mesh );
+		state.trunks = trunks.meshes;
+		state.disposables.push( ...trunks.geometries );
+
+		// 花枝卡片：近处的树每团 cardsPerCluster 张，远处少一些、卡片大一点
+		const cardRatio = content === 'hi' ? 1 : ( content === 'mid' ? 0.75 : 0.55 );
+		const blossom = blossomCards( trees, templates, {
+			random: createRandom( 7713 ),
+			perCluster: ( tree ) => overtureConfig.cardsPerCluster * ( tree.distance < 26 ? 1 : ( tree.distance < 48 ? 0.6 : 0.4 ) ) * cardRatio,
+			sizeScale: ( tree ) => ( tree.distance < 26 ? 1 : 1.25 ),
+		} );
+		const blossomMaterial = createBlossomMaterial( {
+			time: state.uniforms.time,
+			windAmount: state.uniforms.windAmount,
+			shadeThin,
+			colors: { heart: '#c9577a', inner: '#f2a9bf', outer: '#fde6ec' },
+			name: '桃花',
+		} );
+		const blossoms = new THREE.Mesh( blossom.geometry, blossomMaterial );
+		blossoms.name = '桃花';
+		blossoms.frustumCulled = false;
+		scene.add( blossoms );
+		state.blossoms = blossoms;
+		state.disposables.push( blossom.geometry, blossomMaterial );
+
+	}
+
 	await yieldToBrowser();
 
-	// 草
-	const fieldTexture = state.field.texture;
-	const fieldNode = ( xz ) => {
-
-		const uv = xz.sub( vec2( terrainRect.minX, terrainRect.minZ ) ).div( vec2( terrainRect.maxX - terrainRect.minX, terrainRect.maxZ - terrainRect.minZ ) );
-		const sample = texture( fieldTexture, uv ).level( 0 );
-		const inside = uv.x.greaterThan( 0 ).and( uv.x.lessThan( 1 ) ).and( uv.y.greaterThan( 0 ) ).and( uv.y.lessThan( 1 ) );
-		return vec2( sample.r, select( inside, sample.g, float( 0 ) ) );
-
-	};
-
+	// 草（阶段 12 CP3 返工：三环，规格书 10.2）
 	const grassConfig = overtureConfig.grass;
-	state.grass = createGrass( {
-		radius: grassConfig.radius,
-		spacing: grassConfig.spacing[ content ] || grassConfig.spacing.mid,
-		height: grassConfig.height,
-		width: grassConfig.width,
-		field: fieldNode,
-		colors: { base: '#2f4a22', tip: '#9cbb5c', dry: '#b9b073' },
-		wind: [ 0.3, 0.95 ],
-		shade: shadeThin,
+	state.grass = createGrassField( {
 		name: '开场的草',
+		rings: resolveRings( ctx.config.grassField, content, grassConfig ),
+		bladeLength: grassConfig.length,
+		bladeWidth: grassConfig.width,
+		ground: grassGroundAt,
+		field: state.field,
+		palette: ctx.config.grassField.palette,
+		groundColor: grassConfig.groundColor,
+		dryAmount: grassConfig.dry,
+		lighting: ( albedo, normal, point, toViewer, extra ) => ctx.backdrop.worldLightingThin( albedo, normal, point, toViewer, extra ),
+		atmosphere: ( surface, point ) => ctx.backdrop.worldAtmosphere( surface, point ),
+		wind: grassConfig.wind,
+		seed: 1,
+		// 倒影里内环也留三成：溪只有几米宽，两岸离船 1~5 米，倒影里的岸要有草（"芳草鲜美"）；
+		// 外环两成、远环不画（perf.scenesA.overtureGrassReflection：远处的岸在倒影里只剩贴水一条，看不出草的疏密）
+		reflection: { ...ctx.config.perf.scenesA.overtureGrassReflection },
 	} );
-	scene.add( state.grass.mesh );
+	scene.add( state.grass.group );
 
 	// 飘落的花瓣
 	const petalConfig = overtureConfig.petals;
@@ -1412,8 +1624,8 @@ async function build( ctx ) {
 		溪水: visibility( water ),
 		泉眼的石头: visibility( springRocks ),
 		桃树干: visibility( ...( state.trunks || [] ) ),
-		桃花: visibility( blossoms ),
-		草: state.grass.uniforms.amount,
+		桃花: state.locationTrees ? state.locationTrees.toggle : visibility( state.blossoms ),
+		...state.grass.layers(),
 		飘落花瓣: state.petals.uniforms.amount,
 		小船: visibility( state.boat ),
 		晨雾: state.uniforms.fogAmount,
@@ -1428,7 +1640,7 @@ async function build( ctx ) {
 	};
 
 	state.ready = true;
-	console.log( `开场：建好了，用时 ${ ( performance.now() - started ).toFixed( 0 ) } ms；桃树 ${ trees.length } 棵、花枝卡片 ${ blossom.cards } 张、草 ${ state.grass.blades } 根（画相机周围 ${ grassConfig.radius } 米）、路线 ${ state.route.length.toFixed( 0 ) } 米（船停 ${ state.route.stop.toFixed( 0 ) }、洞口 ${ state.route.cave.toFixed( 0 ) }、交接 ${ state.route.handoff.toFixed( 0 ) }）` );
+	console.log( `开场：建好了，用时 ${ ( performance.now() - started ).toFixed( 0 ) } ms；桃树 ${ trees.length } 棵（${ state.locationTrees ? "樱花模型" : "程序化" }）、草 ${ state.grass.blades } 根（三环 ${ state.grass.counts.inner } / ${ state.grass.counts.outer } / ${ state.grass.counts.far }，${ ( state.grass.vertices / 1e6 ).toFixed( 2 ) } 百万顶点）、路线 ${ state.route.length.toFixed( 0 ) } 米（船停 ${ state.route.stop.toFixed( 0 ) }、洞口 ${ state.route.cave.toFixed( 0 ) }、交接 ${ state.route.handoff.toFixed( 0 ) }）` );
 	return { scene };
 
 }
@@ -1441,7 +1653,10 @@ export async function compile() {
 	const reflectorObject = state.reflectorNode.reflector;
 	const virtualCamera = reflectorObject.getVirtualCamera( ctx.camera );
 	const target = reflectorObject.getRenderTarget( virtualCamera );
+	const waterVisible = state.water.visible;
 	state.water.visible = false;
+	// 草按倒影里的份数（远环在倒影里不画，倒影目标上就不编它）
+	if ( state.grass ) state.grass.beginReflection();
 	let jobs;
 	try {
 
@@ -1452,7 +1667,8 @@ export async function compile() {
 
 	} finally {
 
-		state.water.visible = true;
+		state.water.visible = waterVisible;
+		if ( state.grass ) state.grass.endReflection();
 
 	}
 
@@ -1495,6 +1711,8 @@ export function enter() {
 	const ctx = state.ctx;
 	if ( state.reflectionPass ) ctx.pipeline.addPrePass( state.reflectionPass );
 	for ( const label of Object.keys( state.layers ) ) ctx.debug.addLayerToggle( key, label, state.layers[ label ] );
+	// 开场在南岭外面，窄处（落日的岩丘、冰槽、林间小路）全被山挡着，整组不画（原来每帧白跑约 2.4 M 三角的顶点）
+	if ( ctx.backdrop && typeof ctx.backdrop.setNarrowsHidden === 'function' ) ctx.backdrop.setNarrowsHidden( 'all', true );
 
 }
 
@@ -1525,17 +1743,47 @@ export function update( dt, time ) {
 	const boatDistance = Math.min( distance, state.route.stop );
 	const boatPosition = routePoint( boatDistance + 0.6, state.boat.position );
 	const boatAhead = routePoint( boatDistance + 3, tempTarget );
-	boatPosition.y -= ctx.config.overture.eyeHeight + 0.08 + Math.sin( time * 1.1 ) * 0.025;
+	// 路线点在水面上 eyeHeight 米；船沿高出水面 boatFreeboard 米（底板也在水面以上，水不会从船里穿出来）
+	boatPosition.y -= ctx.config.overture.eyeHeight - ctx.config.overture.boatFreeboard + Math.sin( time * 1.1 ) * 0.025;
 	state.boat.lookAt( boatAhead.x, boatPosition.y, boatAhead.z );
 	state.boat.rotateY( Math.PI );
 	state.boat.rotateX( Math.sin( time * 0.9 + 1.3 ) * 0.012 );
 	state.boat.rotateZ( Math.sin( time * 0.7 ) * 0.018 );
 
 	// 草、花瓣跟着相机
-	state.grass.uniforms.time.value = time;
-	state.grass.uniforms.center.value.set( position.x, position.z );
+	state.grass.update( time, position, ctx, ( point ) => ctx.world.toWorld( point, key, point ) );
 	state.petals.uniforms.time.value = time;
 	state.petals.uniforms.center.value.copy( position );
+	updateCaveHide( distance );
+
+}
+
+// 进洞以后（perf.scenesA.caveHide）：过了洞口 caveHideDistance 米，洞口在身后、"初极狭"那段洞壁挡住了外面，开场自己的草、溪水
+// 都看不见了，藏起来（三环草的顶点、溪水和它的平面倒影都省掉）；草根融合照旧（远景地面颜色不变）。往回跳到洞外时还原。
+// 飘落的花瓣不藏：它跟着镜头飘，洞里也看得见（藏了洞里会少一半花瓣，截图对比出来的），它也就几千个面片
+function updateCaveHide( distance ) {
+
+	const perf = state.ctx.config.perf.scenesA;
+	const hide = Boolean( perf.caveHide ) && distance > state.route.cave + perf.caveHideDistance;
+	if ( hide === state.caveHidden ) return;
+	const objects = [ state.grass.group, state.water ];
+	if ( hide ) {
+
+		state.caveSaved = objects.map( ( object ) => object.visible );
+		for ( const object of objects ) object.visible = false;
+
+	} else {
+
+		objects.forEach( ( object, index ) => {
+
+			object.visible = state.caveSaved ? state.caveSaved[ index ] : true;
+
+		} );
+		state.caveSaved = null;
+
+	}
+
+	state.caveHidden = hide;
 
 }
 
@@ -1544,6 +1792,7 @@ export function exit() {
 	if ( ! state.ctx ) return;
 	const ctx = state.ctx;
 	if ( state.reflectionPass ) ctx.pipeline.removePrePass( state.reflectionPass );
+	if ( ctx.backdrop && typeof ctx.backdrop.setNarrowsHidden === 'function' ) ctx.backdrop.setNarrowsHidden( 'all', false );
 	ctx.debug.removeSceneToggles( key );
 	ctx.director.clearExternal();
 
@@ -1557,6 +1806,8 @@ function releaseResources() {
 	if ( state.petals ) state.petals.dispose();
 	if ( state.reflectorNode ) state.reflectorNode.dispose();
 	if ( state.trunks ) for ( const mesh of state.trunks ) mesh.dispose();
+	if ( state.locationTrees ) state.locationTrees.dispose();
+	state.locationTrees = null;
 	state.grass = null;
 	state.petals = null;
 	state.reflectorNode = null;
@@ -1576,6 +1827,8 @@ export function dispose() {
 	state.heights = null;
 	state.field = null;
 	state.route = null;
+	state.caveHidden = false;
+	state.caveSaved = null;
 	state.layers = {};
 	state.ctx = null;
 	console.log( '开场：已释放' );
@@ -1601,6 +1854,14 @@ export function getSpawn() {
 	poseAt( 0, position, quaternion );
 	const forward = new THREE.Vector3( 0, 0, - 30 ).applyQuaternion( quaternion ).add( position );
 	return { position: position.toArray(), lookAt: forward.toArray() };
+
+}
+
+// 引路（规格书 5.3 阶段 12）：路线上第几秒走到第几米、离起点 distance 米的点（局部坐标）。花瓣从"林尽水源"起顺着路线流进山洞
+export function getGuideRoute() {
+
+	if ( ! state.ready ) return null;
+	return { distanceAt: ( time ) => state.schedule( time ), pointAt: ( distance, target ) => routePoint( distance, target ) };
 
 }
 
